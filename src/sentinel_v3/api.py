@@ -48,6 +48,10 @@ class TranslationResult:
     physical: Tensor
     uncertainty: Tensor
     samples: list[Tensor] = field(default_factory=list)
+    deterministic_detail: Tensor | None = None
+    stochastic_residual: Tensor | None = None
+    residual_amplitude: Tensor | None = None
+    pre_projection_violation: Tensor | None = None
     target: TargetRequest | None = None
     metadata: dict[str, object] = field(default_factory=dict)
 
@@ -67,4 +71,6 @@ def translate(
     if num_samples < 1:
         raise ValueError("num_samples must be positive")
     with torch.inference_mode():
-        return model.translate(observations, target, mode=mode, num_samples=num_samples, seed=seed)
+        return model.translate(
+            observations, target, mode=mode, num_samples=num_samples, seed=seed
+        )

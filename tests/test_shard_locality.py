@@ -8,7 +8,10 @@ from sentinel_v3.data import StatefulShardSampler
 
 class _Shards:
     shards: ClassVar[list[dict[str, int]]] = [
-        {"count": 4}, {"count": 4}, {"count": 4}, {"count": 4}
+        {"count": 4},
+        {"count": 4},
+        {"count": 4},
+        {"count": 4},
     ]
     ends: ClassVar[list[int]] = [4, 8, 12, 16]
 

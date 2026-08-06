@@ -1,32 +1,38 @@
 paths:
   train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
   manifest: /data/sentinel_translate/data/manifests/pairs.jsonl
-  output: /data/code/sentinel_translate_v3_1/checkpoints_v311
-  reports: /data/code/sentinel_translate_v3_1/reports
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32
+  reports: /data/code/sentinel_translat/v3.2/reports_v32
 
 model:
   width: 64
   hidden: 768
   encoder_depth: 12
-  dit_depth: 12
   heads: 12
+  adapter_rank: 64
+  dit_hidden: 512
+  dit_depth: 8
+  dit_heads: 8
+  codec_width: 64
+  codec_latent_channels: 16
   flow_steps: 16
   optical_residual_limit: 0.15
   sar_residual_limit_db: 6.0
-  architecture: v3.1.1
+  architecture: v3.2
 
 train:
   stage: physical
-  max_steps: 12000
+  max_steps: 20000
   batch_size: 32
   gradient_accumulation: 1
   num_workers: 0
-  learning_rate: 0.0001
-  encoder_learning_rate: 0.00002
+  learning_rate: 0.00001
+  adapter_learning_rate: 0.0001
+  encoder_learning_rate: 0.000002
   weight_decay: 0.05
-  warmup_steps: 2000
+  warmup_steps: 500
   gradient_clip: 1.0
-  ema_decay: 0.9999
+  ema_decay: 0.999
   init_use_ema: false
   channels_last: false
   save_final: true
@@ -34,6 +40,24 @@ train:
   amp: bfloat16
   log_every: 20
   validate_every: 1000
-  save_every: 2000
-  task_probabilities: [0.35, 0.35, 0.15, 0.15]
+  full_validate_every: 5000
+  save_every: 1000
+  early_stop_patience: 5
+  task_probabilities: [0.5, 0.5]
   physical_alignment_samples: 4
+  physical_alignment_weight: 0.02
+  native_gsd_probability: 0.8
+  pcgrad: true
+  registration_audit: true
+  require_physical_gate: true
+  require_codec_gate: true
+  balance_learning_rates:
+    encoder: 0.000002
+    physical_detail: 0.00001
+    dit: 0.00001
+
+validation:
+  enabled: true
+  split: validation_temporal
+  quick_samples: 32
+  full_steps: [4000, 6000, 8000, 10000, 12000]

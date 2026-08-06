@@ -5,7 +5,7 @@ from typing import ClassVar
 
 import torch
 
-from sentinel_v3.data import StatefulShardSampler, time_weights
+from sentinel_v3.data import StatefulShardSampler, high_frequency_eligible, time_weights
 from sentinel_v3.physics import (
     db_to_intensity,
     db_to_normalized_sar,
@@ -37,13 +37,29 @@ def test_gsd_condition_values() -> None:
 
 def test_time_weights() -> None:
     physical, visual = time_weights(torch.tensor([0, 1, 2, 3]))
-    torch.testing.assert_close(physical, torch.tensor([1.0, 0.75, 0.4, 0.2]))
-    torch.testing.assert_close(visual, torch.tensor([1.0, 0.5, 0.0, 0.0]))
+    torch.testing.assert_close(physical, torch.tensor([1.0, 1.0, 0.75, 0.5]))
+    torch.testing.assert_close(visual, torch.tensor([1.0, 0.25, 0.0, 0.0]))
+
+
+def test_high_frequency_audit_is_strict() -> None:
+    common = {
+        "delta_days": 1,
+        "year": 2018,
+        "split": "train",
+        "valid_fraction": 0.9,
+        "cloud_shadow_fraction": 0.1,
+    }
+    assert high_frequency_eligible(registration_shift_px=0.5, **common)
+    assert not high_frequency_eligible(registration_shift_px=0.5001, **common)
+    assert not high_frequency_eligible(registration_shift_px=0.0, **{**common, "delta_days": 2})
 
 
 class _Dataset:
     shards: ClassVar[list[dict[str, int]]] = [
-        {"count": 5}, {"count": 5}, {"count": 5}, {"count": 5}
+        {"count": 5},
+        {"count": 5},
+        {"count": 5},
+        {"count": 5},
     ]
     ends: ClassVar[list[int]] = [5, 10, 15, 20]
 

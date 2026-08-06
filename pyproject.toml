@@ -3,18 +3,18 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sentinel-translate-v3-1"
-version = "0.3.0"
-description = "Sentinel-first bidirectional physical and stochastic translation"
+name = "sentinel-translate-v3-2"
+version = "0.4.0"
+description = "Low-error physical translation with separated deterministic detail and texture"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.3", "numpy>=1.26", "PyYAML>=6", "Pillow>=10"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8", "ruff>=0.6"]
-eval = ["lpips>=0.1.4", "DISTS-pytorch>=0.1"]
+eval = ["lpips>=0.1.4", "DISTS-pytorch>=0.1", "rasterio>=1.3"]
 
 [project.scripts]
-sentinel-v31 = "sentinel_v3.cli:main"
+sentinel-v32 = "sentinel_v3.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

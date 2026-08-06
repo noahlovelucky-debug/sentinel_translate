@@ -1,0 +1,11 @@
+paths:
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_recovery
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_recovery
+
+train:
+  stage: balance
+  max_steps: 5000
+  warmup_steps: 500
+
+validation:
+  full_steps: [5000]

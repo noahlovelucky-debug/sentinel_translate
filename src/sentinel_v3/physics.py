@@ -67,7 +67,10 @@ def physical_resample(
     ratio = target_gsd_m / source_gsd_m
     if math.isclose(ratio, 1.0):
         return values
-    output_size = (max(1, round(values.shape[-2] / ratio)), max(1, round(values.shape[-1] / ratio)))
+    output_size = (
+        max(1, round(values.shape[-2] / ratio)),
+        max(1, round(values.shape[-1] / ratio)),
+    )
     sigma = max(0.0, 0.5 * math.sqrt(ratio * ratio - 1.0))
     physical = db_to_intensity(values) if modality == "sar" else values
     # Area interpolation is the exact box/MTF integration for integer Sentinel views.
@@ -75,7 +78,9 @@ def physical_resample(
     filtered = physical if float(ratio).is_integer() else _blur(physical, sigma)
     reduced = F.interpolate(filtered.float(), size=output_size, mode="area")
     if restore_grid:
-        reduced = F.interpolate(reduced, size=values.shape[-2:], mode="bilinear", align_corners=False)
+        reduced = F.interpolate(
+            reduced, size=values.shape[-2:], mode="bilinear", align_corners=False
+        )
     if modality == "sar":
         reduced = intensity_to_db(reduced)
     return reduced.to(values.dtype)

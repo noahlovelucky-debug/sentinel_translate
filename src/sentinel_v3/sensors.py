@@ -48,7 +48,9 @@ SENTINEL2 = SensorSpec(
     modality="optical",
     units="surface_reflectance",
     channels=tuple(
-        ChannelSpec(name, "reflectance", native, 10.0, wavelength_nm=wavelength, psf_sigma_pixels=psf)
+        ChannelSpec(
+            name, "reflectance", native, 10.0, wavelength_nm=wavelength, psf_sigma_pixels=psf
+        )
         for name, wavelength, native, psf in (
             ("B02", 492.4, 10.0, 0.55),
             ("B03", 559.8, 10.0, 0.55),
@@ -90,4 +92,3 @@ def get_sensor(name: str) -> SensorSpec:
         return _REGISTRY[name]
     except KeyError as error:
         raise KeyError(f"unknown sensor {name!r}; registered={sorted(_REGISTRY)}") from error
-

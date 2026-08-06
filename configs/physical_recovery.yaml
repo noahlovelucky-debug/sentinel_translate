@@ -1,0 +1,28 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  manifest: /data/sentinel_translate/data/manifests/pairs.jsonl
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_recovery
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_recovery
+
+train:
+  stage: physical
+  max_steps: 12000
+  batch_size: 16
+  learning_rate: 0.00001
+  adapter_learning_rate: 0.0001
+  encoder_learning_rate: 0.000002
+  warmup_steps: 500
+  ema_decay: 0.999
+  native_gsd_probability: 0.8
+  physical_alignment_weight: 0.02
+  validate_every: 1000
+  full_validate_every: 5000
+  save_every: 1000
+  early_stop_patience: 5
+  pcgrad: true
+
+validation:
+  enabled: true
+  split: validation_temporal
+  quick_samples: 32
+  full_steps: [4000, 6000, 8000, 10000, 12000]

@@ -5,7 +5,7 @@ from pathlib import Path
 
 import torch
 
-from sentinel_v3.losses import latent_alignment
+from sentinel_v3.losses import latent_alignment, physical_loss
 from sentinel_v3.selection import select_checkpoint
 
 
@@ -16,38 +16,67 @@ def test_latent_alignment_prefers_correct_pairs() -> None:
     assert loss_aligned < loss_permuted
 
 
-def test_joint_checkpoint_requires_baseline(tmp_path: Path) -> None:
+def test_physical_loss_balances_acceptance_scale_errors() -> None:
+    mask = torch.ones(1, 1, 8, 8)
+    signs = torch.ones(1, 1, 8, 8)
+    signs[..., 4:, :] = -1
+    optical_target = torch.full((1, 3, 8, 8), 0.5)
+    sar_target = torch.full((1, 2, 8, 8), -20.0)
+    optical_loss, _ = physical_loss(
+        optical_target + 0.05 * signs,
+        torch.zeros_like(optical_target),
+        optical_target,
+        mask,
+        "optical",
+        torch.ones(1),
+    )
+    sar_loss, _ = physical_loss(
+        sar_target + 5.0 * signs,
+        torch.zeros_like(sar_target),
+        sar_target,
+        mask,
+        "sar",
+        torch.ones(1),
+    )
+    ratio = float(optical_loss / sar_loss)
+    assert 0.5 <= ratio <= 2.0
+
+
+def test_hard_gate_checkpoint_selection(tmp_path: Path) -> None:
     checkpoint = tmp_path / "candidate.pt"
     checkpoint.write_bytes(b"checkpoint")
     report = tmp_path / "report.json"
     report.write_text(
         json.dumps(
             {
-                "optical_edge_f1": 0.5,
-                "optical_psd_distance": 0.1,
-                "opt2sar_bias_db": 0.2,
-                "sar_enl_error": 0.1,
-                "sar2opt_rmse": 0.04,
-                "sar2opt_sam": 0.1,
-                "quality_gates": {
-                    "lpips_improves_5_percent": True,
-                    "dists_improves_5_percent": True,
-                    "edge_improves": True,
-                    "optical_psd_improves": True,
-                    "rgb_rmse_within_5_percent": True,
-                    "optical_bounds_within_0_1_percent": True,
-                    "sar_bias_within_0_5_db": True,
-                    "sar_psd_improves": True,
-                    "sar_enl_improves": True,
-                    "sar_histogram_improves": True,
-                },
+                "protocol_hash": "fixed-protocol",
+                "quality_gates": {"physical": True, "visual": True, "joint": True},
             }
         ),
         encoding="utf-8",
     )
-    without = select_checkpoint(checkpoint, [report], tmp_path / "without")
-    assert "best_joint.pt" not in without["selected"]
-    with_baseline = select_checkpoint(
-        checkpoint, [report], tmp_path / "with", baseline_rmse=0.041, baseline_sam=0.11
-    )
-    assert "best_joint.pt" in with_baseline["selected"]
+    result = select_checkpoint(checkpoint, [report], tmp_path / "selected")
+    assert result["selected"] == [
+        "best_physical.pt",
+        "best_visual.pt",
+        "best_joint.pt",
+    ]
+
+
+def test_selection_rejects_mixed_protocols(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "candidate.pt"
+    checkpoint.write_bytes(b"checkpoint")
+    reports = []
+    for index, protocol_hash in enumerate(("a", "b")):
+        report = tmp_path / f"report_{index}.json"
+        report.write_text(
+            json.dumps({"protocol_hash": protocol_hash, "quality_gates": {}}),
+            encoding="utf-8",
+        )
+        reports.append(report)
+    try:
+        select_checkpoint(checkpoint, reports, tmp_path / "selected")
+    except ValueError as error:
+        assert "protocol hash" in str(error)
+    else:
+        raise AssertionError("mixed protocols must be rejected")
