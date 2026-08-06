@@ -1033,6 +1033,8 @@ def train(
         "quick_early_stop_score": -float("inf"),
         "full_early_stop_score": -float("inf"),
         "physical_candidate_score": -float("inf"),
+        "codec_score": -float("inf"),
+        "detail_score": -float("inf"),
     }
     quality_gates: dict[str, bool] = {}
     optimizer_states: dict[str, object] = {}
@@ -1283,6 +1285,15 @@ def train(
                     improved = True
                 if is_full_validation:
                     quality_gates.update(report.get("quality_gates", {}))
+                    if stage in {"codec", "detail"}:
+                        component_score = _score(report, stage)
+                        component_key = f"{stage}_score"
+                        if (
+                            bool(report.get("quality_gates", {}).get(stage, False))
+                            and component_score > best_metrics[component_key]
+                        ):
+                            best_metrics[component_key] = component_score
+                            improved_kinds.add(stage)
                     if (
                         stage == "physical"
                         and early_score > best_metrics["physical_candidate_score"]
