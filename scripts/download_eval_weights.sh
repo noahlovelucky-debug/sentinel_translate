@@ -14,7 +14,7 @@ download() {
     echo "$name already verified"
     return
   fi
-  curl -k -L --fail --retry 10 --retry-delay 5 -C - "$url" -o "$partial"
+  curl -L --fail --retry 10 --retry-delay 5 -C - "$url" -o "$partial"
   local actual
   actual=$(sha256sum "$partial" | awk '{print $1}')
   if [[ "$actual" != "$prefix"* ]]; then
