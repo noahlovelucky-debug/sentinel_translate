@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .losses import masked_mean, spectral_angle
+from .losses import highpass, masked_mean, spectral_angle
 from .model import ModelConfig, SentinelV3
 from .sensors import SENTINEL1, SENTINEL2
 from .validation import ValidationProtocol, protocol_records, validation_protocol_hash
@@ -31,6 +31,15 @@ S2_KEYS = (
     "swir16",
     "swir22",
 )
+
+
+def aggregate_scene_bias(signed_biases: list[float]) -> tuple[float, float]:
+    if not signed_biases:
+        raise ValueError("at least one scene bias is required")
+    return (
+        abs(sum(signed_biases) / len(signed_biases)),
+        sum(abs(value) for value in signed_biases) / len(signed_biases),
+    )
 
 
 class ManifestCropDataset(Dataset[dict[str, object]]):
@@ -104,6 +113,8 @@ class ManifestCropDataset(Dataset[dict[str, object]]):
             "s1_date": record["s1_date"],
             "s2_date": record["s2_date"],
             "gsd": record["gsd"],
+            "tile": record["tile"],
+            "pixel_window": (col, row, size, size),
         }
 
 
@@ -166,7 +177,29 @@ def load_checkpoint(
             f"incompatible checkpoint: missing={missing}, "
             f"unexpected={incompatible.unexpected_keys}"
         )
+    temporal_config = payload.get("temporal_prior") or payload["config"].get(
+        "temporal_prior"
+    )
+    model.configure_temporal_prior(temporal_config)
     return model.to(device).eval()
+
+
+def apply_manifest_temporal_prior(
+    model: SentinelV3,
+    physical: Tensor,
+    item: dict[str, object],
+    target_sensor: object,
+) -> tuple[Tensor, Tensor, Tensor]:
+    target = SENTINEL2 if target_sensor == SENTINEL2 else SENTINEL1
+    acquired = item["s2_date"] if target.modality == "optical" else item["s1_date"]
+    return model.apply_temporal_prior(
+        physical,
+        target,
+        acquired=str(acquired),
+        location_id=str(item["tile"]),
+        pixel_window=item["pixel_window"],  # type: ignore[arg-type]
+        orbit=str(item["orbit"]),
+    )
 
 
 def _edge(values: Tensor) -> Tensor:
@@ -352,6 +385,12 @@ def evaluate_model(
                 target_gsd=gsd,
                 metadata=metadata,
             )
+            s2_mean, optical_prior_coverage, optical_prior_violation = (
+                apply_manifest_temporal_prior(model, s2_mean, item, SENTINEL2)
+            )
+            sar_mean, sar_prior_coverage, sar_prior_violation = (
+                apply_manifest_temporal_prior(model, sar_mean, item, SENTINEL1)
+            )
             optical_detail = (
                 model.deterministic_detail(
                     sar_pyramid, SENTINEL1, SENTINEL2, tuple(s2.shape[-2:])
@@ -394,8 +433,14 @@ def evaluate_model(
             "sar2opt_rmse": torch.sqrt(masked_mean((s2_mean - s2).square(), valid)),
             "sar2opt_sam_deg": spectral_angle(s2_mean, s2, valid) * (180.0 / math.pi),
             "opt2sar_rmse_db": torch.sqrt(masked_mean((sar_mean - sar).square(), valid)),
-            "opt2sar_physical_bias_db": masked_mean(sar_mean - sar, valid).abs(),
-            "opt2sar_visual_bias_db": masked_mean(sar_visual - sar, valid).abs(),
+            "opt2sar_physical_signed_bias_db": masked_mean(sar_mean - sar, valid),
+            "opt2sar_physical_scene_abs_bias_db": masked_mean(
+                sar_mean - sar, valid
+            ).abs(),
+            "opt2sar_visual_signed_bias_db": masked_mean(sar_visual - sar, valid),
+            "opt2sar_visual_scene_abs_bias_db": masked_mean(
+                sar_visual - sar, valid
+            ).abs(),
             "physical_rgb_rmse": torch.sqrt(
                 masked_mean((physical_rgb - target_rgb).square(), valid)
             ),
@@ -428,6 +473,10 @@ def evaluate_model(
             "visual_lpips": visual_lpips,
             "physical_dists": physical_dists,
             "visual_dists": visual_dists,
+            "optical_temporal_prior_coverage": optical_prior_coverage,
+            "sar_temporal_prior_coverage": sar_prior_coverage,
+            "optical_temporal_prior_pre_projection_violation": optical_prior_violation,
+            "sar_temporal_prior_pre_projection_violation": sar_prior_violation,
         }
         for name, value in metrics.items():
             sums[name] = sums.get(name, 0.0) + float(value)
@@ -453,6 +502,10 @@ def evaluate_model(
         else None,
     }
     report.update({name: value / len(dataset) for name, value in sums.items()})
+    report["opt2sar_physical_bias_db"] = abs(
+        report.pop("opt2sar_physical_signed_bias_db")
+    )
+    report["opt2sar_visual_bias_db"] = abs(report.pop("opt2sar_visual_signed_bias_db"))
     report["lpips_improvement"] = (report["physical_lpips"] - report["visual_lpips"]) / max(
         report["physical_lpips"], 1e-8
     )
@@ -502,7 +555,8 @@ def evaluate_physical_model(
         "sar2opt_squared_error": 0.0,
         "sar2opt_sam_deg": 0.0,
         "opt2sar_squared_error": 0.0,
-        "opt2sar_physical_bias_db": 0.0,
+        "opt2sar_signed_bias_db": 0.0,
+        "opt2sar_scene_abs_bias_db": 0.0,
     }
     slices: dict[str, dict[str, dict[str, float]]] = {
         "delta_days": {},
@@ -517,7 +571,8 @@ def evaluate_physical_model(
                 "sar2opt_squared_error": 0.0,
                 "sar2opt_sam_deg": 0.0,
                 "opt2sar_squared_error": 0.0,
-                "opt2sar_physical_bias_db": 0.0,
+                "opt2sar_signed_bias_db": 0.0,
+                "opt2sar_scene_abs_bias_db": 0.0,
             },
         )
         bucket["samples"] += 1.0
@@ -549,11 +604,14 @@ def evaluate_physical_model(
                 target_gsd=gsd,
                 metadata=metadata,
             )[0]
+            s2_mean = apply_manifest_temporal_prior(model, s2_mean, item, SENTINEL2)[0]
+            sar_mean = apply_manifest_temporal_prior(model, sar_mean, item, SENTINEL1)[0]
         values = {
             "sar2opt_squared_error": float(masked_mean((s2_mean - s2).square(), valid)),
             "sar2opt_sam_deg": float(spectral_angle(s2_mean, s2, valid) * (180.0 / math.pi)),
             "opt2sar_squared_error": float(masked_mean((sar_mean - sar).square(), valid)),
-            "opt2sar_physical_bias_db": float(masked_mean(sar_mean - sar, valid).abs()),
+            "opt2sar_signed_bias_db": float(masked_mean(sar_mean - sar, valid)),
+            "opt2sar_scene_abs_bias_db": float(masked_mean(sar_mean - sar, valid).abs()),
         }
         for key, value in values.items():
             sums[key] += value
@@ -567,7 +625,8 @@ def evaluate_physical_model(
             "sar2opt_rmse": math.sqrt(values["sar2opt_squared_error"] / count),
             "sar2opt_sam_deg": values["sar2opt_sam_deg"] / count,
             "opt2sar_rmse_db": math.sqrt(values["opt2sar_squared_error"] / count),
-            "opt2sar_physical_bias_db": values["opt2sar_physical_bias_db"] / count,
+            "opt2sar_physical_bias_db": abs(values["opt2sar_signed_bias_db"] / count),
+            "opt2sar_scene_abs_bias_db": values["opt2sar_scene_abs_bias_db"] / count,
         }
 
     report: dict[str, Any] = {
@@ -579,7 +638,8 @@ def evaluate_physical_model(
         "sar2opt_rmse": math.sqrt(sums["sar2opt_squared_error"] / len(dataset)),
         "sar2opt_sam_deg": sums["sar2opt_sam_deg"] / len(dataset),
         "opt2sar_rmse_db": math.sqrt(sums["opt2sar_squared_error"] / len(dataset)),
-        "opt2sar_physical_bias_db": sums["opt2sar_physical_bias_db"] / len(dataset),
+        "opt2sar_physical_bias_db": abs(sums["opt2sar_signed_bias_db"] / len(dataset)),
+        "opt2sar_scene_abs_bias_db": sums["opt2sar_scene_abs_bias_db"] / len(dataset),
         "slices": {
             group: {name: finalize(values) for name, values in buckets.items()}
             for group, buckets in slices.items()
@@ -592,6 +652,105 @@ def evaluate_physical_model(
         and report["opt2sar_physical_bias_db"] <= 0.5
     )
     report["quality_gates"] = {"physical": physical_gate}
+    return report
+
+
+def evaluate_high_frequency_components(
+    model: SentinelV3,
+    manifest: str,
+    split: str,
+    stage: str,
+    *,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    if stage not in {"detail", "codec"}:
+        raise ValueError("component validation supports detail or codec")
+    device = next(model.parameters()).device
+    dataset = ManifestCropDataset(manifest, split, limit=limit)
+    sums: dict[str, float] = {}
+    counts = {"optical": 0, "sar": 0}
+    for item in dataset:
+        if int(item["delta_days"]) > 1:
+            continue
+        s2 = item["s2"].unsqueeze(0).to(device)  # type: ignore[union-attr]
+        sar = item["sar"].unsqueeze(0).to(device)  # type: ignore[union-attr]
+        valid = item["valid"].unsqueeze(0).to(device)  # type: ignore[union-attr]
+        metadata = manifest_metadata(item, device)
+        gsd = float(item["gsd"])
+        directions = (
+            (sar, s2, SENTINEL1, SENTINEL2, "optical"),
+            (s2, sar, SENTINEL2, SENTINEL1, "sar"),
+        )
+        with torch.inference_mode():
+            for source, target, source_spec, target_spec, name in directions:
+                target_visual = target[:, [2, 1, 0]] if name == "optical" else target
+                if stage == "codec":
+                    texture = highpass(target_visual * valid) * valid
+                    latent = model.codec.encode(texture, name)
+                    reconstruction = model.codec.decode(latent, name)
+                    codec_mae = masked_mean((reconstruction - texture).abs(), valid)
+                    sums[f"{name}_codec_mae"] = sums.get(
+                        f"{name}_codec_mae", 0.0
+                    ) + float(codec_mae)
+                    counts[name] += 1
+                    continue
+                physical, _, pyramid = model.physical(
+                    source,
+                    source_spec,
+                    target_spec,
+                    valid,
+                    input_gsd=gsd,
+                    target_gsd=gsd,
+                    metadata=metadata,
+                )
+                physical = apply_manifest_temporal_prior(
+                    model, physical, item, target_spec
+                )[0]
+                base = physical[:, [2, 1, 0]] if name == "optical" else physical
+                target_detail = highpass((target_visual - base) * valid) * valid
+                prediction = model.deterministic_detail(
+                    pyramid, source_spec, target_spec, tuple(base.shape[-2:])
+                )
+                zero_mae = masked_mean(target_detail.abs(), valid)
+                detail_mae = masked_mean((prediction - target_detail).abs(), valid)
+                sums[f"{name}_detail_zero_mae"] = sums.get(
+                    f"{name}_detail_zero_mae", 0.0
+                ) + float(zero_mae)
+                sums[f"{name}_detail_mae"] = sums.get(f"{name}_detail_mae", 0.0) + float(
+                    detail_mae
+                )
+                counts[name] += 1
+    report: dict[str, Any] = {
+        "split": split,
+        "samples": sum(counts.values()) // 2,
+        "eligible_samples": counts["optical"],
+        "protocol_hash": validation_protocol_hash(manifest)
+        if split == "validation_temporal"
+        else None,
+    }
+    for name in ("optical", "sar"):
+        count = max(counts[name], 1)
+        if stage == "codec":
+            report[f"{name}_codec_mae"] = sums[f"{name}_codec_mae"] / count
+            continue
+        zero = sums[f"{name}_detail_zero_mae"] / count
+        detail = sums[f"{name}_detail_mae"] / count
+        report[f"{name}_detail_zero_mae"] = zero
+        report[f"{name}_detail_mae"] = detail
+        report[f"{name}_detail_mae_improvement"] = (zero - detail) / max(zero, 1e-8)
+    if stage == "codec":
+        report["quality_gates"] = {
+            "codec": (
+            report["optical_codec_mae"] <= 0.02 and report["sar_codec_mae"] <= 1.0
+            )
+        }
+    else:
+        report["quality_gates"] = {
+            "detail": all(
+                report[f"{name}_detail_mae_improvement"] >= 0.30
+                for name in ("optical", "sar")
+            )
+        }
     return report
 
 

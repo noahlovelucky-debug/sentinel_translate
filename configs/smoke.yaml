@@ -48,6 +48,7 @@ train:
   registration_audit: false
   require_physical_gate: false
   require_codec_gate: false
+  require_detail_gate: false
 
 validation:
   enabled: false

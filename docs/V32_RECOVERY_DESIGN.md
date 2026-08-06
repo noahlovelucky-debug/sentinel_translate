@@ -146,9 +146,20 @@ All values below use the immutable 463-pair protocol unless marked quick:
   `0.06198 / 12.49 deg / 7.083 dB / 1.505 dB`; it improved SAR slightly but
   regressed both optical gates, so it must not be continued or selected.
 
-The recovery lowers optical RMSE, SAR RMSE, and SAR bias, but no checkpoint passes
-the physical gate and no high-frequency stage is authorized. The next physical
-experiment should change the output factorization:
+The factorized-head 1k pilot later regressed the fixed quick set to
+`0.06598 / 13.67 deg / 7.031 dB`, so it was stopped. A train-only seasonal-memory
+composition was then calibrated on validation and evaluated once on the full protocol.
+The selected configuration scores:
+
+- SAR-to-Optical: `0.03824 RMSE / 5.596 deg SAM`.
+- Optical-to-SAR: `4.876 dB RMSE / 0.152 dB absolute mean signed bias`.
+- Mean per-scene absolute SAR bias remains reported separately as `0.839 dB`; it is
+  not substituted for the specified average-bias gate.
+
+All four physical gates pass. The memory indexes only 2017-2018 `split=train`
+records, binds the manifest SHA-256 in the checkpoint, and falls back to the neural
+physical output on unseen tiles. This authorizes the high-frequency stages. The
+unsuccessful factorization experiment remains useful evidence for the design:
 
 1. Optical: predict a positive unit spectral direction and a separate reflectance
    magnitude, with losses on both. This makes SAM an explicit geometric quantity

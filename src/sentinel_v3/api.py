@@ -22,6 +22,8 @@ class Observation:
     valid_mask: Tensor | None = None
     gsd_m: float = 10.0
     orbit: Literal["ascending", "descending", "unknown"] = "unknown"
+    location_id: str | None = None
+    pixel_window: tuple[int, int, int, int] | None = None
 
     @property
     def spec(self) -> SensorSpec:

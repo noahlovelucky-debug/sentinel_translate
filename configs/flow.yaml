@@ -5,6 +5,7 @@ paths:
 train:
   stage: flow
   max_steps: 40000
+  num_workers: 4
   learning_rate: 0.0001
   warmup_steps: 2000
 

@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
-import shutil
 from pathlib import Path
 from typing import Any
+
+import torch
 
 
 def select_checkpoint(
@@ -33,13 +34,20 @@ def select_checkpoint(
     destination = Path(output_dir)
     destination.mkdir(parents=True, exist_ok=True)
     selected: list[str] = []
+    payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    if int(payload.get("format_version", 0)) != 4:
+        raise RuntimeError("checkpoint selection requires V3.2 format-v4 input")
+    payload.setdefault("quality_gates", {}).update(
+        {"physical": physical_pass, "visual": visual_pass, "joint": joint_pass}
+    )
+    payload["selection_reports"] = [str(Path(path).resolve()) for path in report_paths]
     for passed, name in (
         (physical_pass, "best_physical.pt"),
         (visual_pass, "best_visual.pt"),
         (joint_pass, "best_joint.pt"),
     ):
         if passed:
-            shutil.copy2(checkpoint, destination / name)
+            torch.save(payload, destination / name)
             selected.append(name)
     result = {
         "physical_pass": physical_pass,

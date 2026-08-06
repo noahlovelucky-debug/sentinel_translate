@@ -138,6 +138,27 @@ class JointObjective(nn.Module):
                 target_gsd=batch["target_gsd"][indices],  # type: ignore[index]
                 metadata=batch["metadata"][indices],  # type: ignore[index]
             )
+            if self.model.temporal_prior is not None:
+                corrected: list[Tensor] = []
+                batch_indices = indices.detach().cpu().tolist()
+                for local_index, batch_index in enumerate(batch_indices):
+                    pair_id = str(batch["pair_id"][batch_index])  # type: ignore[index]
+                    _, location_id, s1_date, orbit, s2_date = pair_id.split(":")
+                    window_values = batch["window"][batch_index].tolist()  # type: ignore[index]
+                    pixel_window = tuple(int(value) for value in window_values)
+                    acquired = s2_date if target_spec.modality == "optical" else s1_date
+                    corrected.append(
+                        self.model.apply_temporal_prior(
+                            physical[local_index : local_index + 1],
+                            target_spec,
+                            acquired=acquired,
+                            location_id=location_id,
+                            pixel_window=pixel_window,  # type: ignore[arg-type]
+                            orbit=orbit,
+                            exclude_pair_id=pair_id,
+                        )[0]
+                    )
+                physical = torch.cat(corrected)
         target = self._visual_target(batch[target_key][indices], target_spec)  # type: ignore[index]
         base = self._visual_physical(physical, target_spec)
         valid = batch["valid"][indices]  # type: ignore[index]
@@ -225,20 +246,10 @@ class JointObjective(nn.Module):
         target_spec: SensorSpec,
         weights: Tensor,
     ) -> tuple[Tensor, dict[str, Tensor]]:
-        with torch.no_grad():
-            target, base, valid, pyramid = self._physical_context(
-                batch,
-                indices,
-                source_key,
-                target_key,
-                source_spec,
-                target_spec,
-                joint=False,
-            )
-            detail = self.model.deterministic_detail(
-                pyramid, source_spec, target_spec, tuple(target.shape[-2:])
-            )
-            texture = self._texture_target(target, base, detail, valid)
+        del source_key, source_spec
+        target = self._visual_target(batch[target_key][indices], target_spec)  # type: ignore[index]
+        valid = batch["valid"][indices]  # type: ignore[index]
+        texture = highpass(target * valid) * valid
         raw_latent = self.model.codec.encode(texture, target_spec.modality, standardized=False)
         self.model.codec.update_statistics(raw_latent, target_spec.modality)
         latent = self.model.codec.normalize(raw_latent, target_spec.modality)
@@ -832,6 +843,7 @@ def _checkpoint_payload(
         "validation_protocol_hash": validation_protocol_hash,
         "best_metrics": best_metrics,
         "quality_gates": quality_gates,
+        "temporal_prior": config.get("temporal_prior"),
     }
 
 
@@ -846,12 +858,22 @@ def _validate_training_state(
     validation = config.get("validation", {})
     if not bool(validation.get("enabled", False)):
         return {}
-    from .evaluation import evaluate_model, evaluate_physical_model
+    from .evaluation import (
+        evaluate_high_frequency_components,
+        evaluate_model,
+        evaluate_physical_model,
+    )
 
     limit = None if full else int(validation.get("quick_samples", 32))
-    if stage == "codec":
-        return {}
-    if stage in {"physical", "detail"}:
+    if stage in {"detail", "codec"}:
+        return evaluate_high_frequency_components(
+            model,
+            config["paths"]["manifest"],
+            str(validation.get("split", "validation_temporal")),
+            stage,
+            limit=limit,
+        )
+    if stage == "physical":
         return evaluate_physical_model(
             model,
             config["paths"]["manifest"],
@@ -878,6 +900,16 @@ def _score(report: dict[str, Any], kind: str) -> float:
             float(report.get("opt2sar_physical_bias_db", float("inf"))) / 0.5,
         )
         return -max(ratios)
+    if kind == "detail":
+        return min(
+            float(report.get("optical_detail_mae_improvement", -float("inf"))),
+            float(report.get("sar_detail_mae_improvement", -float("inf"))),
+        )
+    if kind == "codec":
+        return -max(
+            float(report.get("optical_codec_mae", float("inf"))) / 0.02,
+            float(report.get("sar_codec_mae", float("inf"))) / 1.0,
+        )
     if kind == "visual":
         return float(report.get("lpips_improvement", -float("inf"))) + float(
             report.get("dists_improvement", -float("inf"))
@@ -928,7 +960,21 @@ def train(
         and bool(train_config.get("registration_audit", True)),
     )
     if limit is not None:
-        dataset = Subset(dataset, range(min(limit, len(dataset))))
+        if stage in {"detail", "codec", "flow", "balance"}:
+            eligible_indices: list[int] = []
+            for index in range(len(dataset)):
+                if bool(dataset[index]["hf_eligible"]):
+                    eligible_indices.append(index)
+                    if len(eligible_indices) == limit:
+                        break
+            if len(eligible_indices) < limit:
+                raise RuntimeError(
+                    f"requested {limit} high-frequency patches but found "
+                    f"only {len(eligible_indices)} eligible patches"
+                )
+            dataset = Subset(dataset, eligible_indices)
+        else:
+            dataset = Subset(dataset, range(min(limit, len(dataset))))
     sampler = (
         None
         if isinstance(dataset, Subset)
@@ -981,6 +1027,12 @@ def train(
     if init_model:
         initial = torch.load(init_model, map_location="cpu", weights_only=False)
         initial_state = dict(initial["model"])
+        temporal_config = initial.get("temporal_prior") or initial.get("config", {}).get(
+            "temporal_prior"
+        )
+        if temporal_config:
+            config["temporal_prior"] = temporal_config
+            model.configure_temporal_prior(temporal_config)
         if bool(train_config.get("init_use_ema", False)) and "ema" in initial:
             initial_state.update(initial["ema"]["state"])
         loaded, initialized = _load_compatible_state(model, initial_state)
@@ -999,6 +1051,14 @@ def train(
         ):
             raise RuntimeError(
                 "flow training requires a frozen codec checkpoint that passed reconstruction gates"
+            )
+        if (
+            stage in {"flow", "balance"}
+            and bool(train_config.get("require_detail_gate", True))
+            and not bool(initial.get("quality_gates", {}).get("detail", False))
+        ):
+            raise RuntimeError(
+                "flow training requires a deterministic-detail checkpoint that passed its gate"
             )
         if int(initial.get("format_version", 0)) == 4:
             optimizer_states.update(initial.get("optimizer_states", {}))
@@ -1028,6 +1088,12 @@ def train(
         if checkpoint["stage"] != stage:
             raise RuntimeError("a checkpoint may only resume the same V3.2 training stage")
         model.load_state_dict(checkpoint["model"])
+        temporal_config = checkpoint.get("temporal_prior") or checkpoint.get("config", {}).get(
+            "temporal_prior"
+        )
+        if temporal_config:
+            config["temporal_prior"] = temporal_config
+            model.configure_temporal_prior(temporal_config)
         optimizer.load_state_dict(checkpoint["optimizer_states"][stage])
         scheduler.load_state_dict(checkpoint["scheduler_states"][stage])
         ema.load_state_dict(checkpoint["ema"], device, model)
@@ -1187,7 +1253,7 @@ def train(
                 report = report_objects[0]
             if report:
                 improved = False
-                early_kind = "physical" if stage in {"physical", "detail"} else "visual"
+                early_kind = stage if stage in {"physical", "detail", "codec"} else "visual"
                 early_score = _score(report, early_kind)
                 scope = "full" if is_full_validation else "quick"
                 early_key = f"{scope}_early_stop_score"
@@ -1215,13 +1281,6 @@ def train(
                             improved_kinds.add(kind)
                 if not is_full_validation:
                     stale_validations = 0 if improved else stale_validations + 1
-            if stage == "codec" and is_full_validation:
-                optical_error = aggregate.get("sar2opt/codec_charbonnier", float("inf"))
-                sar_error = aggregate.get("opt2sar/codec_charbonnier", float("inf"))
-                thresholds = train_config.get("codec_gates", {})
-                quality_gates["codec"] = optical_error <= float(
-                    thresholds.get("optical_charbonnier", 0.02)
-                ) and sar_error <= float(thresholds.get("sar_charbonnier", 1.0))
             if rank == 0:
                 validation_report = report or {
                     "stage": stage,

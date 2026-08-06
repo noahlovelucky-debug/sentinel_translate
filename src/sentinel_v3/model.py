@@ -14,6 +14,7 @@ from .api import Observation, TargetRequest, TranslationResult
 from .losses import highpass
 from .physics import gsd_condition
 from .sensors import ChannelSpec, SensorSpec
+from .temporal_prior import TemporalPriorConfig, TemporalPriorStore
 
 Pyramid = tuple[Tensor, Tensor, Tensor, Tensor]
 
@@ -740,6 +741,44 @@ class SentinelV3(nn.Module):
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("sar_alpha_scale", torch.ones(()))
+        self.temporal_prior: TemporalPriorStore | None = None
+
+    def configure_temporal_prior(self, config: dict[str, object] | None) -> None:
+        self.temporal_prior = (
+            TemporalPriorStore(TemporalPriorConfig.from_dict(config)) if config else None
+        )
+
+    def apply_temporal_prior(
+        self,
+        physical: Tensor,
+        target: SensorSpec,
+        *,
+        acquired: date | str,
+        location_id: str | None,
+        pixel_window: tuple[int, int, int, int] | None,
+        orbit: str = "unknown",
+        exclude_pair_id: str | None = None,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        zero = physical.new_zeros(())
+        if self.temporal_prior is None or location_id is None or pixel_window is None:
+            return physical, zero, zero
+        queried = self.temporal_prior.query(
+            location_id=location_id,
+            acquired=acquired,
+            modality=target.modality,
+            pixel_window=pixel_window,
+            orbit=orbit,
+            device=physical.device,
+            dtype=physical.dtype,
+            exclude_pair_id=exclude_pair_id,
+        )
+        if queried is None:
+            return physical, zero, zero
+        prior, coverage = queried
+        composed, violation = self.temporal_prior.compose(
+            physical, prior, coverage, target.modality
+        )
+        return composed, coverage.float().mean(), violation
 
     @staticmethod
     def descriptors(channels: Iterable[ChannelSpec], device: torch.device) -> Tensor:
@@ -1013,11 +1052,26 @@ class SentinelV3(nn.Module):
             target_gsd=target.gsd_m,
             metadata=metadata,
         )
+        target_date = target.acquired or observation.acquired
+        physical, prior_coverage, prior_violation = self.apply_temporal_prior(
+            physical,
+            target.spec,
+            acquired=target_date,
+            location_id=observation.location_id,
+            pixel_window=observation.pixel_window,
+            orbit=observation.orbit,
+        )
         result = TranslationResult(
             physical=physical,
             uncertainty=torch.exp(0.5 * log_variance) * valid,
             target=target,
-            metadata={"seed": seed, "mode": mode, "source_sensor": observation.spec.name},
+            metadata={
+                "seed": seed,
+                "mode": mode,
+                "source_sensor": observation.spec.name,
+                "temporal_prior_coverage": float(prior_coverage),
+                "temporal_prior_pre_projection_violation": float(prior_violation),
+            },
         )
         if mode == "physical":
             return result

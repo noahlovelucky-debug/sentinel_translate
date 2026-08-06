@@ -48,6 +48,7 @@ DEFAULT: dict[str, Any] = {
         "registration_audit": True,
         "require_physical_gate": True,
         "require_codec_gate": True,
+        "require_detail_gate": True,
         "balance_learning_rates": {
             "encoder": 0.000002,
             "physical_detail": 0.00001,

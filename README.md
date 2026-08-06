@@ -62,6 +62,20 @@ direction adapter LR `1e-4`. It evaluates full candidates at 4k/6k/8k/10k/12k an
 five comparable validations without improvement. Older checkpoints may be used only with
 `--init-model`; `--resume` accepts V3.2 format-v4 checkpoints from the same stage.
 
+The selected physical predictor also has a train-only seasonal memory for locations observed
+in 2017-2018. Optical uses six unique acquisitions with an exponential 30-day seasonal kernel
+for spectral direction and a `0.75` amplitude blend. SAR uses eight same-orbit acquisitions
+with a uniform robust seasonal mean and a `0.80` blend. The manifest hash and all calibration
+values are stored in the checkpoint. `Observation.location_id` and `pixel_window` opt into this
+path; unseen spatial tiles fall back exactly to the neural physical model.
+
+```bash
+PYTHONPATH=src python -m sentinel_v3.cli --config configs/physical_recovery.yaml \
+  configure-temporal-prior \
+  --checkpoint checkpoints_v32_condition_pilot/physical/step_0004000.pt \
+  --output checkpoints_v32_temporal/physical_candidate.pt
+```
+
 ## Staged training
 
 The required local order is physical -> codec 20k -> detail 20k -> flow pilots/full 40k ->
@@ -84,6 +98,10 @@ are written under `reports_v32_recovery`; format-v4 checkpoints and `latest.pt`,
 `best_physical_candidate.pt`, `best_physical.pt`, `best_visual.pt`, and `best_joint.pt` are
 confined to `checkpoints_v32_recovery`. A candidate symlink records progress but cannot unlock
 high-frequency training; only `best_physical.pt` can do that.
+
+Codec and deterministic-detail gates are also computed on fixed manifest crops, not the most
+recent training batch. Flow requires both gates in its initializer. The detail gate requires at
+least 30% MAE improvement over zero output independently for Optical and SAR.
 
 Calibrate a trained flow checkpoint before final selection:
 

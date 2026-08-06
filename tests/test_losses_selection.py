@@ -44,7 +44,7 @@ def test_physical_loss_balances_acceptance_scale_errors() -> None:
 
 def test_hard_gate_checkpoint_selection(tmp_path: Path) -> None:
     checkpoint = tmp_path / "candidate.pt"
-    checkpoint.write_bytes(b"checkpoint")
+    torch.save({"format_version": 4, "quality_gates": {}}, checkpoint)
     report = tmp_path / "report.json"
     report.write_text(
         json.dumps(
@@ -61,6 +61,14 @@ def test_hard_gate_checkpoint_selection(tmp_path: Path) -> None:
         "best_visual.pt",
         "best_joint.pt",
     ]
+    selected = torch.load(
+        tmp_path / "selected" / "best_physical.pt", weights_only=False
+    )
+    assert selected["quality_gates"] == {
+        "physical": True,
+        "visual": True,
+        "joint": True,
+    }
 
 
 def test_selection_rejects_mixed_protocols(tmp_path: Path) -> None:

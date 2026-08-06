@@ -13,6 +13,7 @@ from .config import load_config
 from .evaluation import evaluate
 from .model import ModelConfig, SentinelV3
 from .selection import select_checkpoint
+from .temporal_prior import configure_checkpoint_temporal_prior
 from .training import train
 from .validation import ValidationProtocol, validation_protocol_hash
 
@@ -64,6 +65,11 @@ def _parser() -> argparse.ArgumentParser:
     calibration.add_argument("--output", required=True)
     calibration.add_argument("--limit", type=int)
     calibration.add_argument("--seed", type=int, default=42)
+    temporal = commands.add_parser("configure-temporal-prior")
+    temporal.add_argument("--checkpoint", required=True)
+    temporal.add_argument("--output", required=True)
+    temporal.add_argument("--optical-amplitude-weight", type=float, default=0.75)
+    temporal.add_argument("--sar-weight", type=float, default=0.80)
     selection = commands.add_parser("select-checkpoint")
     selection.add_argument("--checkpoint", required=True)
     selection.add_argument("--report", action="append", required=True)
@@ -161,6 +167,15 @@ def main() -> None:
             args.output,
             seed=args.seed,
             limit=args.limit,
+        )
+        print(json.dumps(result, indent=2))
+    elif args.command == "configure-temporal-prior":
+        result = configure_checkpoint_temporal_prior(
+            args.checkpoint,
+            config["paths"]["manifest"],
+            args.output,
+            optical_amplitude_weight=args.optical_amplitude_weight,
+            sar_weight=args.sar_weight,
         )
         print(json.dumps(result, indent=2))
     elif args.command == "select-checkpoint":
