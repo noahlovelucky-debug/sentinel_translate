@@ -670,6 +670,12 @@ def _optimizer(
         model.decoder.radiometric_descriptor,
         model.decoder.radiometric_bias,
         model.decoder.full_resolution_fusion,
+        model.decoder.optical_direction_kernel,
+        model.decoder.optical_amplitude_head,
+        model.decoder.sar_spatial_kernel,
+        model.decoder.sar_mean_condition,
+        model.decoder.sar_mean_descriptor,
+        model.decoder.sar_mean_head,
     )
     direction_parameters = [
         parameter for module in direction_modules for parameter in module.parameters()
@@ -941,6 +947,11 @@ def train(
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     _set_trainable(model, stage)
+    if stage == "physical" and not bool(
+        train_config.get("train_full_resolution_fusion", False)
+    ):
+        for parameter in model.decoder.full_resolution_fusion.parameters():
+            parameter.requires_grad_(False)
     optimizer = _optimizer(model, train_config, stage, device)
     scheduler = _scheduler(
         optimizer, int(train_config["warmup_steps"]), int(train_config["max_steps"])
@@ -1099,6 +1110,16 @@ def train(
             with sync_context, amp_context:
                 loss, metrics = wrapped(batch, stage)  # type: ignore[operator]
                 loss = loss / accumulation
+            if not bool(torch.isfinite(loss.detach())):
+                finite_metrics = {
+                    name: float(value.detach())
+                    for name, value in metrics.items()
+                    if bool(torch.isfinite(value.detach()))
+                }
+                raise FloatingPointError(
+                    f"non-finite {stage} loss at step {step}, micro-step {micro_step}; "
+                    f"finite metrics={finite_metrics}"
+                )
             if (
                 stage == "physical"
                 and bool(train_config.get("pcgrad", True))

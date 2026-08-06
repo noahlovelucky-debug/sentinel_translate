@@ -15,6 +15,7 @@ train:
   ema_decay: 0.999
   native_gsd_probability: 0.8
   physical_alignment_weight: 0.02
+  train_full_resolution_fusion: false
   validate_every: 1000
   full_validate_every: 5000
   save_every: 1000

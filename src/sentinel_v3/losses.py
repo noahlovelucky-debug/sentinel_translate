@@ -236,9 +236,21 @@ def physical_loss(
     }
     if modality == "optical":
         sam = spectral_angle(prediction, target, weight)
+        magnitude_error = (
+            torch.linalg.vector_norm(prediction, dim=1, keepdim=True)
+            - torch.linalg.vector_norm(target, dim=1, keepdim=True)
+        ).abs()
+        magnitude = masked_mean(magnitude_error, weight)
         sam_gate_radians = math.radians(5.716)
-        total = total + 0.1 * sam / sam_gate_radians + 0.1 * channel_bias / 0.05
+        magnitude_scale = math.sqrt(prediction.shape[1]) * 0.05
+        total = (
+            total
+            + 0.1 * sam / sam_gate_radians
+            + 0.1 * magnitude / magnitude_scale
+            + 0.1 * channel_bias / 0.05
+        )
         metrics["sam"] = sam.detach()
+        metrics["spectral_magnitude"] = magnitude.detach()
     else:
         relation = masked_mean(
             ((prediction[:, :1] - prediction[:, 1:2]) - (target[:, :1] - target[:, 1:2])).abs(),

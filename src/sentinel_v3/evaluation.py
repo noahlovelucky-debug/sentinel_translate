@@ -149,6 +149,12 @@ def load_checkpoint(
         "decoder.radiometric_descriptor.",
         "decoder.radiometric_bias.",
         "decoder.full_resolution_fusion.",
+        "decoder.optical_direction_kernel.",
+        "decoder.optical_amplitude_head.",
+        "decoder.sar_spatial_kernel.",
+        "decoder.sar_mean_condition.",
+        "decoder.sar_mean_descriptor.",
+        "decoder.sar_mean_head.",
     )
     missing = [
         name

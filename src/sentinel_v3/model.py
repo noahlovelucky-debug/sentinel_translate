@@ -304,6 +304,20 @@ class DynamicPhysicalDecoder(nn.Module):
         self.radiometric_bias = nn.ModuleDict(
             {modality: nn.Linear(width, 1) for modality in ("optical", "sar")}
         )
+        self.optical_direction_kernel = nn.Sequential(
+            nn.Linear(8, width), nn.SiLU(), nn.Linear(width, width + 1)
+        )
+        self.optical_amplitude_head = nn.Sequential(
+            nn.Conv2d(width, width, 1), nn.SiLU(), nn.Conv2d(width, 1, 1)
+        )
+        self.sar_spatial_kernel = nn.Sequential(
+            nn.Linear(8, width), nn.SiLU(), nn.Linear(width, width + 1)
+        )
+        self.sar_mean_condition = nn.Sequential(
+            nn.Linear(11, width), nn.SiLU(), nn.Linear(width, width)
+        )
+        self.sar_mean_descriptor = nn.Linear(8, width)
+        self.sar_mean_head = nn.Linear(width, 1)
         for kernel in self.radiometric_kernel.values():
             nn.init.zeros_(kernel[-1].weight)
             nn.init.zeros_(kernel[-1].bias)
@@ -313,6 +327,14 @@ class DynamicPhysicalDecoder(nn.Module):
         for fusion in self.full_resolution_fusion.values():
             nn.init.zeros_(fusion[-1].weight)
             nn.init.zeros_(fusion[-1].bias)
+        for head in (
+            self.optical_direction_kernel[-1],
+            self.optical_amplitude_head[-1],
+            self.sar_spatial_kernel[-1],
+            self.sar_mean_head,
+        ):
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
         nn.init.zeros_(self.gsd_modulation[-1].weight)
         nn.init.zeros_(self.gsd_modulation[-1].bias)
 
@@ -320,6 +342,30 @@ class DynamicPhysicalDecoder(nn.Module):
     def _dynamic(features: Tensor, parameters: Tensor) -> Tensor:
         weights, bias = parameters[..., :-1], parameters[..., -1]
         return torch.einsum("bfhw,of->bohw", features, weights) + bias.view(1, -1, 1, 1)
+
+    @staticmethod
+    def _optical_factorization(
+        base_logits: Tensor, direction_delta: Tensor, amplitude_delta: Tensor
+    ) -> Tensor:
+        direction_delta = direction_delta - direction_delta.mean(dim=1, keepdim=True)
+        corrected_logits = base_logits.float()
+        corrected_logits = corrected_logits + 0.5 * torch.tanh(direction_delta.float())
+        corrected_logits = corrected_logits + 0.5 * torch.tanh(amplitude_delta.float())
+        return torch.sigmoid(corrected_logits).to(base_logits.dtype)
+
+    @staticmethod
+    def _sar_factorization(
+        base: Tensor,
+        spatial_delta_db: Tensor,
+        scene_delta_db: Tensor,
+        valid: Tensor,
+    ) -> Tensor:
+        denominator = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1.0)
+        spatial_mean = (spatial_delta_db * valid).sum(dim=(-2, -1), keepdim=True)
+        spatial_delta_db = spatial_delta_db - spatial_mean / denominator
+        correction_db = spatial_delta_db + scene_delta_db[:, :, None, None]
+        corrected = base.float() + correction_db.float()
+        return (-20.0 + 25.0 * torch.tanh(corrected / 25.0)).to(base.dtype)
 
     def forward(
         self,
@@ -329,6 +375,7 @@ class DynamicPhysicalDecoder(nn.Module):
         output_size: tuple[int, int],
         scale_condition: Tensor | None = None,
         scene_condition: Tensor | None = None,
+        valid: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
         full, half, quarter, shared = pyramid
         decoded = F.interpolate(
@@ -366,11 +413,27 @@ class DynamicPhysicalDecoder(nn.Module):
         log_variance = self._dynamic(
             features, self.log_variance_kernel(target_descriptors)
         ).clamp(-8.0, 3.0)
-        mean = (
-            torch.sigmoid(base)
-            if modality == "optical"
-            else -20.0 + 25.0 * torch.tanh(base / 25.0)
-        )
+        if modality == "optical":
+            direction_delta = self._dynamic(
+                features, self.optical_direction_kernel(target_descriptors)
+            )
+            amplitude_delta = self.optical_amplitude_head(features)
+            mean = self._optical_factorization(base, direction_delta, amplitude_delta)
+        else:
+            spatial_delta_db = 4.0 * torch.tanh(
+                self._dynamic(features, self.sar_spatial_kernel(target_descriptors)) / 4.0
+            )
+            if scene_condition is None:
+                scene_delta_db = base.new_zeros(base.shape[:2])
+            else:
+                conditioned = self.sar_mean_condition(scene_condition.float())[:, None]
+                described = self.sar_mean_descriptor(target_descriptors)[None]
+                scene_delta_db = 5.0 * torch.tanh(
+                    self.sar_mean_head(F.silu(conditioned + described)).squeeze(-1) / 5.0
+                )
+            if valid is None:
+                valid = base.new_ones(base.shape[0], 1, *base.shape[-2:])
+            mean = self._sar_factorization(base, spatial_delta_db, scene_delta_db, valid)
         return mean, log_variance
 
 
@@ -768,6 +831,7 @@ class SentinelV3(nn.Module):
             values.shape[-2:],
             scene_condition[:, -3:],
             scene_condition,
+            valid,
         )
         return mean * valid, log_variance, pyramid
 

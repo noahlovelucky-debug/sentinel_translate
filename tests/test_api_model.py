@@ -6,7 +6,7 @@ import pytest
 import torch
 
 from sentinel_v3 import Observation, TargetRequest, translate
-from sentinel_v3.model import LowRankResidualAdapter, SentinelV3
+from sentinel_v3.model import DynamicPhysicalDecoder, LowRankResidualAdapter, SentinelV3
 from sentinel_v3.sensors import SENTINEL1, SENTINEL2, ChannelSpec, SensorSpec
 
 
@@ -93,7 +93,69 @@ def test_radiometric_kernel_preserves_init_and_receives_gradient(
     assert conditional_bias.weight.grad is not None
     assert torch.count_nonzero(conditional_bias.weight.grad) > 0
     assert full_fusion.weight.grad is not None
-    assert torch.count_nonzero(full_fusion.weight.grad) > 0
+    if full_fusion.weight.requires_grad:
+        assert torch.count_nonzero(full_fusion.weight.grad) > 0
+    if target.modality == "optical":
+        factor_heads = (
+            tiny_model.decoder.optical_direction_kernel[-1],
+            tiny_model.decoder.optical_amplitude_head[-1],
+        )
+    else:
+        factor_heads = (
+            tiny_model.decoder.sar_spatial_kernel[-1],
+            tiny_model.decoder.sar_mean_head,
+        )
+    for head in factor_heads:
+        assert head.weight.grad is not None
+        assert torch.count_nonzero(head.weight.grad) > 0
+
+
+def test_factorized_outputs_preserve_initial_prediction_and_bounds() -> None:
+    optical_logits = torch.randn(2, 10, 8, 8)
+    reconstructed = DynamicPhysicalDecoder._optical_factorization(
+        optical_logits, torch.zeros_like(optical_logits), torch.zeros(2, 1, 8, 8)
+    )
+    torch.testing.assert_close(reconstructed, torch.sigmoid(optical_logits))
+    assert float(reconstructed.min()) >= 0.0
+    assert float(reconstructed.max()) <= 1.0
+
+    sar_base = torch.zeros(1, 2, 8, 8)
+    spatial = torch.ones_like(sar_base)
+    spatial[..., 4:, :] = -1.0
+    valid = torch.ones(1, 1, 8, 8)
+    reconstructed_sar = DynamicPhysicalDecoder._sar_factorization(
+        sar_base, spatial, torch.zeros(1, 2), valid
+    )
+    assert float(reconstructed_sar.min()) >= -45.0
+    assert float(reconstructed_sar.max()) <= 5.0
+    torch.testing.assert_close(
+        (reconstructed_sar + 20.0).mean(dim=(-2, -1)),
+        torch.zeros(1, 2),
+        atol=1e-6,
+        rtol=0,
+    )
+
+
+def test_factorized_projection_has_finite_bfloat16_gradients() -> None:
+    optical_base = torch.linspace(-100, 100, 20, dtype=torch.bfloat16).view(1, 10, 1, 2)
+    direction = torch.zeros_like(optical_base, requires_grad=True)
+    amplitude = torch.zeros(1, 1, 1, 2, dtype=torch.bfloat16, requires_grad=True)
+    optical = DynamicPhysicalDecoder._optical_factorization(
+        optical_base, direction, amplitude
+    )
+    optical.float().square().mean().backward()
+    assert direction.grad is not None and torch.isfinite(direction.grad).all()
+    assert amplitude.grad is not None and torch.isfinite(amplitude.grad).all()
+
+    sar_base = torch.tensor([[[[-100.0, 100.0]], [[100.0, -100.0]]]], dtype=torch.bfloat16)
+    spatial = torch.zeros_like(sar_base, requires_grad=True)
+    scene = torch.zeros(1, 2, dtype=torch.bfloat16, requires_grad=True)
+    sar = DynamicPhysicalDecoder._sar_factorization(
+        sar_base, spatial, scene, torch.ones(1, 1, 1, 2, dtype=torch.bfloat16)
+    )
+    sar.float().square().mean().backward()
+    assert spatial.grad is not None and torch.isfinite(spatial.grad).all()
+    assert scene.grad is not None and torch.isfinite(scene.grad).all()
 
 
 def test_public_api_is_seeded_and_physical_does_not_sample(tiny_model: SentinelV3) -> None:
