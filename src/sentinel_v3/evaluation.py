@@ -79,7 +79,18 @@ def load_checkpoint(path: str | Path, device: torch.device, *, use_ema: bool = T
     if use_ema and "ema" in payload:
         state = dict(state)
         state.update(payload["ema"]["state"])
-    model.load_state_dict(state)
+    incompatible = model.load_state_dict(state, strict=False)
+    allowed_missing = {
+        "residual_dit.amplitude_head.weight",
+        "residual_dit.amplitude_head.bias",
+    }
+    unexpected = set(incompatible.unexpected_keys)
+    missing = set(incompatible.missing_keys) - allowed_missing
+    if unexpected or missing:
+        raise RuntimeError(
+            f"incompatible checkpoint: missing={sorted(missing)}, "
+            f"unexpected={sorted(unexpected)}"
+        )
     return model.to(device).eval()
 
 
@@ -241,9 +252,14 @@ def evaluate(
                 for sample in range(3)
             ]
             sar_residual = model.sample_residual(optical_scene[-1], SENTINEL1, tuple(sar.shape), seed=seed + index)
-            optical_samples = [s2_mean[:, [2, 1, 0]] + residual for residual in optical_residuals]
+            optical_samples = [
+                model.compose_visual(
+                    s2_mean[:, [2, 1, 0]], residual, SENTINEL2.modality
+                )
+                for residual in optical_residuals
+            ]
             s2_visual = optical_samples[0]
-            sar_visual = sar_mean + sar_residual
+            sar_visual = model.compose_visual(sar_mean, sar_residual, SENTINEL1.modality)
         s2_target_rgb = s2[:, [2, 1, 0]]
         metrics = {
             "sar2opt_rmse": torch.sqrt(masked_mean((s2_mean - s2).square(), valid)),

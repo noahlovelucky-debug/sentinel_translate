@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "sentinel-translate-v3-1"
-version = "0.2.0"
+version = "0.3.0"
 description = "Sentinel-first bidirectional physical and stochastic translation"
 requires-python = ">=3.11"
 dependencies = ["torch>=2.3", "numpy>=1.26", "PyYAML>=6", "Pillow>=10"]

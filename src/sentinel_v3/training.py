@@ -162,15 +162,59 @@ class JointObjective(nn.Module):
         )
         target_velocity = residual_latent - noise
         latent_mask = F.interpolate(valid, size=velocity.shape[-2:], mode="area")
-        weight = high_frequency_weights[indices].view(-1, 1, 1, 1) * latent_mask
+        residual_weights = high_frequency_weights[indices]
+        weight = residual_weights.view(-1, 1, 1, 1) * latent_mask
         flow = masked_mean((velocity - target_velocity).square(), weight)
         decoded = highpass(
             self.model.residual_dit.decode_residual(residual_latent, target_visual.shape[1])
         )
         frequency_loss, frequency_metrics = high_frequency_loss(
-            decoded, residual, valid, target_spec.modality
+            decoded,
+            residual,
+            valid,
+            target_spec.modality,
+            sample_weight=residual_weights,
         )
-        total = flow + 0.25 * frequency_loss
+        predicted_endpoint = interpolated + (
+            1 - time_values[:, None, None, None]
+        ) * velocity
+        endpoint = highpass(
+            self.model.residual_dit.decode_residual(
+                predicted_endpoint, target_visual.shape[1]
+            )
+        )
+        endpoint_loss, endpoint_metrics = high_frequency_loss(
+            endpoint,
+            residual,
+            valid,
+            target_spec.modality,
+            sample_weight=residual_weights,
+        )
+        target_amplitude = F.avg_pool2d(
+            (residual * valid).square(), 4, stride=4
+        ).sqrt()
+        amplitude_limit = (
+            self.model.config.optical_residual_limit
+            if target_spec.modality == "optical"
+            else self.model.config.sar_residual_limit_db
+        )
+        target_amplitude = target_amplitude.clamp_max(amplitude_limit)
+        predicted_amplitude = self.model.residual_amplitude(
+            pyramid[-1], target_spec, target_visual.shape[1], target_visual.shape[-2:]
+        )
+        amplitude_mask = F.avg_pool2d(valid, 4, stride=4)
+        amplitude_weight = residual_weights.view(-1, 1, 1, 1) * amplitude_mask
+        amplitude_loss = masked_mean(
+            (predicted_amplitude - target_amplitude).abs(), amplitude_weight
+        )
+        total = flow + 0.15 * frequency_loss + 0.1 * endpoint_loss + 0.2 * amplitude_loss
+        frequency_metrics.update(
+            {
+                f"endpoint_{name}": value
+                for name, value in endpoint_metrics.items()
+            }
+        )
+        frequency_metrics["amplitude"] = amplitude_loss.detach()
         if self.visual_joint:
             physical_auxiliary = masked_mean((physical - target).square(), valid)
             if target_spec.modality == "sar":
@@ -363,6 +407,22 @@ def _scheduler(optimizer: AdamW, warmup: int, maximum: int) -> LambdaLR:
     return LambdaLR(optimizer, factor)
 
 
+def _stage_learning_rates(
+    train_config: dict[str, Any], stage: str
+) -> tuple[float, float, float]:
+    residual_lr = float(train_config["learning_rate"])
+    decoder_lr = residual_lr
+    encoder_lr = float(train_config["encoder_learning_rate"])
+    if stage == "visual":
+        decoder_lr *= 0.1
+        encoder_lr *= 0.1
+    elif stage == "balance":
+        decoder_lr *= 0.1
+        encoder_lr *= 0.1
+        residual_lr *= 0.1
+    return encoder_lr, decoder_lr, residual_lr
+
+
 def _atomic_save(payload: dict[str, object], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
@@ -446,15 +506,11 @@ def train(
     if stage in {"overfit", "pretrain", "physical"}:
         for parameter in model.residual_dit.parameters():
             parameter.requires_grad_(False)
-    main_lr = float(train_config["learning_rate"])
-    encoder_lr = float(train_config["encoder_learning_rate"])
-    if stage == "visual":
-        main_lr *= 0.1
-        encoder_lr = main_lr
+    encoder_lr, main_lr, residual_lr = _stage_learning_rates(train_config, stage)
     groups = [
         {"params": model.encoder.parameters(), "lr": encoder_lr},
         {"params": model.decoder.parameters(), "lr": main_lr},
-        {"params": model.residual_dit.parameters(), "lr": float(train_config["learning_rate"])},
+        {"params": model.residual_dit.parameters(), "lr": residual_lr},
     ]
     optimizer = AdamW(
         groups,
@@ -542,7 +598,8 @@ def train(
             loss.backward()
             for name, value in metrics.items():
                 aggregate[name] = aggregate.get(name, 0.0) + float(value) / accumulation
-        nn.utils.clip_grad_norm_(model.parameters(), float(train_config["gradient_clip"]))
+        for group in optimizer.param_groups:
+            nn.utils.clip_grad_norm_(group["params"], float(train_config["gradient_clip"]))
         optimizer.step()
         scheduler.step()
         ema.update(model)

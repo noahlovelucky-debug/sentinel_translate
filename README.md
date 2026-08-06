@@ -37,14 +37,14 @@ The mandatory 64-patch connectivity test is:
 PYTHONPATH=src python -m sentinel_v3.cli --config configs/smoke.yaml train --limit 64 --max-steps 100
 ```
 
-Formal training migrates `/data/code/sentinel_translate_v3/checkpoints/pretrain/step_0008000.pt`,
-then runs the accelerated schedule `physical 12k (batch 32) -> visual 40k
-(batch 16) -> balance 10k (batch 16)` on eight GPUs with `bash
-scripts/launch_8gpu.sh`. The physical stage uses translation-only batches and a
-four-pair latent-alignment subset, preserving the planned number of bidirectional
-translation examples while avoiding redundant full-batch encoding. For an interrupted
-phase, use `train --resume checkpoints/latest.pt` with the same stage and maximum step. `--init` is only
-for loading weights at a new phase and intentionally resets optimizer and data-stream state.
+The corrected V3.1.1 high-frequency run starts from the stable V3.1 physical
+checkpoint at `checkpoints/physical/step_0012000.pt`, retrains Visual for 40k
+steps, and then runs a 10k low-learning-rate Balance phase on eight GPUs with
+`bash scripts/launch_8gpu.sh`. It writes only to `checkpoints_v311`, so invalid
+legacy Balance checkpoints cannot be resumed accidentally. For an interrupted
+phase, use `train --resume checkpoints_v311/latest.pt` with the same stage and
+maximum step. `--init` is only for loading weights at a new phase and intentionally
+resets optimizer and data-stream state.
 
 The default loader uses zero workers because that is required for exact sample-level resume. Increasing
 `num_workers` improves throughput but only preserves epoch-level ordering across a restart.

@@ -1,7 +1,7 @@
 paths:
   train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
   manifest: /data/sentinel_translate/data/manifests/pairs.jsonl
-  output: /data/code/sentinel_translate_v3_1/checkpoints
+  output: /data/code/sentinel_translate_v3_1/checkpoints_v311
   reports: /data/code/sentinel_translate_v3_1/reports
 
 model:
@@ -13,7 +13,7 @@ model:
   flow_steps: 16
   optical_residual_limit: 0.15
   sar_residual_limit_db: 6.0
-  architecture: v3.1
+  architecture: v3.1.1
 
 train:
   stage: physical

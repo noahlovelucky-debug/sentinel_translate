@@ -85,9 +85,13 @@ def latent_alignment(
     return info_nce + 0.25 * dense_loss, {"info_nce": info_nce.detach(), "dense_cosine": dense_loss.detach()}
 
 
-def low_frequency_loss(residual: Tensor, mask: Tensor) -> Tensor:
+def low_frequency_loss(
+    residual: Tensor, mask: Tensor, sample_weight: Tensor | None = None
+) -> Tensor:
     low = F.avg_pool2d(residual, 4, stride=4)
     low_mask = F.avg_pool2d(mask, 4, stride=4)
+    if sample_weight is not None:
+        low_mask = low_mask * sample_weight.view(-1, 1, 1, 1)
     return masked_mean(low.square(), low_mask)
 
 
@@ -99,10 +103,22 @@ def highpass(values: Tensor, block_size: int = 4) -> Tensor:
     return values - low
 
 
-def log_spectral_distance(prediction: Tensor, target: Tensor, mask: Tensor) -> Tensor:
+def log_spectral_distance(
+    prediction: Tensor,
+    target: Tensor,
+    mask: Tensor,
+    sample_weight: Tensor | None = None,
+) -> Tensor:
     prediction_spectrum = torch.fft.rfft2((prediction * mask).float(), norm="ortho")
     target_spectrum = torch.fft.rfft2((target * mask).float(), norm="ortho")
-    return (torch.log1p(prediction_spectrum.abs()) - torch.log1p(target_spectrum.abs())).abs().mean()
+    distance = (
+        torch.log1p(prediction_spectrum.abs())
+        - torch.log1p(target_spectrum.abs())
+    ).abs().mean(dim=(1, 2, 3))
+    if sample_weight is None:
+        return distance.mean()
+    weights = sample_weight.to(distance.dtype) * (mask.flatten(1).sum(1) > 0).to(distance.dtype)
+    return (distance * weights).sum() / weights.sum().clamp_min(1e-8)
 
 
 def high_frequency_loss(
@@ -110,14 +126,18 @@ def high_frequency_loss(
     target: Tensor,
     mask: Tensor,
     modality: str,
+    sample_weight: Tensor | None = None,
 ) -> tuple[Tensor, dict[str, Tensor]]:
-    reconstruction = masked_mean((prediction - target).abs(), mask)
+    weight = mask
+    if sample_weight is not None:
+        weight = weight * sample_weight.view(-1, 1, 1, 1)
+    reconstruction = masked_mean((prediction - target).abs(), weight)
     pred_dy, pred_dx = gradients(prediction)
     target_dy, target_dx = gradients(target)
-    gradient = masked_mean((pred_dy - target_dy).abs(), mask[..., 1:, :])
-    gradient += masked_mean((pred_dx - target_dx).abs(), mask[..., :, 1:])
-    spectrum = log_spectral_distance(prediction, target, mask)
-    low = low_frequency_loss(prediction, mask)
+    gradient = masked_mean((pred_dy - target_dy).abs(), weight[..., 1:, :])
+    gradient += masked_mean((pred_dx - target_dx).abs(), weight[..., :, 1:])
+    spectrum = log_spectral_distance(prediction, target, mask, sample_weight)
+    low = low_frequency_loss(prediction, mask, sample_weight)
     total = reconstruction + 0.2 * gradient + 0.1 * spectrum + 0.2 * low
     metrics = {
         "hf_reconstruction": reconstruction.detach(),
@@ -130,7 +150,7 @@ def high_frequency_loss(
         local_target_variance = F.avg_pool2d(target.square(), 9, 1, 4)
         speckle = masked_mean(
             (torch.sqrt(local_prediction_variance + 1e-6) - torch.sqrt(local_target_variance + 1e-6)).abs(),
-            mask,
+            weight,
         )
         total = total + 0.2 * speckle
         metrics["speckle_scale"] = speckle.detach()

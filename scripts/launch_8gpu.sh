@@ -3,7 +3,7 @@ set -euo pipefail
 
 ROOT=/data/code/sentinel_translate_v3_1
 CONFIG=${CONFIG:-$ROOT/configs/sentinel_v3.yaml}
-OUTPUT=${OUTPUT:-$ROOT/checkpoints}
+OUTPUT=${OUTPUT:-$ROOT/checkpoints_v311}
 PYTHONPATH=$ROOT/src
 export PYTHONPATH
 
@@ -29,12 +29,10 @@ latest_checkpoint() {
   find "$OUTPUT/$stage" -maxdepth 1 -type f -name 'step_*.pt' | sort | tail -n 1
 }
 
-V3_INIT=${V3_INIT:-/data/code/sentinel_translate_v3/checkpoints/pretrain/step_0008000.pt}
-PHYSICAL_STEPS=${PHYSICAL_STEPS:-12000}
+PHYSICAL_INIT=${PHYSICAL_INIT:-$ROOT/checkpoints/physical/step_0012000.pt}
 VISUAL_STEPS=${VISUAL_STEPS:-40000}
 BALANCE_STEPS=${BALANCE_STEPS:-10000}
 
-physical_checkpoint=$(latest_checkpoint physical)
 visual_checkpoint=$(latest_checkpoint visual)
 balance_checkpoint=$(latest_checkpoint balance)
 
@@ -46,13 +44,7 @@ fi
 if [[ -n "$visual_checkpoint" ]]; then
   run_stage visual "$VISUAL_STEPS" 16 resume "$visual_checkpoint"
 else
-  if [[ -n "$physical_checkpoint" ]]; then
-    run_stage physical "$PHYSICAL_STEPS" 32 resume "$physical_checkpoint"
-  else
-    run_stage physical "$PHYSICAL_STEPS" 32 init "$V3_INIT"
-  fi
-  physical_checkpoint="$OUTPUT/physical/step_$(printf '%07d' "$PHYSICAL_STEPS").pt"
-  run_stage visual "$VISUAL_STEPS" 16 init "$physical_checkpoint"
+  run_stage visual "$VISUAL_STEPS" 16 init "$PHYSICAL_INIT"
 fi
 
 visual_checkpoint="$OUTPUT/visual/step_$(printf '%07d' "$VISUAL_STEPS").pt"

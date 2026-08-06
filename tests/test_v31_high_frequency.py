@@ -1,10 +1,16 @@
 from __future__ import annotations
 
+import pytest
 import torch
 
 from sentinel_v3.losses import high_frequency_loss, highpass, low_frequency_loss
 from sentinel_v3.model import SentinelV3
-from sentinel_v3.training import JointObjective, _load_compatible_state
+from sentinel_v3.sensors import SENTINEL2
+from sentinel_v3.training import (
+    JointObjective,
+    _load_compatible_state,
+    _stage_learning_rates,
+)
 
 
 def test_highpass_removes_constant_low_frequency() -> None:
@@ -22,6 +28,22 @@ def test_sar_frequency_loss_is_finite() -> None:
     )
     assert torch.isfinite(loss)
     assert "speckle_scale" in metrics
+
+
+def test_temporally_invalid_frequency_loss_is_zero() -> None:
+    source = torch.randn(2, 3, 32, 32, requires_grad=True)
+    prediction = highpass(source)
+    target = highpass(torch.randn(2, 3, 32, 32))
+    loss, _ = high_frequency_loss(
+        prediction,
+        target,
+        torch.ones(2, 1, 32, 32),
+        "optical",
+        sample_weight=torch.zeros(2),
+    )
+    loss.backward()
+    assert float(loss.detach()) == 0.0
+    torch.testing.assert_close(source.grad, torch.zeros_like(source.grad))
 
 
 def test_visual_stage_trains_residual_branch(tiny_model: SentinelV3) -> None:
@@ -47,6 +69,58 @@ def test_visual_stage_trains_residual_branch(tiny_model: SentinelV3) -> None:
     assert "opt2sar/speckle_scale" in metrics
     assert any(parameter.grad is not None for parameter in tiny_model.residual_dit.parameters())
     assert all(parameter.grad is None for parameter in tiny_model.encoder.parameters())
+
+
+def test_visual_stage_ignores_two_day_high_frequency_targets(
+    tiny_model: SentinelV3,
+) -> None:
+    objective = JointObjective(tiny_model, [0.35, 0.35, 0.15, 0.15])
+    batch_size = 4
+    batch: dict[str, object] = {
+        "s2": torch.rand(batch_size, 10, 32, 32),
+        "sar": torch.randn(batch_size, 2, 32, 32) * 4 - 15,
+        "s2_view": torch.rand(batch_size, 10, 32, 32),
+        "sar_view": torch.randn(batch_size, 2, 32, 32) * 4 - 15,
+        "s2_target": torch.rand(batch_size, 10, 32, 32),
+        "sar_target": torch.randn(batch_size, 2, 32, 32) * 4 - 15,
+        "valid": torch.ones(batch_size, 1, 32, 32),
+        "metadata": torch.zeros(batch_size, 8),
+        "input_gsd": torch.full((batch_size,), 10.0),
+        "target_gsd": torch.full((batch_size,), 10.0),
+        "delta_days": torch.full((batch_size,), 2, dtype=torch.long),
+    }
+    loss, metrics = objective(batch, "visual")
+    loss.backward()
+    assert float(loss.detach()) == 0.0
+    assert float(metrics["sar2opt/amplitude"]) == 0.0
+    assert float(metrics["opt2sar/amplitude"]) == 0.0
+    gradients = [
+        parameter.grad
+        for parameter in tiny_model.residual_dit.parameters()
+        if parameter.grad is not None
+    ]
+    assert gradients
+    assert sum(float(gradient.abs().sum()) for gradient in gradients) == 0.0
+
+
+def test_residual_amplitude_and_optical_composition_are_bounded(
+    tiny_model: SentinelV3,
+) -> None:
+    scene = torch.randn(2, tiny_model.config.hidden, 4, 4)
+    amplitude = tiny_model.residual_amplitude(scene, SENTINEL2, 3, (32, 32))
+    assert amplitude.shape == (2, 3, 8, 8)
+    assert bool((amplitude >= 0).all())
+    assert bool((amplitude <= tiny_model.config.optical_residual_limit).all())
+    physical = torch.tensor([[[[0.0, 1.0]]]])
+    residual = torch.tensor([[[[-0.5, 0.5]]]])
+    composed = tiny_model.compose_visual(physical, residual, "optical")
+    torch.testing.assert_close(composed, torch.tensor([[[[0.0, 1.0]]]]))
+
+
+def test_balance_uses_joint_finetuning_learning_rates() -> None:
+    config = {"learning_rate": 1e-4, "encoder_learning_rate": 2e-5}
+    assert _stage_learning_rates(config, "visual") == pytest.approx((2e-6, 1e-5, 1e-4))
+    assert _stage_learning_rates(config, "balance") == pytest.approx((2e-6, 1e-5, 1e-5))
 
 
 def test_v3_state_migration_skips_new_or_incompatible_tensors(tiny_model: SentinelV3) -> None:

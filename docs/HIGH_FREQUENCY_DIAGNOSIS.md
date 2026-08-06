@@ -4,6 +4,11 @@ Status: diagnosis based on `visual/step_0040000.pt`, eight fixed validation
 samples, and the stopped balance run. This is an implementation diagnosis, not
 a claim that a proposed fix has already been validated.
 
+V3.1.1 implements the corrective mechanics described below: full temporal
+gating, endpoint reconstruction, scene-conditioned block amplitude, bounded
+optical composition, and low-rate Balance optimization. Their quality impact
+still requires a new training run and closed validation.
+
 ## Evidence
 
 The visual checkpoint improves SAR PSD, ENL, and histogram statistics relative

@@ -286,9 +286,12 @@ class ResidualDiT(nn.Module):
         self.target = nn.Sequential(nn.Linear(8, hidden), nn.SiLU(), nn.Linear(hidden, hidden))
         self.blocks = nn.ModuleList([FlowBlock(hidden, heads) for _ in range(depth)])
         self.output = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, hidden // 4))
+        self.amplitude_head = nn.Conv2d(hidden, max_channels, 1)
         self.decoder = nn.Sequential(
             ResidualBlock(hidden // 4), nn.ConvTranspose2d(hidden // 4, max_channels, 4, stride=4)
         )
+        nn.init.zeros_(self.amplitude_head.weight)
+        nn.init.constant_(self.amplitude_head.bias, math.log(0.1 / 0.9))
 
     def encode_residual(self, residual: Tensor) -> Tensor:
         if residual.shape[1] > self.max_channels:
@@ -298,6 +301,20 @@ class ResidualDiT(nn.Module):
 
     def decode_residual(self, latent: Tensor, channels: int) -> Tensor:
         return self.decoder(latent)[:, :channels]
+
+    def predict_amplitude(
+        self,
+        scene: Tensor,
+        target_descriptors: Tensor,
+        channels: int,
+        output_size: tuple[int, int],
+    ) -> Tensor:
+        condition = self.target(target_descriptors.mean(dim=0)).view(1, -1, 1, 1)
+        logits = self.amplitude_head(F.silu(scene + condition))[:, :channels]
+        block_size = (output_size[0] // 4, output_size[1] // 4)
+        return torch.sigmoid(
+            F.interpolate(logits, size=block_size, mode="bilinear", align_corners=False)
+        )
 
     def forward(self, latent: Tensor, time: Tensor, scene: Tensor, target_descriptors: Tensor) -> Tensor:
         batch, channels, height, width = latent.shape
@@ -321,7 +338,7 @@ class ModelConfig:
     flow_steps: int = 16
     optical_residual_limit: float = 0.15
     sar_residual_limit_db: float = 6.0
-    architecture: str = "v3.1"
+    architecture: str = "v3.1.1"
 
 
 class SentinelV3(nn.Module):
@@ -420,6 +437,29 @@ class SentinelV3(nn.Module):
         descriptors = self.descriptors(target.channels[:visual_channels], latent.device)
         return self.residual_dit(latent, time, scene, descriptors)
 
+    def residual_amplitude(
+        self,
+        scene: Tensor,
+        target: SensorSpec,
+        visual_channels: int,
+        output_size: tuple[int, int],
+    ) -> Tensor:
+        descriptors = self.descriptors(target.channels[:visual_channels], scene.device)
+        normalized = self.residual_dit.predict_amplitude(
+            scene, descriptors, visual_channels, output_size
+        )
+        limit = (
+            self.config.optical_residual_limit
+            if target.modality == "optical"
+            else self.config.sar_residual_limit_db
+        )
+        return normalized * limit
+
+    @staticmethod
+    def compose_visual(physical: Tensor, residual: Tensor, modality: str) -> Tensor:
+        composed = physical + residual
+        return composed.clamp(0.0, 1.0) if modality == "optical" else composed
+
     def sample_residual(
         self,
         scene: Tensor,
@@ -442,10 +482,14 @@ class SentinelV3(nn.Module):
             next_time = torch.full((batch,), (index + 1) / steps, device=scene.device, dtype=scene.dtype)
             second = self.flow_velocity(proposal, next_time, scene, target, channels)
             latent = latent + 0.5 * dt * (first + second)
-        residual = self.residual_dit.decode_residual(latent, channels)
-        residual = highpass(residual)
-        limit = self.config.optical_residual_limit if target.modality == "optical" else self.config.sar_residual_limit_db
-        return limit * torch.tanh(residual / max(limit, 1e-6))
+        residual = highpass(self.residual_dit.decode_residual(latent, channels))
+        block_rms = F.avg_pool2d(residual.square(), 4, stride=4).sqrt().clamp_min(1e-4)
+        unit = residual / block_rms.repeat_interleave(4, -2).repeat_interleave(4, -1)
+        unit = highpass(torch.tanh(unit))
+        unit_rms = F.avg_pool2d(unit.square(), 4, stride=4).sqrt().clamp_min(1e-4)
+        unit = unit / unit_rms.repeat_interleave(4, -2).repeat_interleave(4, -1)
+        amplitude = self.residual_amplitude(scene, target, channels, (height, width))
+        return unit * amplitude.repeat_interleave(4, -2).repeat_interleave(4, -1)
 
     @staticmethod
     def _metadata(observation: Observation, batch: int, device: torch.device) -> Tensor:
@@ -502,5 +546,7 @@ class SentinelV3(nn.Module):
                 residual = self.sample_residual(
                     pyramid[-1], target.spec, tuple(base.shape), seed=seed + sample_index
                 )
-                result.samples.append((base + residual) * valid)
+                result.samples.append(
+                    self.compose_visual(base, residual, target.spec.modality) * valid
+                )
         return result
