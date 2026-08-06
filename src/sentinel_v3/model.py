@@ -256,6 +256,16 @@ class DynamicPhysicalDecoder(nn.Module):
         self.full = nn.Sequential(
             nn.Conv2d(width * 2, width, 3, padding=1), ResidualBlock(width)
         )
+        self.full_resolution_fusion = nn.ModuleDict(
+            {
+                modality: nn.Sequential(
+                    nn.Conv2d(width * 2, width, 3, padding=1),
+                    nn.SiLU(),
+                    nn.Conv2d(width, width, 3, padding=1),
+                )
+                for modality in ("optical", "sar")
+            }
+        )
         self.kernel = nn.Sequential(nn.Linear(8, width), nn.SiLU(), nn.Linear(width, width + 1))
         self.log_variance_kernel = nn.Sequential(
             nn.Linear(8, width), nn.SiLU(), nn.Linear(width, width + 1)
@@ -300,6 +310,9 @@ class DynamicPhysicalDecoder(nn.Module):
         for head in self.radiometric_bias.values():
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
+        for fusion in self.full_resolution_fusion.values():
+            nn.init.zeros_(fusion[-1].weight)
+            nn.init.zeros_(fusion[-1].bias)
         nn.init.zeros_(self.gsd_modulation[-1].weight)
         nn.init.zeros_(self.gsd_modulation[-1].bias)
 
@@ -317,7 +330,7 @@ class DynamicPhysicalDecoder(nn.Module):
         scale_condition: Tensor | None = None,
         scene_condition: Tensor | None = None,
     ) -> tuple[Tensor, Tensor]:
-        _, half, quarter, shared = pyramid
+        full, half, quarter, shared = pyramid
         decoded = F.interpolate(
             self.up2(shared), size=quarter.shape[-2:], mode="bilinear", align_corners=False
         )
@@ -328,6 +341,9 @@ class DynamicPhysicalDecoder(nn.Module):
         decoded = self.fuse1(torch.cat((decoded, half), dim=1))
         decoded = F.interpolate(decoded, size=output_size, mode="bilinear", align_corners=False)
         features = self.full(decoded)
+        features = features + self.full_resolution_fusion[modality](
+            torch.cat((features, full), dim=1)
+        )
         if scale_condition is not None:
             shift, scale = self.gsd_modulation(scale_condition.float()).chunk(2, dim=-1)
             features = features * (1 + 0.1 * torch.tanh(scale)[:, :, None, None])

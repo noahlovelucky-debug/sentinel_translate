@@ -73,6 +73,7 @@ def test_zero_radiometric_extensions_preserve_v4_loading(
         "decoder.radiometric_condition.",
         "decoder.radiometric_descriptor.",
         "decoder.radiometric_bias.",
+        "decoder.full_resolution_fusion.",
     )
     legacy_state = {
         name: value for name, value in tiny_model.state_dict().items() if not name.startswith(prefixes)

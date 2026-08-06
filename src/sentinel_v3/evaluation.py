@@ -148,6 +148,7 @@ def load_checkpoint(
         "decoder.radiometric_condition.",
         "decoder.radiometric_descriptor.",
         "decoder.radiometric_bias.",
+        "decoder.full_resolution_fusion.",
     )
     missing = [
         name

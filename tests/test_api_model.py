@@ -79,10 +79,12 @@ def test_radiometric_kernel_preserves_init_and_receives_gradient(
         before = tiny_model.physical(values, source, target, valid)[0]
     kernel = tiny_model.decoder.radiometric_kernel[target.modality][-1]
     conditional_bias = tiny_model.decoder.radiometric_bias[target.modality]
+    full_fusion = tiny_model.decoder.full_resolution_fusion[target.modality][-1]
     torch.testing.assert_close(kernel.weight, torch.zeros_like(kernel.weight))
     torch.testing.assert_close(
         conditional_bias.weight, torch.zeros_like(conditional_bias.weight)
     )
+    torch.testing.assert_close(full_fusion.weight, torch.zeros_like(full_fusion.weight))
     prediction = tiny_model.physical(values, source, target, valid)[0]
     torch.testing.assert_close(prediction, before)
     prediction.square().mean().backward()
@@ -90,6 +92,8 @@ def test_radiometric_kernel_preserves_init_and_receives_gradient(
     assert torch.count_nonzero(kernel.weight.grad) > 0
     assert conditional_bias.weight.grad is not None
     assert torch.count_nonzero(conditional_bias.weight.grad) > 0
+    assert full_fusion.weight.grad is not None
+    assert torch.count_nonzero(full_fusion.weight.grad) > 0
 
 
 def test_public_api_is_seeded_and_physical_does_not_sample(tiny_model: SentinelV3) -> None:

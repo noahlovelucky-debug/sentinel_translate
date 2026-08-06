@@ -669,6 +669,7 @@ def _optimizer(
         model.decoder.radiometric_condition,
         model.decoder.radiometric_descriptor,
         model.decoder.radiometric_bias,
+        model.decoder.full_resolution_fusion,
     )
     direction_parameters = [
         parameter for module in direction_modules for parameter in module.parameters()

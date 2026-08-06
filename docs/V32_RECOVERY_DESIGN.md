@@ -58,6 +58,12 @@ so importing a checkpoint is function-preserving while they receive a gradient o
 first step. Optical corrections are bounded to 2 logit units and SAR corrections to
 5 dB-equivalent pre-projection units.
 
+The physical decoder must consume the complete FPN. A direction-specific `H/1`
+residual fusion combines the decoded feature with the projector feature before output
+projection; its final convolution is zero-initialized for checkpoint compatibility.
+This keeps exact source-aligned boundaries available to the deterministic physical
+path instead of reconstructing them from an `H/2` bilinear upsample.
+
 Use 80% native 10-to-10 m examples and 20% multiscale examples. High-frequency stages
 use native 10-to-10 m only. Weight physical temporal buckets `1.0/1.0/0.75/0.5`; retain
 strict `1.0/0.25/0/0` for high frequency.
