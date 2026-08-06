@@ -234,6 +234,40 @@ class TemporalPriorStore:
             values = encoded.astype(np.float32) / 200.0 - 50.0
         return values, valid
 
+    def full_scene_prior(
+        self,
+        *,
+        location_id: str,
+        acquired: date | str,
+        modality: Literal["optical", "sar"],
+        orbit: str,
+        exclude_pair_id: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        target_date = date.fromisoformat(acquired) if isinstance(acquired, str) else acquired
+        nearest = self._nearest(
+            location_id,
+            target_date,
+            modality,
+            orbit,
+            exclude_pair_id=exclude_pair_id,
+        )
+        if not nearest:
+            raise RuntimeError("no leave-one-out temporal neighbors are available")
+        record = nearest[0][1]
+        width, height = int(record["width"]), int(record["height"])
+        channels = len(S2_ASSET_KEYS) if modality == "optical" else 2
+        weighted = np.zeros((channels, height, width), dtype=np.float32)
+        weights = np.zeros((1, height, width), dtype=np.float32)
+        for temporal_weight, neighbor in nearest:
+            values, valid = self._read_record_uncached(
+                str(neighbor["pair_id"]), modality, (0, 0, width, height)
+            )
+            sample_weight = np.float32(temporal_weight) * valid[None]
+            weighted += values * sample_weight
+            weights += sample_weight
+        covered = weights > 0
+        return weighted / np.maximum(weights, 1e-12), covered
+
     def compose(
         self,
         physical: Tensor,

@@ -137,33 +137,43 @@ class JointObjective(nn.Module):
                 metadata=batch["metadata"][indices],  # type: ignore[index]
             )
             if self.model.temporal_prior is not None:
-                corrected: list[Tensor] = []
-                batch_indices = indices.detach().cpu().tolist()
-                for local_index, batch_index in enumerate(batch_indices):
-                    pair_id = str(batch["pair_id"][batch_index])  # type: ignore[index]
-                    _, location_id, s1_date, orbit, s2_date = pair_id.split(":")
-                    window_values = batch["window"][batch_index].tolist()  # type: ignore[index]
-                    pixel_window = tuple(int(value) for value in window_values)
-                    transform_values = batch["augmentation"][batch_index].tolist()  # type: ignore[index]
-                    spatial_transform = (
-                        bool(transform_values[0]),
-                        bool(transform_values[1]),
-                        int(transform_values[2]),
-                    )
-                    acquired = s2_date if target_spec.modality == "optical" else s1_date
-                    corrected.append(
-                        self.model.apply_temporal_prior(
-                            physical[local_index : local_index + 1],
-                            target_spec,
-                            acquired=acquired,
-                            location_id=location_id,
-                            pixel_window=pixel_window,  # type: ignore[arg-type]
-                            orbit=orbit,
-                            exclude_pair_id=pair_id,
-                            spatial_transform=spatial_transform,
-                        )[0]
-                    )
-                physical = torch.cat(corrected)
+                prior_key = f"{target_spec.modality}_temporal_prior"
+                coverage_key = f"{target_spec.modality}_temporal_coverage"
+                if prior_key in batch:
+                    physical = self.model.temporal_prior.compose(
+                        physical,
+                        batch[prior_key][indices].to(physical.dtype),  # type: ignore[index]
+                        batch[coverage_key][indices],  # type: ignore[index]
+                        target_spec.modality,
+                    )[0]
+                else:
+                    corrected: list[Tensor] = []
+                    batch_indices = indices.detach().cpu().tolist()
+                    for local_index, batch_index in enumerate(batch_indices):
+                        pair_id = str(batch["pair_id"][batch_index])  # type: ignore[index]
+                        _, location_id, s1_date, orbit, s2_date = pair_id.split(":")
+                        window_values = batch["window"][batch_index].tolist()  # type: ignore[index]
+                        pixel_window = tuple(int(value) for value in window_values)
+                        transform_values = batch["augmentation"][batch_index].tolist()  # type: ignore[index]
+                        spatial_transform = (
+                            bool(transform_values[0]),
+                            bool(transform_values[1]),
+                            int(transform_values[2]),
+                        )
+                        acquired = s2_date if target_spec.modality == "optical" else s1_date
+                        corrected.append(
+                            self.model.apply_temporal_prior(
+                                physical[local_index : local_index + 1],
+                                target_spec,
+                                acquired=acquired,
+                                location_id=location_id,
+                                pixel_window=pixel_window,  # type: ignore[arg-type]
+                                orbit=orbit,
+                                exclude_pair_id=pair_id,
+                                spatial_transform=spatial_transform,
+                            )[0]
+                        )
+                    physical = torch.cat(corrected)
         target = self._visual_target(batch[target_key][indices], target_spec)  # type: ignore[index]
         base = self._visual_physical(physical, target_spec)
         valid = batch["valid"][indices]  # type: ignore[index]
@@ -972,6 +982,11 @@ def train(
         ),
         audit_high_frequency=stage in {"detail", "codec", "flow", "balance"}
         and bool(train_config.get("registration_audit", True)),
+        temporal_prior_index=(
+            config["paths"].get("temporal_prior_shards")
+            if stage in {"detail", "flow", "balance"}
+            else None
+        ),
     )
     if limit is not None:
         if stage in {"detail", "codec", "flow", "balance"}:

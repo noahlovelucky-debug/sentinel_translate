@@ -12,6 +12,7 @@ from .validation import validation_protocol_hash
 DEFAULT: dict[str, Any] = {
     "paths": {
         "train_shards": "/data/sentinel_translate/data/shards_v2/train/index.json",
+        "temporal_prior_shards": "/data/sentinel_translate/data/shards_v32_temporal_prior/index.json",
         "manifest": "/data/sentinel_translate/data/manifests/pairs.jsonl",
         "output": "/data/code/sentinel_translat/v3.2/checkpoints_v32",
         "reports": "/data/code/sentinel_translat/v3.2/reports_v32",

@@ -72,10 +72,17 @@ class V2ShardDataset(Dataset[dict[str, object]]):
         random_gsd: bool = True,
         native_gsd_probability: float = 0.0,
         audit_high_frequency: bool = False,
+        temporal_prior_index: str | Path | None = None,
     ) -> None:
         self.index_path = Path(index_path)
         self.index = json.loads(self.index_path.read_text(encoding="utf-8"))
         self.shards = list(self.index["shards"])
+        self.prior_shards: list[dict[str, object]] | None = None
+        if temporal_prior_index is not None:
+            prior_index = json.loads(Path(temporal_prior_index).read_text(encoding="utf-8"))
+            self.prior_shards = list(prior_index["shards"])
+            if len(self.prior_shards) != len(self.shards):
+                raise RuntimeError("temporal-prior and training shard counts differ")
         self.ends: list[int] = []
         total = 0
         for shard in self.shards:
@@ -91,30 +98,67 @@ class V2ShardDataset(Dataset[dict[str, object]]):
         self.split = str(self.index.get("split", "unknown"))
         self._cache_index = -1
         self._cache: dict[str, object] | None = None
+        self._prior_cache: dict[str, object] | None = None
 
     def __len__(self) -> int:
         return self.total
 
-    def _load(self, index: int) -> tuple[dict[str, object], int]:
+    def _load(
+        self, index: int
+    ) -> tuple[dict[str, object], dict[str, object] | None, int]:
         shard_index = bisect.bisect_right(self.ends, index)
         start = 0 if shard_index == 0 else self.ends[shard_index - 1]
         if shard_index != self._cache_index:
             self._cache = torch.load(
                 self.shards[shard_index]["path"], map_location="cpu", weights_only=False
             )
+            self._prior_cache = (
+                torch.load(
+                    self.prior_shards[shard_index]["path"],
+                    map_location="cpu",
+                    weights_only=False,
+                )
+                if self.prior_shards is not None
+                else None
+            )
+            if self._prior_cache is not None:
+                if self._prior_cache["pair_id"] != self._cache["pair_id"]:
+                    raise RuntimeError("temporal-prior shard pair IDs do not match training data")
+                if not torch.equal(self._prior_cache["window"], self._cache["window"]):
+                    raise RuntimeError("temporal-prior windows do not match training data")
             self._cache_index = shard_index
         assert self._cache is not None
-        return self._cache, index - start
+        return self._cache, self._prior_cache, index - start
 
     def __getitem__(self, index: int) -> dict[str, object]:
         if index < 0:
             index += self.total
         if not 0 <= index < self.total:
             raise IndexError(index)
-        shard, local = self._load(index)
+        shard, prior_shard, local = self._load(index)
         s2 = normalized_s2_to_reflectance(shard["s2"][local].float().unsqueeze(0))
         sar = normalized_sar_to_db(shard["sar"][local].float().unsqueeze(0))
         valid = shard["joint_valid"][local].float().unsqueeze(0)
+        optical_prior = (
+            prior_shard["optical"][local].unsqueeze(0)
+            if prior_shard is not None
+            else None
+        )
+        optical_coverage = (
+            prior_shard["optical_coverage"][local].unsqueeze(0)
+            if prior_shard is not None
+            else None
+        )
+        sar_prior = (
+            prior_shard["sar"][local].unsqueeze(0)
+            if prior_shard is not None
+            else None
+        )
+        sar_coverage = (
+            prior_shard["sar_coverage"][local].unsqueeze(0)
+            if prior_shard is not None
+            else None
+        )
         flip_x = False
         flip_y = False
         rotations = 0
@@ -122,14 +166,44 @@ class V2ShardDataset(Dataset[dict[str, object]]):
             flip_x = bool(torch.rand(()) < 0.5)
             if flip_x:
                 s2, sar, valid = (torch.flip(value, (-1,)) for value in (s2, sar, valid))
+                if optical_prior is not None:
+                    optical_prior, optical_coverage, sar_prior, sar_coverage = (
+                        torch.flip(value, (-1,))
+                        for value in (
+                            optical_prior,
+                            optical_coverage,
+                            sar_prior,
+                            sar_coverage,
+                        )
+                    )
             flip_y = bool(torch.rand(()) < 0.5)
             if flip_y:
                 s2, sar, valid = (torch.flip(value, (-2,)) for value in (s2, sar, valid))
+                if optical_prior is not None:
+                    optical_prior, optical_coverage, sar_prior, sar_coverage = (
+                        torch.flip(value, (-2,))
+                        for value in (
+                            optical_prior,
+                            optical_coverage,
+                            sar_prior,
+                            sar_coverage,
+                        )
+                    )
             rotations = int(torch.randint(0, 4, ()))
             if rotations:
                 s2, sar, valid = (
                     torch.rot90(value, rotations, (-2, -1)) for value in (s2, sar, valid)
                 )
+                if optical_prior is not None:
+                    optical_prior, optical_coverage, sar_prior, sar_coverage = (
+                        torch.rot90(value, rotations, (-2, -1))
+                        for value in (
+                            optical_prior,
+                            optical_coverage,
+                            sar_prior,
+                            sar_coverage,
+                        )
+                    )
         use_native_gsd = not self.random_gsd or bool(
             torch.rand(()) < self.native_gsd_probability
         )
@@ -197,12 +271,22 @@ class V2ShardDataset(Dataset[dict[str, object]]):
             "hf_eligible": torch.tensor(eligible),
             "augmentation": torch.tensor((int(flip_x), int(flip_y), rotations)),
         }
+        if optical_prior is not None:
+            result.update(
+                {
+                    "optical_temporal_prior": optical_prior.squeeze(0),
+                    "optical_temporal_coverage": optical_coverage.squeeze(0),
+                    "sar_temporal_prior": sar_prior.squeeze(0),
+                    "sar_temporal_coverage": sar_coverage.squeeze(0),
+                }
+            )
         return result
 
     def __getstate__(self) -> dict[str, object]:
         state = self.__dict__.copy()
         state["_cache_index"] = -1
         state["_cache"] = None
+        state["_prior_cache"] = None
         return state
 
 
