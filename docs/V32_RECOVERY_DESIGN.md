@@ -131,3 +131,31 @@ optical PSD. A failed 5k pilot stops the flow run. Final selection requires 5%
 LPIPS/DISTS improvement, all physical gates, projection violation at most 0.1%, and the
 SAR PSD/ENL/histogram gates. Fixed-seed single samples are used for the main result;
 best-of-K remains excluded.
+
+## Recovery Evidence (2026-08-07)
+
+All values below use the immutable 463-pair protocol unless marked quick:
+
+- V1 Mean: `0.07916 / 16.75 deg`; V2 Refiner: `0.07844 / 16.87 deg`.
+- V3.1 4k-12k: optical RMSE `0.07757-0.07893`, SAM
+  `16.43-17.31 deg`, SAR RMSE `7.34-7.53 dB`, and SAR per-scene absolute
+  bias `2.09-2.16 dB`.
+- Corrected V3.2 import: `0.06473 / 12.43 deg / 7.415 dB / 2.104 dB`.
+- Conditioned recovery 4k EMA: `0.06182 / 12.45 deg / 7.096 dB / 1.512 dB`.
+- A subsequent 1k `H/1` fusion pilot scored
+  `0.06198 / 12.49 deg / 7.083 dB / 1.505 dB`; it improved SAR slightly but
+  regressed both optical gates, so it must not be continued or selected.
+
+The recovery lowers optical RMSE, SAR RMSE, and SAR bias, but no checkpoint passes
+the physical gate and no high-frequency stage is authorized. The next physical
+experiment should change the output factorization:
+
+1. Optical: predict a positive unit spectral direction and a separate reflectance
+   magnitude, with losses on both. This makes SAM an explicit geometric quantity
+   instead of asking ten independent dynamic output channels to discover it.
+2. SAR: predict scene/polarization means from pooled scene condition, plus a spatial
+   residual constrained to zero masked mean. This separates the `0.5 dB` bias gate
+   from texture and local structure.
+3. Train the new heads with the backbone frozen first; unfreeze only transformer
+   blocks 9-12 if full validation improves. Do not spend another 8k steps on the
+   current output parameterization.
