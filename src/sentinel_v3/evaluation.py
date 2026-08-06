@@ -14,7 +14,7 @@ from PIL import Image, ImageDraw
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .losses import highpass, masked_mean, spectral_angle
+from .losses import deterministic_detail_target, highpass, masked_mean, spectral_angle
 from .model import ModelConfig, SentinelV3
 from .sensors import SENTINEL1, SENTINEL2
 from .validation import ValidationProtocol, protocol_records, validation_protocol_hash
@@ -707,7 +707,9 @@ def evaluate_high_frequency_components(
                     model, physical, item, target_spec
                 )[0]
                 base = physical[:, [2, 1, 0]] if name == "optical" else physical
-                target_detail = highpass((target_visual - base) * valid) * valid
+                target_detail = deterministic_detail_target(
+                    target_visual, base, valid, name
+                )
                 prediction = model.deterministic_detail(
                     pyramid, source_spec, target_spec, tuple(base.shape[-2:])
                 )

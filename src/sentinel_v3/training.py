@@ -24,6 +24,7 @@ from .data import StatefulShardSampler, V2ShardDataset, time_weights
 from .losses import (
     codec_reconstruction_loss,
     deterministic_detail_loss,
+    deterministic_detail_target,
     high_frequency_loss,
     highpass,
     latent_alignment,
@@ -111,12 +112,7 @@ class JointObjective(nn.Module):
         valid: Tensor,
         target_spec: SensorSpec,
     ) -> Tensor:
-        residual = (target - base.detach()) * valid
-        if target_spec.modality == "sar":
-            padded = F.pad(residual, (1, 1, 1, 1), mode="reflect")
-            neighborhoods = padded.unfold(2, 3, 1).unfold(3, 3, 1)
-            residual = neighborhoods.flatten(-2).median(dim=-1).values
-        return highpass(residual) * valid
+        return deterministic_detail_target(target, base, valid, target_spec.modality)
 
     def _physical_context(
         self,

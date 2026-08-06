@@ -301,6 +301,20 @@ def highpass(values: Tensor, block_size: int = 4) -> Tensor:
     return values - low
 
 
+def deterministic_detail_target(
+    target: Tensor,
+    base: Tensor,
+    mask: Tensor,
+    modality: str,
+) -> Tensor:
+    residual = (target - base.detach()) * mask
+    if modality == "sar":
+        padded = F.pad(residual, (1, 1, 1, 1), mode="reflect")
+        neighborhoods = padded.unfold(2, 3, 1).unfold(3, 3, 1)
+        residual = neighborhoods.flatten(-2).median(dim=-1).values
+    return highpass(residual) * mask
+
+
 def log_spectral_distance(
     prediction: Tensor,
     target: Tensor,

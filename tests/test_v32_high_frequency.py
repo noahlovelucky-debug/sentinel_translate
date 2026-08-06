@@ -4,7 +4,13 @@ import pytest
 import torch
 
 from sentinel_v3.calibration import calibrate_amplitude_scale
-from sentinel_v3.losses import high_frequency_loss, highpass, low_frequency_loss, robust_rms
+from sentinel_v3.losses import (
+    deterministic_detail_target,
+    high_frequency_loss,
+    highpass,
+    low_frequency_loss,
+    robust_rms,
+)
 from sentinel_v3.model import ModelConfig, SentinelV3
 from sentinel_v3.sensors import SENTINEL1, SENTINEL2
 from sentinel_v3.training import (
@@ -46,6 +52,14 @@ def test_sar_frequency_loss_is_finite() -> None:
     loss, metrics = high_frequency_loss(prediction, target, torch.ones(2, 1, 32, 32), "sar")
     assert torch.isfinite(loss)
     assert "speckle_scale" in metrics
+
+
+def test_sar_deterministic_target_rejects_isolated_speckle() -> None:
+    target = torch.zeros(1, 2, 8, 8)
+    target[..., 4, 4] = 20.0
+    mask = torch.ones(1, 1, 8, 8)
+    detail = deterministic_detail_target(target, torch.zeros_like(target), mask, "sar")
+    torch.testing.assert_close(detail, torch.zeros_like(detail))
 
 
 def test_multiscale_conditions_match_codec_grid(tiny_model: SentinelV3) -> None:
