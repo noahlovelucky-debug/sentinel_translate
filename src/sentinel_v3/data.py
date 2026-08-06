@@ -115,10 +115,15 @@ class V2ShardDataset(Dataset[dict[str, object]]):
         s2 = normalized_s2_to_reflectance(shard["s2"][local].float().unsqueeze(0))
         sar = normalized_sar_to_db(shard["sar"][local].float().unsqueeze(0))
         valid = shard["joint_valid"][local].float().unsqueeze(0)
+        flip_x = False
+        flip_y = False
+        rotations = 0
         if self.augment:
-            if torch.rand(()) < 0.5:
+            flip_x = bool(torch.rand(()) < 0.5)
+            if flip_x:
                 s2, sar, valid = (torch.flip(value, (-1,)) for value in (s2, sar, valid))
-            if torch.rand(()) < 0.5:
+            flip_y = bool(torch.rand(()) < 0.5)
+            if flip_y:
                 s2, sar, valid = (torch.flip(value, (-2,)) for value in (s2, sar, valid))
             rotations = int(torch.randint(0, 4, ()))
             if rotations:
@@ -190,6 +195,7 @@ class V2ShardDataset(Dataset[dict[str, object]]):
             "valid_fraction": torch.tensor(valid_fraction),
             "cloud_shadow_fraction": torch.tensor(cloud_shadow_fraction),
             "hf_eligible": torch.tensor(eligible),
+            "augmentation": torch.tensor((int(flip_x), int(flip_y), rotations)),
         }
         return result
 

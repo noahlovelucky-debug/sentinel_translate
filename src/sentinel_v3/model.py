@@ -765,6 +765,7 @@ class SentinelV3(nn.Module):
         pixel_window: tuple[int, int, int, int] | None,
         orbit: str = "unknown",
         exclude_pair_id: str | None = None,
+        spatial_transform: tuple[bool, bool, int] | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
         zero = physical.new_zeros(())
         if self.temporal_prior is None or location_id is None or pixel_window is None:
@@ -782,6 +783,21 @@ class SentinelV3(nn.Module):
         if queried is None:
             return physical, zero, zero
         prior, coverage = queried
+        if spatial_transform is not None:
+            flip_x, flip_y, rotations = spatial_transform
+            if flip_x:
+                prior, coverage = (
+                    torch.flip(values, (-1,)) for values in (prior, coverage)
+                )
+            if flip_y:
+                prior, coverage = (
+                    torch.flip(values, (-2,)) for values in (prior, coverage)
+                )
+            if rotations:
+                prior, coverage = (
+                    torch.rot90(values, rotations, (-2, -1))
+                    for values in (prior, coverage)
+                )
         composed, violation = self.temporal_prior.compose(
             physical, prior, coverage, target.modality
         )

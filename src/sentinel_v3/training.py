@@ -148,6 +148,12 @@ class JointObjective(nn.Module):
                     _, location_id, s1_date, orbit, s2_date = pair_id.split(":")
                     window_values = batch["window"][batch_index].tolist()  # type: ignore[index]
                     pixel_window = tuple(int(value) for value in window_values)
+                    transform_values = batch["augmentation"][batch_index].tolist()  # type: ignore[index]
+                    spatial_transform = (
+                        bool(transform_values[0]),
+                        bool(transform_values[1]),
+                        int(transform_values[2]),
+                    )
                     acquired = s2_date if target_spec.modality == "optical" else s1_date
                     corrected.append(
                         self.model.apply_temporal_prior(
@@ -158,6 +164,7 @@ class JointObjective(nn.Module):
                             pixel_window=pixel_window,  # type: ignore[arg-type]
                             orbit=orbit,
                             exclude_pair_id=pair_id,
+                            spatial_transform=spatial_transform,
                         )[0]
                     )
                 physical = torch.cat(corrected)
