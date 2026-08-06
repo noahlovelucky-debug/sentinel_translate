@@ -1,0 +1,38 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  manifest: /data/sentinel_translate/data/manifests/pairs.jsonl
+  output: /data/code/sentinel_translate_v3_1/checkpoints_smoke
+  reports: /data/code/sentinel_translate_v3_1/reports_smoke
+
+model:
+  width: 8
+  hidden: 32
+  encoder_depth: 1
+  dit_depth: 1
+  heads: 4
+  flow_steps: 2
+  optical_residual_limit: 0.15
+  sar_residual_limit_db: 6.0
+  architecture: v3.1
+
+train:
+  stage: overfit
+  max_steps: 2
+  batch_size: 2
+  gradient_accumulation: 1
+  num_workers: 0
+  learning_rate: 0.0001
+  encoder_learning_rate: 0.00002
+  weight_decay: 0.05
+  warmup_steps: 1
+  gradient_clip: 1.0
+  ema_decay: 0.9
+  init_use_ema: false
+  channels_last: true
+  save_final: true
+  seed: 42
+  amp: float32
+  log_every: 1
+  validate_every: 1
+  save_every: 1
+  task_probabilities: [0.35, 0.35, 0.15, 0.15]
