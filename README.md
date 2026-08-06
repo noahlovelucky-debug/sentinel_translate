@@ -66,3 +66,12 @@ stopped; its checkpoints must not be used for evaluation or publication.
 The exact local and future multi-sensor data/weight requirements are in
 [requirement.txt](requirement.txt). Raw data and multi-gigabyte checkpoints are
 deliberately excluded from Git.
+
+### Diagnostic panels
+
+These fixed-seed V3.1 panels are visible directly in the repository. They are
+failure diagnostics, not success examples; see [the results analysis](docs/RESULTS.md).
+
+![SAR-to-optical diagnostic](docs/assets/validation_000_sar2opt.png)
+
+![Optical-to-SAR diagnostic](docs/assets/validation_000_opt2sar.png)
