@@ -51,6 +51,7 @@ class JointObjective(nn.Module):
         task_probabilities: list[float] | None = None,
         physical_alignment_samples: int = 4,
         physical_alignment_weight: float = 0.02,
+        optical_dists_weight: float = 0.1,
     ) -> None:
         super().__init__()
         self.model = model
@@ -60,6 +61,7 @@ class JointObjective(nn.Module):
         )
         self.physical_alignment_samples = physical_alignment_samples
         self.physical_alignment_weight = physical_alignment_weight
+        self.optical_dists_weight = optical_dists_weight
         self.last_direction_losses: list[Tensor] = []
 
     @staticmethod
@@ -223,6 +225,12 @@ class JointObjective(nn.Module):
     ) -> Tensor:
         from .evaluation import perceptual_evaluators
 
+        sample_count = min(2, prediction.shape[0])
+        prediction = prediction[:sample_count]
+        target = target[:sample_count]
+        valid = valid[:sample_count]
+        if sample_weight is not None:
+            sample_weight = sample_weight[:sample_count]
         _, evaluator = perceptual_evaluators(prediction.device)
         size = (min(64, prediction.shape[-2]), min(64, prediction.shape[-1]))
 
@@ -251,16 +259,19 @@ class JointObjective(nn.Module):
         valid = batch["valid"][indices]  # type: ignore[index]
         texture = highpass(target * valid) * valid
         raw_latent = self.model.codec.encode(texture, target_spec.modality, standardized=False)
-        self.model.codec.update_statistics(raw_latent, target_spec.modality)
+        # Direction filtering differs by rank; collectives inside this branch would deadlock.
+        self.model.codec.update_statistics(
+            raw_latent, target_spec.modality, synchronize=False
+        )
         latent = self.model.codec.normalize(raw_latent, target_spec.modality)
         decoded = self.model.codec.decode(latent, target_spec.modality)
         weight = weights[indices]
         loss, metrics = codec_reconstruction_loss(
             decoded, texture, valid * weight[:, None, None, None], target_spec.modality
         )
-        if target_spec.modality == "optical":
+        if target_spec.modality == "optical" and self.optical_dists_weight > 0:
             dists = self._optical_dists(decoded, texture, valid, weight)
-            loss = loss + 0.1 * dists
+            loss = loss + self.optical_dists_weight * dists
             metrics["codec_dists"] = dists.detach()
         return loss, metrics
 
@@ -1007,6 +1018,7 @@ def train(
         list(train_config.get("task_probabilities", [0.5, 0.5])),
         int(train_config.get("physical_alignment_samples", 4)),
         float(train_config.get("physical_alignment_weight", 0.02)),
+        float(train_config.get("optical_dists_weight", 0.1)),
     ).to(device)
     ema = EMA(model, float(train_config["ema_decay"]))
     step = 0
@@ -1133,7 +1145,9 @@ def train(
         wrapped = DistributedDataParallel(
             objective,
             device_ids=[local_rank] if device.type == "cuda" else None,
-            find_unused_parameters=False,
+            find_unused_parameters=bool(
+                train_config.get("find_unused_parameters", True)
+            ),
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
         )

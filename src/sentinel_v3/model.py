@@ -548,12 +548,19 @@ class ResidualCodec(nn.Module):
         getattr(self, f"{modality}_std").copy_(std.clamp_min(1e-4))
 
     @torch.no_grad()
-    def update_statistics(self, latent: Tensor, modality: str, momentum: float = 0.01) -> None:
+    def update_statistics(
+        self,
+        latent: Tensor,
+        modality: str,
+        momentum: float = 0.01,
+        *,
+        synchronize: bool = True,
+    ) -> None:
         working = latent.float()
         total = working.sum(dim=(0, 2, 3))
         total_square = working.square().sum(dim=(0, 2, 3))
         count = working.new_tensor(working.shape[0] * working.shape[2] * working.shape[3])
-        if dist.is_available() and dist.is_initialized():
+        if synchronize and dist.is_available() and dist.is_initialized():
             dist.all_reduce(total)
             dist.all_reduce(total_square)
             dist.all_reduce(count)
