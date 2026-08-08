@@ -102,3 +102,55 @@ def test_zero_radiometric_extensions_preserve_v4_loading(
             values, SENTINEL1, SENTINEL2, valid
         )[0]
     torch.testing.assert_close(actual, expected)
+
+
+def test_id_bridge_extensions_are_optional_for_legacy_v4_checkpoints(
+    tmp_path: Path, tiny_model: torch.nn.Module
+) -> None:
+    prefixes = ("id_bridge_origin.", "residual_dit.origin_projection.")
+    legacy_state = {
+        name: value for name, value in tiny_model.state_dict().items() if not name.startswith(prefixes)
+    }
+    legacy_config = asdict(tiny_model.config)
+    for name in (
+        "id_bridge_state",
+        "id_bridge_state_channels",
+        "id_bridge_optical_state_scale",
+        "id_bridge_sar_state_scale",
+        "id_bridge_anchor_origin",
+        "id_bridge_optical_innovation_scale",
+        "id_bridge_sar_innovation_scale",
+    ):
+        legacy_config.pop(name)
+    checkpoint = tmp_path / "legacy_v4_without_id_bridge.pt"
+    torch.save(
+        {
+            "format_version": 4,
+            "config": {"model": legacy_config},
+            "model": legacy_state,
+        },
+        checkpoint,
+    )
+
+    loaded = load_checkpoint(checkpoint, torch.device("cpu"))
+    assert isinstance(loaded, type(tiny_model))
+
+
+def test_checkpoint_loader_rejects_unknown_missing_v4_parameter(
+    tmp_path: Path, tiny_model: torch.nn.Module
+) -> None:
+    state = dict(tiny_model.state_dict())
+    unknown_key = next(name for name in state if name.startswith("encoder."))
+    state.pop(unknown_key)
+    checkpoint = tmp_path / "legacy_v4_unknown_missing.pt"
+    torch.save(
+        {
+            "format_version": 4,
+            "config": {"model": asdict(tiny_model.config)},
+            "model": state,
+        },
+        checkpoint,
+    )
+
+    with pytest.raises(RuntimeError, match="incompatible checkpoint"):
+        load_checkpoint(checkpoint, torch.device("cpu"))

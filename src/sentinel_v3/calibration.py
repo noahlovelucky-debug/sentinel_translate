@@ -23,6 +23,43 @@ from .model import SentinelV3
 from .sensors import SENTINEL1, SENTINEL2
 
 
+def select_texture_release_candidate(
+    candidates: list[dict[str, float | bool]],
+) -> dict[str, float | bool]:
+    """Select texture only when it improves the same-detail zero-alpha baseline."""
+
+    release = [candidate for candidate in candidates if candidate.get("release_beneficial")]
+    if release:
+        return max(
+            release,
+            key=lambda candidate: (
+                float(candidate["lpips_improvement"])
+                + float(candidate["dists_improvement"])
+            ),
+        )
+    anchor_fallback = [
+        candidate
+        for candidate in candidates
+        if bool(candidate.get("detail_enabled"))
+        and float(candidate.get("alpha", -1.0)) == 0.0
+        and candidate.get("visual_beneficial")
+    ]
+    if anchor_fallback:
+        return max(
+            anchor_fallback,
+            key=lambda candidate: (
+                float(candidate["lpips_improvement"])
+                + float(candidate["dists_improvement"])
+            ),
+        )
+    return next(
+        candidate
+        for candidate in candidates
+        if float(candidate.get("alpha", -1.0)) == 0.0
+        and not bool(candidate.get("detail_enabled"))
+    )
+
+
 def calibrate_amplitude_scale(
     physical: Tensor,
     deterministic_detail: Tensor,
@@ -126,7 +163,11 @@ def calibrate_checkpoint(
             )
             optical_texture = (
                 model.sample_residual(
-                    sar_pyramid, SENTINEL2, tuple(optical_base.shape), seed=seed + index
+                    sar_pyramid,
+                    SENTINEL2,
+                    tuple(optical_base.shape),
+                    seed=seed + index,
+                    bridge_anchor=optical_detail,
                 )
                 * valid
             )
@@ -161,10 +202,11 @@ def calibrate_checkpoint(
     optical_alpha = float(alphas[optical_index])
     sar_alpha = float(alphas[sar_index])
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    payload["model"]["optical_alpha_scale"] = torch.tensor(optical_alpha)
+    optical_scale_name = model.amplitude_scale_name("optical")
+    payload["model"][optical_scale_name] = torch.tensor(optical_alpha)
     payload["model"]["sar_alpha_scale"] = torch.tensor(sar_alpha)
     if "ema" in payload:
-        payload["ema"]["state"]["optical_alpha_scale"] = torch.tensor(optical_alpha)
+        payload["ema"]["state"][optical_scale_name] = torch.tensor(optical_alpha)
         payload["ema"]["state"]["sar_alpha_scale"] = torch.tensor(sar_alpha)
     result = {
         "split": "validation_temporal",
@@ -315,7 +357,7 @@ def calibrate_texture_release(
         0.050,
         0.160,
     ),
-    alpha_values: tuple[float, ...] = (0.0, 0.25, 0.50, 0.75, 1.0),
+    alpha_values: tuple[float, ...] = (0.0, 0.05, 0.10, 0.20, 0.25, 0.50, 0.75, 1.0),
     detail_values: tuple[bool, ...] = (False, True),
 ) -> dict[str, Any]:
     """Calibrate sparse Optical texture release against paired validation risk.
@@ -332,6 +374,7 @@ def calibrate_texture_release(
     model = load_checkpoint(checkpoint, device)
     model.set_amplitude_scale("optical", 1.0)
     model.set_optical_texture_amplitude_floor(0.0)
+    model.set_optical_texture_risk_threshold(0.0)
     dataset = ManifestCropDataset(manifest, "validation_temporal", limit=limit)
     cached: list[dict[str, Tensor]] = []
     with torch.inference_mode():
@@ -360,7 +403,13 @@ def calibrate_texture_release(
                 * valid
             )
             texture = (
-                model.sample_residual(pyramid, SENTINEL2, tuple(base.shape), seed=seed + index)
+                model.sample_residual(
+                    pyramid,
+                    SENTINEL2,
+                    tuple(base.shape),
+                    seed=seed + index,
+                    bridge_anchor=detail,
+                )
                 * valid
             )
             amplitude = model.residual_amplitude(
@@ -503,45 +552,64 @@ def calibrate_texture_release(
                 "visual_psd_distance": psd_visual / count,
             }
         )
-        candidate["release_beneficial"] = bool(
-            alpha > 0.0
-            and candidate["lpips_improvement"] > 0.0
+        candidate["visual_beneficial"] = bool(
+            candidate["lpips_improvement"] > 0.0
             and candidate["dists_improvement"] > 0.0
             and candidate["visual_edge_f1"] > candidate["physical_edge_f1"]
             and candidate["visual_psd_distance"] < candidate["physical_psd_distance"]
         )
 
-    beneficial = [
+    detail_baselines = {
+        enabled: next(
+            candidate
+            for candidate in safe_candidates
+            if bool(candidate["detail_enabled"]) == enabled
+            and float(candidate["alpha"]) == 0.0
+        )
+        for enabled in (False, True)
+        if any(
+            bool(candidate["detail_enabled"]) == enabled
+            and float(candidate["alpha"]) == 0.0
+            for candidate in safe_candidates
+        )
+    }
+    for candidate in safe_candidates:
+        baseline = detail_baselines[bool(candidate["detail_enabled"])]
+        candidate["release_beneficial"] = bool(
+            float(candidate["alpha"]) > 0.0
+            and candidate["lpips_improvement"] > baseline["lpips_improvement"]
+            and candidate["dists_improvement"] > baseline["dists_improvement"]
+            and candidate["visual_edge_f1"] > baseline["visual_edge_f1"]
+            and candidate["visual_psd_distance"] < baseline["visual_psd_distance"]
+        )
+
+    release_beneficial = [
         candidate for candidate in safe_candidates if candidate.get("release_beneficial")
     ]
-    if beneficial:
-        selected = max(
-            beneficial,
-            key=lambda candidate: (
-                float(candidate["lpips_improvement"]) + float(candidate["dists_improvement"])
-            ),
-        )
-    else:
-        selected = next(
-            candidate
-            for candidate in candidates
-            if candidate["alpha"] == 0.0 and not candidate["detail_enabled"]
-        )
+    selected = select_texture_release_candidate(safe_candidates)
     selected_floor = float(selected["amplitude_floor"])
     selected_alpha = float(selected["alpha"])
     selected_detail_enabled = bool(selected["detail_enabled"])
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-    payload["model"]["optical_texture_amplitude_floor"] = torch.tensor(selected_floor)
-    payload["model"]["optical_alpha_scale"] = torch.tensor(selected_alpha)
+    optical_scale_name = model.amplitude_scale_name("optical")
+    amplitude_floor_name = model.texture_amplitude_floor_name()
+    payload["model"][amplitude_floor_name] = torch.tensor(selected_floor)
+    payload["model"][optical_scale_name] = torch.tensor(selected_alpha)
     if not selected_detail_enabled:
         payload["model"]["optical_detail_confidence_threshold"] = torch.tensor(1.01)
+        payload["model"]["optical_anchor_band_scales"] = torch.zeros(3)
+        payload["model"]["optical_anchor_density_gain"] = torch.tensor(0.0)
+    if selected_alpha > 0.0:
+        payload["model"]["optical_texture_risk_threshold"] = torch.tensor(0.0)
     if "ema" in payload:
-        payload["ema"]["state"]["optical_texture_amplitude_floor"] = torch.tensor(
-            selected_floor
-        )
-        payload["ema"]["state"]["optical_alpha_scale"] = torch.tensor(selected_alpha)
+        payload["ema"]["state"][amplitude_floor_name] = torch.tensor(selected_floor)
+        payload["ema"]["state"][optical_scale_name] = torch.tensor(selected_alpha)
         if not selected_detail_enabled:
             payload["ema"]["state"]["optical_detail_confidence_threshold"] = torch.tensor(1.01)
+            payload["ema"]["state"]["optical_anchor_band_scales"] = torch.zeros(3)
+            payload["ema"]["state"]["optical_anchor_density_gain"] = torch.tensor(0.0)
+        if selected_alpha > 0.0:
+            payload["ema"]["state"]["optical_texture_risk_threshold"] = torch.tensor(0.0)
     result: dict[str, Any] = {
         "split": "validation_temporal",
         "samples": len(cached),
@@ -552,7 +620,7 @@ def calibrate_texture_release(
         "selected_amplitude_floor": selected_floor,
         "selected_alpha": selected_alpha,
         "selected_detail_enabled": selected_detail_enabled,
-        "amplitude_is_useful_risk_proxy": bool(beneficial),
+        "amplitude_is_useful_risk_proxy": bool(release_beneficial),
         "selected": selected,
         "candidates": candidates,
     }
@@ -577,6 +645,8 @@ def calibrate_anchor_detail(
     model = load_checkpoint(checkpoint, device)
     model.set_detail_confidence_threshold("optical", 1.01)
     model.set_optical_anchor_band_scales((0.0, 0.0, 0.0))
+    model.set_optical_anchor_density(0.0, 1.0)
+    model.set_optical_anchor_source_density(0.0, 1.0)
     dataset = ManifestCropDataset(manifest, "validation_temporal", limit=limit)
     cached: list[dict[str, Tensor]] = []
     with torch.inference_mode():
@@ -586,7 +656,7 @@ def calibrate_anchor_detail(
             valid = item["valid"].unsqueeze(0).to(device)  # type: ignore[union-attr]
             metadata = manifest_metadata(item, device)
             gsd = float(item["gsd"])
-            physical, _, _ = model.physical(
+            physical, _, pyramid = model.physical(
                 sar,
                 SENTINEL1,
                 SENTINEL2,
@@ -603,6 +673,9 @@ def calibrate_anchor_detail(
                     "target": s2[:, [2, 1, 0]].cpu(),
                     "valid": valid.cpu(),
                     "bands": torch.stack(frequency_bands(base, levels=3), dim=1).cpu(),
+                    "source_density": F.avg_pool2d(
+                        highpass(pyramid[0]).abs().mean(dim=1, keepdim=True), 4, stride=4
+                    ).cpu(),
                 }
             )
     if not cached:
@@ -611,7 +684,12 @@ def calibrate_anchor_detail(
     scale_candidates: list[tuple[float, float, float]] = [(0.0, 0.0, 0.0)]
     scale_candidates.extend((value, value, value) for value in scalar_values)
     for level in range(3):
-        for value in (0.05, 0.10, 0.20, 0.30):
+        level_values = (
+            (0.05, 0.10, 0.20, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.60)
+            if level == 0
+            else (0.05, 0.10, 0.20, 0.30)
+        )
+        for value in level_values:
             scales = [0.0, 0.0, 0.0]
             scales[level] = value
             scale_candidates.append(tuple(scales))
@@ -626,6 +704,98 @@ def calibrate_anchor_detail(
             (0.10, 0.15, 0.30),
         )
     )
+    parameter_candidates = [
+        {
+            "band_scales": scales,
+            "density_gain": 0.0,
+            "density_threshold": 1.0,
+            "source_gain": 0.0,
+            "source_threshold": 1.0,
+        }
+        for scales in scale_candidates
+    ]
+    for base_scale in (0.20, 0.25, 0.30):
+        for peak_scale in (0.50, 0.60, 0.80):
+            for threshold in (1.0, 1.5, 2.0):
+                parameter_candidates.append(
+                    {
+                        "band_scales": (base_scale, 0.0, 0.0),
+                        "density_gain": peak_scale - base_scale,
+                        "density_threshold": threshold,
+                        "source_gain": 0.0,
+                        "source_threshold": 1.0,
+                    }
+                )
+    for base_scale in (0.10, 0.20, 0.30):
+        for density_gain in (0.0, 0.20, 0.30):
+            for source_gain in (0.10, 0.20, 0.30, 0.40):
+                for source_threshold in (0.75, 1.0, 1.5, 2.0):
+                    parameter_candidates.append(
+                        {
+                            "band_scales": (base_scale, 0.0, 0.0),
+                            "density_gain": density_gain,
+                            "density_threshold": 1.0,
+                            "source_gain": source_gain,
+                            "source_threshold": source_threshold,
+                        }
+                    )
+    for base_scale in (0.10, 0.15, 0.20):
+        for density_gain in (0.0, 0.10, 0.20):
+            for source_gain in (0.40, 0.45, 0.50, 0.55):
+                for source_threshold in (1.0, 1.15, 1.30, 1.50):
+                    parameter_candidates.append(
+                        {
+                            "band_scales": (base_scale, 0.0, 0.0),
+                            "density_gain": density_gain,
+                            "density_threshold": 1.0,
+                            "source_gain": source_gain,
+                            "source_threshold": source_threshold,
+                        }
+                    )
+    for base_scale in (0.10, 0.15, 0.20):
+        for density_gain in (0.0, 0.10):
+            for source_gain in (0.60, 0.65, 0.70):
+                for source_threshold in (1.0, 1.15, 1.30, 1.50):
+                    parameter_candidates.append(
+                        {
+                            "band_scales": (base_scale, 0.0, 0.0),
+                            "density_gain": density_gain,
+                            "density_threshold": 1.0,
+                            "source_gain": source_gain,
+                            "source_threshold": source_threshold,
+                        }
+                    )
+
+    def anchor_detail(item: dict[str, Tensor], candidate: dict[str, Any]) -> Tensor:
+        bands = item["bands"]
+        scales = bands.new_tensor(candidate["band_scales"]).view(1, 3, 1, 1, 1)
+        fine_scale: Tensor = scales[:, :1]
+        gain = float(candidate["density_gain"])
+        if gain > 0.0:
+            density = F.avg_pool2d(bands[:, 0].abs().mean(dim=1, keepdim=True), 4, stride=4)
+            normalized = density / density.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            gate = (normalized >= float(candidate["density_threshold"])).to(bands.dtype)
+            gate = F.avg_pool2d(gate, 3, stride=1, padding=1)
+            gate = F.interpolate(
+                gate, size=bands.shape[-2:], mode="bilinear", align_corners=False
+            )
+            fine_scale = fine_scale + gain * gate[:, None]
+        source_gain = float(candidate["source_gain"])
+        if source_gain > 0.0:
+            source_density = item["source_density"]
+            normalized_source = source_density / source_density.mean(
+                dim=(-2, -1), keepdim=True
+            ).clamp_min(1e-6)
+            source_gate = (
+                normalized_source >= float(candidate["source_threshold"])
+            ).to(bands.dtype)
+            source_gate = F.avg_pool2d(source_gate, 3, stride=1, padding=1)
+            source_gate = F.interpolate(
+                source_gate, size=bands.shape[-2:], mode="bilinear", align_corners=False
+            )
+            fine_scale = fine_scale + source_gain * source_gate[:, None]
+        return fine_scale[:, 0] * bands[:, 0] + (bands[:, 1:] * scales[:, 1:]).sum(dim=1)
+
     physical_rmse = sum(
         float(
             torch.sqrt(masked_mean((item["physical"] - item["target"]).square(), item["valid"]))
@@ -633,13 +803,12 @@ def calibrate_anchor_detail(
         for item in cached
     ) / len(cached)
     candidates: list[dict[str, Any]] = []
-    for scales in scale_candidates:
+    for parameters in parameter_candidates:
         rmse_sum = 0.0
         violation_sum = 0.0
         bad_scenes = 0
         for item in cached:
-            scale = item["bands"].new_tensor(scales).view(1, 3, 1, 1, 1)
-            detail = (item["bands"] * scale).sum(dim=1)
+            detail = anchor_detail(item, parameters)
             visual, violation = SentinelV3.compose_visual(
                 item["physical"],
                 detail,
@@ -663,7 +832,11 @@ def calibrate_anchor_detail(
         bad_fraction = bad_scenes / count
         candidates.append(
             {
-                "band_scales": list(scales),
+                "band_scales": list(parameters["band_scales"]),
+                "density_gain": float(parameters["density_gain"]),
+                "density_threshold": float(parameters["density_threshold"]),
+                "source_gain": float(parameters["source_gain"]),
+                "source_threshold": float(parameters["source_threshold"]),
                 "visual_rgb_rmse": visual_rmse,
                 "rmse_ratio": visual_rmse / max(physical_rmse, 1e-8),
                 "pre_projection_violation": violation,
@@ -694,9 +867,8 @@ def calibrate_anchor_detail(
             physical = item["physical"].to(device)
             target = item["target"].to(device)
             valid = item["valid"].to(device)
-            bands = item["bands"].to(device)
-            scale = bands.new_tensor(scales).view(1, 3, 1, 1, 1)
-            detail = (bands * scale).sum(dim=1)
+            device_item = {name: value.to(device) for name, value in item.items()}
+            detail = anchor_detail(device_item, candidate)
             visual = SentinelV3.compose_visual(
                 physical, detail, torch.zeros_like(detail), "optical"
             )
@@ -723,7 +895,11 @@ def calibrate_anchor_detail(
             }
         )
         candidate["beneficial"] = bool(
-            any(float(value) > 0.0 for value in scales)
+            (
+                any(float(value) > 0.0 for value in scales)
+                or float(candidate["density_gain"]) > 0.0
+                or float(candidate["source_gain"]) > 0.0
+            )
             and candidate["lpips_improvement"] > 0.0
             and candidate["dists_improvement"] > 0.0
             and candidate["visual_edge_f1"] > candidate["physical_edge_f1"]
@@ -741,12 +917,36 @@ def calibrate_anchor_detail(
         else candidates[0]
     )
     selected_scales = tuple(float(value) for value in selected["band_scales"])
+    selected_density_gain = float(selected["density_gain"])
+    selected_density_threshold = float(selected["density_threshold"])
+    selected_source_gain = float(selected["source_gain"])
+    selected_source_threshold = float(selected["source_threshold"])
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     scales_tensor = torch.tensor(selected_scales)
     payload["model"]["optical_anchor_band_scales"] = scales_tensor
+    payload["model"]["optical_anchor_density_gain"] = torch.tensor(selected_density_gain)
+    payload["model"]["optical_anchor_density_threshold"] = torch.tensor(
+        selected_density_threshold
+    )
+    payload["model"]["optical_anchor_source_gain"] = torch.tensor(selected_source_gain)
+    payload["model"]["optical_anchor_source_threshold"] = torch.tensor(
+        selected_source_threshold
+    )
     payload["model"]["optical_detail_confidence_threshold"] = torch.tensor(1.01)
     if "ema" in payload:
         payload["ema"]["state"]["optical_anchor_band_scales"] = scales_tensor
+        payload["ema"]["state"]["optical_anchor_density_gain"] = torch.tensor(
+            selected_density_gain
+        )
+        payload["ema"]["state"]["optical_anchor_density_threshold"] = torch.tensor(
+            selected_density_threshold
+        )
+        payload["ema"]["state"]["optical_anchor_source_gain"] = torch.tensor(
+            selected_source_gain
+        )
+        payload["ema"]["state"]["optical_anchor_source_threshold"] = torch.tensor(
+            selected_source_threshold
+        )
         payload["ema"]["state"]["optical_detail_confidence_threshold"] = torch.tensor(1.01)
     result: dict[str, Any] = {
         "split": "validation_temporal",
@@ -755,6 +955,10 @@ def calibrate_anchor_detail(
         "physical_lpips": physical_lpips,
         "physical_dists": physical_dists,
         "selected_band_scales": list(selected_scales),
+        "selected_density_gain": selected_density_gain,
+        "selected_density_threshold": selected_density_threshold,
+        "selected_source_gain": selected_source_gain,
+        "selected_source_threshold": selected_source_threshold,
         "anchor_detail_is_beneficial": bool(beneficial),
         "selected": selected,
         "candidates": candidates,

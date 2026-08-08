@@ -25,6 +25,7 @@ from .data import StatefulIndexSampler, StatefulShardSampler, V2ShardDataset, ti
 from .losses import (
     charbonnier,
     codec_reconstruction_loss,
+    cross_modal_identifiability_target,
     detail_reliability_target,
     deterministic_detail_loss,
     deterministic_detail_target,
@@ -46,6 +47,31 @@ def _weighted_zero(module: nn.Module, device: torch.device) -> Tensor:
         parameter.sum() * 0.0 for parameter in module.parameters() if parameter.requires_grad
     ]
     return sum(terms, torch.zeros((), device=device))
+
+
+@torch.no_grad()
+def _stable_clip_grad_norm_(parameters: list[nn.Parameter], max_norm: float) -> tuple[float, float]:
+    """Clip a parameter group without overflowing the FP32 norm reduction."""
+
+    gradients = [parameter.grad for parameter in parameters if parameter.grad is not None]
+    if not gradients:
+        return 0.0, 0.0
+    maxima = torch.stack([gradient.detach().abs().amax().float() for gradient in gradients])
+    if not bool(torch.isfinite(maxima).all()):
+        raise FloatingPointError("non-finite gradient values before clipping")
+    maximum = float(maxima.max())
+    if maximum == 0.0:
+        return 0.0, 0.0
+    scale = 1.0 / maximum
+    scaled_square = sum(
+        (gradient.detach().float() * scale).square().sum()
+        for gradient in gradients
+    )
+    norm = maximum * math.sqrt(float(scaled_square))
+    coefficient = min(1.0, max_norm / max(norm, 1e-12))
+    for gradient in gradients:
+        gradient.mul_(coefficient)
+    return norm, maximum
 
 
 def texture_benefit_target(
@@ -95,6 +121,7 @@ class JointObjective(nn.Module):
         flow_rollout_pixel_weight: float = 0.1,
         flow_rollout_hf_weight: float = 0.1,
         risk_flow_steps: int = 4,
+        bridge_flow_steps: int = 4,
     ) -> None:
         super().__init__()
         self.model = model
@@ -121,6 +148,7 @@ class JointObjective(nn.Module):
         self.flow_rollout_pixel_weight = flow_rollout_pixel_weight
         self.flow_rollout_hf_weight = flow_rollout_hf_weight
         self.risk_flow_steps = max(1, risk_flow_steps)
+        self.bridge_flow_steps = max(1, bridge_flow_steps)
         self.last_direction_losses: list[Tensor] = []
         self.progress = 0.0
         self.current_step = 0
@@ -142,6 +170,44 @@ class JointObjective(nn.Module):
     def _assignments(batch_size: int, device: torch.device) -> Tensor:
         tasks = torch.arange(batch_size, device=device) % 2
         return tasks[torch.randperm(batch_size, device=device)]
+
+    def _id_bridge_assignments(
+        self,
+        batch_size: int,
+        device: torch.device,
+        *,
+        rank: int | None = None,
+    ) -> Tensor:
+        if rank is None:
+            rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        return (torch.arange(batch_size, device=device) + self.current_step + rank) % 2
+
+    @staticmethod
+    def _id_bridge_start(
+        mu: Tensor,
+        log_sigma: Tensor,
+        reliability_logits: Tensor,
+        noise_scale: float,
+        epsilon: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        q_pred = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
+        sigma = noise_scale * torch.sigmoid(log_sigma) * (1.0 - q_pred)
+        # Distribution parameters are trained by their own calibrated objectives only.
+        return mu + sigma.detach() * epsilon, q_pred, sigma
+
+    @staticmethod
+    def _id_bridge_anchor_values(
+        mu: Tensor,
+        correction: Tensor,
+        endpoint: Tensor,
+        q_oracle: Tensor,
+    ) -> Tensor:
+        if mu.shape != correction.shape or mu.shape != endpoint.shape:
+            raise ValueError("id bridge anchor tensors must share a latent shape")
+        if q_oracle.shape != (mu.shape[0], 1, *mu.shape[-2:]):
+            raise ValueError("id bridge oracle must be B1HW on the latent grid")
+        values = q_oracle * F.smooth_l1_loss(mu, endpoint, reduction="none")
+        return values + (1.0 - q_oracle) * 0.05 * correction.abs()
 
     def _physical_direction(
         self,
@@ -412,10 +478,14 @@ class JointObjective(nn.Module):
         predicted_image = image(prediction)
         target_image = image(target)
         lpips_evaluator, dists_evaluator = perceptual_evaluators(prediction.device)
-        lpips_values = lpips_evaluator(
-            predicted_image * 2.0 - 1.0, target_image * 2.0 - 1.0
-        ).flatten()
-        dists_values = dists_evaluator(predicted_image, target_image).flatten()
+        # The surrounding training step may use BF16 autocast. Perceptual backbones
+        # have substantially larger cross-rank gradient variance in BF16, so keep
+        # this sparse auxiliary loss in FP32.
+        with torch.autocast(prediction.device.type, enabled=False):
+            lpips_values = lpips_evaluator(
+                predicted_image * 2.0 - 1.0, target_image * 2.0 - 1.0
+            ).flatten()
+            dists_values = dists_evaluator(predicted_image, target_image).flatten()
         denominator = weights.sum().clamp_min(1e-8)
         return (
             (lpips_values * weights).sum() / denominator,
@@ -742,15 +812,338 @@ class JointObjective(nn.Module):
             "candidate_benefit": masked_mean(benefit, block_valid).detach(),
         }
 
+    def _bridge_direction(
+        self,
+        batch: dict[str, object],
+        indices: Tensor,
+        source_key: str,
+        target_key: str,
+        source_spec: SensorSpec,
+        target_spec: SensorSpec,
+        weights: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if target_spec.modality != "optical":
+            raise ValueError("residual bridge training is defined for Optical only")
+        target, base, valid, pyramid = self._physical_context(
+            batch,
+            indices,
+            source_key,
+            target_key,
+            source_spec,
+            target_spec,
+            joint=False,
+        )
+        with torch.no_grad():
+            detail = self.model.deterministic_detail(
+                pyramid,
+                source_spec,
+                target_spec,
+                tuple(target.shape[-2:]),
+                base=base,
+            )
+            latent_size = (target.shape[-2] // 4, target.shape[-1] // 4)
+            latent_gate = self.model.optical_bridge_gate(detail, latent_size)
+            full_gate = F.interpolate(
+                latent_gate, size=target.shape[-2:], mode="bilinear", align_corners=False
+            )
+            texture = self._texture_target(target, base, detail, valid) * full_gate
+            endpoint_latent = self.model.codec.encode(texture, "optical")
+            anchor_latent = self.model.codec.encode(highpass(detail), "optical")
+        noise = self.model.flow_noise_scale(target_spec) * torch.randn_like(endpoint_latent)
+        noise = noise * latent_gate
+        time_values = torch.rand(texture.shape[0], device=texture.device, dtype=texture.dtype)
+        interpolation = (1.0 - time_values[:, None, None, None]) * noise + time_values[
+            :, None, None, None
+        ] * endpoint_latent
+        velocity = self.model.flow_velocity(
+            interpolation,
+            time_values,
+            pyramid,
+            target_spec,
+            texture.shape[1],
+            bridge_anchor=anchor_latent,
+            use_optical_bridge=True,
+        )
+        target_velocity = endpoint_latent - noise
+        residual_weights = weights[indices]
+        latent_valid = F.interpolate(valid, size=latent_size, mode="area") * latent_gate
+        velocity_loss = masked_mean(
+            F.smooth_l1_loss(velocity, target_velocity, reduction="none"),
+            residual_weights[:, None, None, None] * latent_valid,
+        )
+        predicted_latent = interpolation + (
+            1.0 - time_values[:, None, None, None]
+        ) * velocity
+        endpoint = highpass(self.model.codec.decode(predicted_latent, "optical")) * full_gate
+        endpoint_weights = residual_weights * (1.0 - time_values).clamp_min(0.05)
+        endpoint_loss, endpoint_metrics = high_frequency_loss(
+            endpoint,
+            texture,
+            valid * full_gate,
+            "optical",
+            sample_weight=endpoint_weights,
+        )
+        target_amplitude = robust_rms(texture, valid).clamp_max(
+            self.model.config.optical_residual_limit
+        )
+        predicted_amplitude = self.model.residual_amplitude(
+            pyramid, target_spec, texture.shape[1], tuple(texture.shape[-2:])
+        )
+        amplitude_loss = masked_mean(
+            (
+                (predicted_amplitude - target_amplitude)
+                / self.model.config.optical_residual_limit
+            ).abs(),
+            residual_weights[:, None, None, None]
+            * F.avg_pool2d(valid, 4, stride=4)
+            * latent_gate,
+        )
+        shaped = self.model.shape_residual_texture(
+            endpoint,
+            pyramid,
+            target_spec,
+            amplitude=predicted_amplitude,
+            apply_release_gate=False,
+        ) * full_gate
+        composed = self.model.compose_visual(base, detail, shaped, "optical")
+        assert isinstance(composed, Tensor)
+        visual_weight = valid * endpoint_weights[:, None, None, None]
+        visual_pixel = masked_mean(
+            charbonnier((composed - target) / 0.05), visual_weight
+        )
+        visual_hf, visual_hf_metrics = high_frequency_loss(
+            highpass(composed),
+            highpass(target),
+            valid,
+            "optical",
+            sample_weight=endpoint_weights,
+        )
+        total = (
+            velocity_loss
+            + 0.25 * endpoint_loss
+            + 0.20 * amplitude_loss
+            + 0.10 * visual_pixel
+            + 0.10 * visual_hf
+        )
+        metrics = {
+            "velocity": velocity_loss.detach(),
+            "amplitude": amplitude_loss.detach(),
+            "visual_pixel": visual_pixel.detach(),
+            "bridge_coverage": latent_gate.mean().detach(),
+            "endpoint_source_weight": (1.0 - time_values).mean().detach(),
+            **{f"endpoint_{name}": value for name, value in endpoint_metrics.items()},
+            **{f"visual_{name}": value for name, value in visual_hf_metrics.items()},
+        }
+        if (
+            self.flow_visual_perceptual_weight > 0.0
+            and self.current_step % self.flow_rollout_every == 0
+        ):
+            lpips, dists = self._optical_visual_perceptual(
+                composed, target, valid, endpoint_weights
+            )
+            total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
+                lpips + dists
+            )
+            metrics["visual_lpips"] = lpips.detach()
+            metrics["visual_dists"] = dists.detach()
+        return total, metrics
+
+    def _id_bridge_direction(
+        self,
+        batch: dict[str, object],
+        indices: Tensor,
+        source_key: str,
+        target_key: str,
+        source_spec: SensorSpec,
+        target_spec: SensorSpec,
+        weights: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        target, base, valid, pyramid = self._physical_context(
+            batch,
+            indices,
+            source_key,
+            target_key,
+            source_spec,
+            target_spec,
+            joint=False,
+        )
+        delta = (target - base.detach()) * valid
+        mu, correction, anchor_detail, log_sigma, reliability_logits = (
+            self.model.predict_id_bridge_origin_components(pyramid, base, target_spec)
+        )
+        if self.model.id_bridge_uses_observable_anchor and target_spec.modality == "optical":
+            # Keep the observable prior in pixels; the Haar state transports only its
+            # orthogonal innovation and therefore cannot project away anchor detail.
+            full_residual = highpass(delta) * valid
+            innovation_target = self.model.project_id_bridge_residual(
+                (full_residual - anchor_detail) * valid, target_spec
+            ) * valid
+        else:
+            # This bridge owns all high-frequency residuals, including SAR speckle and tails.
+            full_residual = self.model.project_id_bridge_residual(delta, target_spec) * valid
+            innovation_target = full_residual
+        with torch.no_grad():
+            endpoint_latent = self.model.encode_id_bridge_residual(innovation_target, target_spec)
+        oracle = cross_modal_identifiability_target(
+            pyramid[0].detach(), frequency_bands(full_residual, levels=3), valid
+        ).detach()
+        q_oracle = oracle.mean(dim=1, keepdim=True)
+        z0, q_pred, sigma = self._id_bridge_start(
+            mu,
+            log_sigma,
+            reliability_logits,
+            self.model.flow_noise_scale(target_spec),
+            torch.randn_like(mu),
+        )
+        time_values = torch.rand(
+            innovation_target.shape[0],
+            device=innovation_target.device,
+            dtype=innovation_target.dtype,
+        )
+        time = time_values[:, None, None, None]
+        zt = (1.0 - time) * z0 + time * endpoint_latent
+        velocity = self.model.flow_velocity(
+            zt,
+            time_values,
+            pyramid,
+            target_spec,
+            innovation_target.shape[1],
+            origin_latent=mu,
+            use_optical_bridge=False,
+        )
+        residual_weights = weights[indices]
+        time_weight = (1.0 - time_values).clamp_min(0.05)
+        latent_valid = F.interpolate(valid, size=mu.shape[-2:], mode="area")
+        latent_weight = (
+            residual_weights[:, None, None, None]
+            * time_weight[:, None, None, None]
+            * latent_valid
+        )
+        velocity_loss = masked_mean(charbonnier(velocity - (endpoint_latent - z0)), latent_weight)
+        anchor_values = self._id_bridge_anchor_values(
+            mu, correction, endpoint_latent, q_oracle
+        )
+        anchor_loss = masked_mean(anchor_values, latent_weight)
+        reliability_loss = masked_mean(
+            F.binary_cross_entropy_with_logits(
+                reliability_logits.float(), oracle.float(), reduction="none"
+            ),
+            latent_weight.float(),
+        )
+        innovation = (endpoint_latent - mu.detach()).abs()
+        target_fraction = (
+            innovation / max(self.model.flow_noise_scale(target_spec), 1e-3)
+        ).clamp(0.0, 1.0)
+        sigma_weight = latent_weight * (1.0 - q_oracle)
+        sigma_loss = masked_mean(
+            F.smooth_l1_loss(torch.sigmoid(log_sigma), target_fraction, reduction="none"),
+            sigma_weight,
+        )
+        predicted_latent = zt + (1.0 - time) * velocity
+        endpoint = self.model.decode_id_bridge_residual(predicted_latent, target_spec)
+        endpoint_weights = residual_weights * time_weight
+        endpoint_loss, endpoint_metrics = high_frequency_loss(
+            endpoint,
+            innovation_target,
+            valid,
+            target_spec.modality,
+            sample_weight=endpoint_weights,
+        )
+        total = (
+            velocity_loss
+            + 0.25 * endpoint_loss
+            + 0.20 * anchor_loss
+            + 0.10 * reliability_loss
+            + 0.25 * sigma_loss
+        )
+        metrics = {
+            "velocity": velocity_loss.detach(),
+            "endpoint_source_weight": time_weight.mean().detach(),
+            "anchor": anchor_loss.detach(),
+            "reliability": reliability_loss.detach(),
+            "sigma_calibration": sigma_loss.detach(),
+            "q": q_pred.mean().detach(),
+            "sigma": sigma.mean().detach(),
+            **{f"endpoint_{name}": value for name, value in endpoint_metrics.items()},
+        }
+        if self.model.id_bridge_uses_observable_anchor and target_spec.modality == "optical":
+            origin_residual = anchor_detail + self.model.decode_id_bridge_residual(mu, target_spec)
+            origin_hf_loss, origin_hf_metrics = high_frequency_loss(
+                origin_residual,
+                full_residual,
+                valid,
+                "optical",
+                sample_weight=residual_weights,
+            )
+            total = total + 0.25 * origin_hf_loss
+            metrics.update({f"origin_{name}": value for name, value in origin_hf_metrics.items()})
+        if self.current_step % self.flow_rollout_every == 0:
+            rollout_latent = self.model.integrate_flow(
+                z0,
+                pyramid,
+                target_spec,
+                innovation_target.shape[1],
+                steps=2,
+                origin_latent=mu,
+                use_optical_bridge=False,
+            )
+            rollout_latent = self.model.gate_id_bridge_innovation(
+                rollout_latent, mu, reliability_logits, target_spec
+            )
+            rollout_innovation = self.model.decode_id_bridge_residual(rollout_latent, target_spec)
+            rollout_visual = self.model.compose_visual(
+                base, anchor_detail, rollout_innovation, target_spec.modality
+            )
+            assert isinstance(rollout_visual, Tensor)
+            expanded_valid = valid.expand_as(rollout_visual)
+            denominator = expanded_valid.sum(dim=(1, 2, 3)).clamp_min(1.0)
+            rollout_rmse = torch.sqrt(
+                ((rollout_visual - target).square() * expanded_valid).sum(dim=(1, 2, 3))
+                / denominator
+            )
+            base_rmse = torch.sqrt(
+                ((base - target).square() * expanded_valid).sum(dim=(1, 2, 3)) / denominator
+            )
+            distortion = torch.relu(rollout_rmse / (base_rmse + 1e-6) - 1.05)
+            distortion_loss = (distortion * residual_weights).sum() / residual_weights.sum().clamp_min(
+                1e-8
+            )
+            total = total + 0.25 * distortion_loss
+            metrics["rollout_distortion_hinge"] = distortion_loss.detach()
+            if target_spec.modality == "optical":
+                if self.flow_visual_perceptual_weight > 0.0:
+                    rollout_lpips, rollout_dists = self._optical_visual_perceptual(
+                        rollout_visual, target, valid, residual_weights
+                    )
+                    total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
+                        rollout_lpips + rollout_dists
+                    )
+                    metrics["rollout_lpips"] = rollout_lpips.detach()
+                    metrics["rollout_dists"] = rollout_dists.detach()
+            else:
+                rollout_hf, rollout_hf_metrics = high_frequency_loss(
+                    highpass(rollout_visual),
+                    highpass(target),
+                    valid,
+                    "sar",
+                    sample_weight=residual_weights,
+                )
+                total = total + self.flow_rollout_hf_weight * rollout_hf
+                metrics.update(
+                    {f"rollout_{name}": value for name, value in rollout_hf_metrics.items()}
+                )
+        return total, metrics
+
     def forward(self, batch: dict[str, object], stage: str) -> tuple[Tensor, dict[str, Tensor]]:
         stage = "flow" if stage == "visual" else stage
         device = batch["s2"].device  # type: ignore[union-attr]
         batch_size = batch["s2"].shape[0]  # type: ignore[union-attr]
-        tasks = (
-            torch.zeros(batch_size, device=device, dtype=torch.long)
-            if stage == "risk"
-            else self._assignments(batch_size, device)
-        )
+        if stage in {"risk", "bridge"}:
+            tasks = torch.zeros(batch_size, device=device, dtype=torch.long)
+        elif stage == "id_bridge":
+            tasks = self._id_bridge_assignments(batch_size, device)
+        else:
+            tasks = self._assignments(batch_size, device)
         physical_weights, high_frequency_weights = time_weights(batch["delta_days"])  # type: ignore[arg-type]
         if "hf_eligible" in batch:
             high_frequency_weights = high_frequency_weights * batch["hf_eligible"].to(  # type: ignore[union-attr]
@@ -774,7 +1167,7 @@ class JointObjective(nn.Module):
             ):
                 continue
             indices = torch.nonzero(tasks == task_index, as_tuple=False).flatten()
-            if stage in {"detail", "codec", "flow", "risk"}:
+            if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge"}:
                 indices = indices[high_frequency_weights[indices] > 0]
             if indices.numel() == 0:
                 continue
@@ -823,6 +1216,26 @@ class JointObjective(nn.Module):
                 )
             elif stage == "risk":
                 loss, direction_metrics = self._risk_direction(
+                    batch,
+                    indices,
+                    source_key,
+                    target_key,
+                    source_spec,
+                    target_spec,
+                    high_frequency_weights,
+                )
+            elif stage == "bridge":
+                loss, direction_metrics = self._bridge_direction(
+                    batch,
+                    indices,
+                    source_key,
+                    target_key,
+                    source_spec,
+                    target_spec,
+                    high_frequency_weights,
+                )
+            elif stage == "id_bridge":
+                loss, direction_metrics = self._id_bridge_direction(
                     batch,
                     indices,
                     source_key,
@@ -901,16 +1314,21 @@ class JointObjective(nn.Module):
                 {f"latent/{name}": value for name, value in alignment_metrics.items()}
             )
 
-        if stage in {"detail", "codec", "flow", "risk"} and not bool(
+        if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge"} and not bool(
             high_frequency_weights.any()
         ):
-            branch = {
-                "detail": self.model.detail_head,
-                "codec": self.model.codec,
-                "flow": self.model.residual_dit,
-                "risk": self.model.residual_dit,
-            }[stage]
-            total = total + _weighted_zero(branch, device)
+            if stage == "id_bridge":
+                total = total + _weighted_zero(self.model.id_bridge_origin, device)
+                total = total + _weighted_zero(self.model.residual_dit, device)
+            else:
+                branch = {
+                    "detail": self.model.detail_head,
+                    "codec": self.model.codec,
+                    "flow": self.model.residual_dit,
+                    "risk": self.model.residual_dit,
+                    "bridge": self.model.residual_dit,
+                }[stage]
+                total = total + _weighted_zero(branch, device)
         metrics["loss"] = total.detach()
         return total, metrics
 
@@ -1007,7 +1425,7 @@ def _stage_learning_rates(
 ) -> tuple[float, float, float]:
     base = float(train_config.get("learning_rate", 1e-4))
     encoder = float(train_config.get("encoder_learning_rate", 2e-5))
-    if stage in {"flow", "visual", "risk"}:
+    if stage in {"flow", "visual", "risk", "bridge", "id_bridge"}:
         return 0.0, 0.0, base
     if stage == "balance":
         balance = train_config.get("balance_learning_rates", {})
@@ -1051,6 +1469,12 @@ def _load_compatible_state(model: nn.Module, state: dict[str, Tensor]) -> tuple[
     return len(compatible), len(current) - len(compatible)
 
 
+def _stage_requires_codec_gate(model: SentinelV3, stage: str) -> bool:
+    if stage in {"flow", "risk", "bridge", "balance"}:
+        return True
+    return stage == "id_bridge" and model.config.id_bridge_state == "codec"
+
+
 def _match_optimizer_layout(optimizer: AdamW) -> None:
     for parameter, state in optimizer.state.items():
         if parameter.ndim != 4 or not parameter.is_contiguous(
@@ -1080,6 +1504,25 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
             model.residual_dit.texture_risk_candidate,
             model.residual_dit.texture_risk_head,
         )
+    elif stage == "bridge":
+        modules = (
+            model.residual_dit.optical_bridge_anchor,
+            model.residual_dit.optical_bridge_adapters,
+            model.residual_dit.optical_bridge_output,
+            model.residual_dit.optical_bridge_amplitude_head,
+        )
+    elif stage == "id_bridge":
+        modules = (
+            model.id_bridge_origin,
+            model.residual_dit.input,
+            model.residual_dit.scene_projections,
+            model.residual_dit.frequency_adapter,
+            model.residual_dit.time,
+            model.residual_dit.target,
+            model.residual_dit.blocks,
+            model.residual_dit.output,
+            model.residual_dit.origin_projection,
+        )
     elif stage in {"balance", "overfit"}:
         modules = (model.encoder, model.decoder, model.detail_head, model.residual_dit)
     else:
@@ -1087,6 +1530,10 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
     for module in modules:
         for parameter in module.parameters():
             parameter.requires_grad_(True)
+    if stage == "bridge":
+        model.residual_dit.optical_bridge_base_gate.requires_grad_(True)
+    if stage == "id_bridge":
+        model.residual_dit.condition_gates.requires_grad_(True)
 
 
 def _optimizer(
@@ -1136,7 +1583,12 @@ def _optimizer(
             "lr": main_lr,
         },
         {"name": "codec", "params": list(model.codec.parameters()), "lr": main_lr},
-        {"name": "dit", "params": list(model.residual_dit.parameters()), "lr": residual_lr},
+        {
+            "name": "dit",
+            "params": list(model.residual_dit.parameters())
+            + list(model.id_bridge_origin.parameters()),
+            "lr": residual_lr,
+        },
     ]
     groups = [
         {
@@ -1265,6 +1717,7 @@ def _checkpoint_payload(
         "rank_states": rank_states,
         "config": config,
         "codec_version": model.codec.version,
+        "residual_state": model.residual_state_metadata(),
         "validation_protocol_hash": validation_protocol_hash,
         "best_metrics": best_metrics,
         "quality_gates": quality_gates,
@@ -1367,6 +1820,7 @@ def train(
         )
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     train_config = config["train"]
+    torch.autograd.set_detect_anomaly(bool(train_config.get("detect_anomaly", False)))
     stage = "flow" if train_config["stage"] == "visual" else str(train_config["stage"])
     channels_last = bool(train_config.get("channels_last", False)) and device.type == "cuda"
     seed = int(train_config["seed"]) + rank
@@ -1382,20 +1836,21 @@ def train(
         random_gsd=True,
         native_gsd_probability=(
             1.0
-            if stage in {"detail", "codec", "flow", "risk", "balance"}
+            if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
             else float(train_config.get("native_gsd_probability", 0.8))
         ),
-        audit_high_frequency=stage in {"detail", "codec", "flow", "risk", "balance"}
+        audit_high_frequency=stage
+        in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
         and bool(train_config.get("registration_audit", True))
         and not bool(config["paths"].get("hf_eligibility")),
         temporal_prior_index=(
             config["paths"].get("temporal_prior_shards")
-            if stage in {"detail", "flow", "risk", "balance"}
+            if stage in {"detail", "flow", "risk", "bridge", "id_bridge", "balance"}
             else None
         ),
     )
     if limit is not None:
-        if stage in {"detail", "codec", "flow", "risk", "balance"}:
+        if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}:
             eligible_indices: list[int] = []
             for index in range(len(dataset)):
                 if bool(dataset[index]["hf_eligible"]):
@@ -1410,7 +1865,15 @@ def train(
             dataset = Subset(dataset, eligible_indices)
         else:
             dataset = Subset(dataset, range(min(limit, len(dataset))))
-    high_frequency_stage = stage in {"detail", "codec", "flow", "risk", "balance"}
+    high_frequency_stage = stage in {
+        "detail",
+        "codec",
+        "flow",
+        "risk",
+        "bridge",
+        "id_bridge",
+        "balance",
+    }
     eligibility_path = config["paths"].get("hf_eligibility")
     if isinstance(dataset, Subset):
         sampler = None
@@ -1487,6 +1950,7 @@ def train(
         flow_rollout_pixel_weight=float(train_config.get("flow_rollout_pixel_weight", 0.1)),
         flow_rollout_hf_weight=float(train_config.get("flow_rollout_hf_weight", 0.1)),
         risk_flow_steps=int(train_config.get("risk_flow_steps", 4)),
+        bridge_flow_steps=int(train_config.get("bridge_flow_steps", 4)),
     ).to(device)
     ema = EMA(model, float(train_config["ema_decay"]))
     step = 0
@@ -1524,7 +1988,7 @@ def train(
         if optical_detail_override is not None:
             model.set_detail_confidence_threshold("optical", float(optical_detail_override))
         if (
-            stage in {"detail", "codec", "flow", "risk", "balance"}
+            stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
             and bool(train_config.get("require_physical_gate", True))
             and not bool(initial.get("quality_gates", {}).get("physical", False))
         ):
@@ -1532,7 +1996,7 @@ def train(
                 "high-frequency training requires a frozen physical checkpoint that passed validation"
             )
         if (
-            stage in {"flow", "risk", "balance"}
+            _stage_requires_codec_gate(model, stage)
             and bool(train_config.get("require_codec_gate", True))
             and not bool(initial.get("quality_gates", {}).get("codec", False))
         ):
@@ -1540,7 +2004,7 @@ def train(
                 "flow training requires a frozen codec checkpoint that passed reconstruction gates"
             )
         if (
-            stage in {"flow", "risk", "balance"}
+            stage in {"flow", "risk", "bridge", "balance"}
             and bool(train_config.get("require_detail_gate", True))
             and not bool(initial.get("quality_gates", {}).get("detail", False))
         ):
@@ -1599,7 +2063,7 @@ def train(
             _match_optimizer_layout(optimizer)
 
     if (
-        stage in {"detail", "codec", "flow", "risk", "balance"}
+        stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
         and bool(train_config.get("require_physical_gate", True))
         and not (resume or init_model)
     ):
@@ -1607,7 +2071,7 @@ def train(
             "high-frequency stages require --init-model with a passing physical v4 checkpoint"
         )
     if (
-        stage in {"flow", "risk", "balance"}
+        _stage_requires_codec_gate(model, stage)
         and bool(train_config.get("require_codec_gate", True))
         and not (resume or init_model)
     ):
@@ -1689,8 +2153,27 @@ def train(
                 aggregate[name] = aggregate.get(name, 0.0) + float(value) / accumulation
         if pcgrad_corrections is not None:
             _apply_pcgrad_corrections(*pcgrad_corrections, distributed)
+        nonfinite_gradients = [
+            name
+            for name, parameter in model.named_parameters()
+            if parameter.grad is not None
+            and not bool(torch.isfinite(parameter.grad.detach()).all())
+        ]
+        if nonfinite_gradients:
+            raise FloatingPointError(
+                "non-finite gradients before clipping: "
+                + ", ".join(nonfinite_gradients[:16])
+            )
+        gradient_norm = 0.0
+        gradient_max = 0.0
         for group in optimizer.param_groups:
-            nn.utils.clip_grad_norm_(group["params"], float(train_config["gradient_clip"]))
+            group_norm, group_max = _stable_clip_grad_norm_(
+                group["params"], float(train_config["gradient_clip"])
+            )
+            gradient_norm = max(gradient_norm, group_norm)
+            gradient_max = max(gradient_max, group_max)
+        aggregate["gradient_norm"] = gradient_norm
+        aggregate["gradient_max"] = gradient_max
         optimizer.step()
         scheduler.step()
         ema.update(model)

@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 import torch
 
-from sentinel_v3.calibration import calibrate_amplitude_scale
+from sentinel_v3.calibration import calibrate_amplitude_scale, select_texture_release_candidate
 from sentinel_v3.data import StatefulIndexSampler, StatefulShardSampler, V2ShardDataset
 from sentinel_v3.evaluation import tail_quantile_error
 from sentinel_v3.losses import (
@@ -21,6 +21,8 @@ from sentinel_v3.training import (
     EMA,
     JointObjective,
     _load_compatible_state,
+    _set_trainable,
+    _stable_clip_grad_norm_,
     _stage_learning_rates,
     texture_benefit_target,
 )
@@ -79,6 +81,17 @@ def test_sar_frequency_loss_is_finite() -> None:
     assert "speckle_scale" in metrics
 
 
+def test_frequency_loss_has_finite_gradient_at_zero_spectrum() -> None:
+    prediction = torch.zeros(2, 3, 32, 32, requires_grad=True)
+    target = highpass(torch.randn_like(prediction))
+    loss, _ = high_frequency_loss(
+        prediction, target, torch.ones(2, 1, 32, 32), "optical"
+    )
+    loss.backward()
+    assert prediction.grad is not None
+    assert bool(torch.isfinite(prediction.grad).all())
+
+
 def test_sar_tail_quantile_error_tracks_bright_and_dark_tails() -> None:
     target = torch.arange(100, dtype=torch.float32).reshape(1, 1, 10, 10)
     prediction = target.clone()
@@ -115,6 +128,7 @@ def test_detail_head_is_conditioned_on_physical_base(tiny_model: SentinelV3) -> 
     with torch.no_grad():
         base_head.weight.fill_(0.01)
         output_head.weight.fill_(0.01)
+    tiny_model.set_detail_confidence_threshold("optical", 0.0)
     without_base = tiny_model.deterministic_detail(
         pyramid, SENTINEL1, SENTINEL2, (32, 32), base=torch.zeros(1, 3, 32, 32)
     )
@@ -171,6 +185,26 @@ def test_eval_detail_uses_calibrated_modality_threshold(tiny_model: SentinelV3) 
     assert int(torch.count_nonzero(released)) > 0
 
 
+def test_production_detail_uses_hard_gate_during_flow_training(
+    tiny_model: SentinelV3,
+) -> None:
+    pyramid = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    with torch.no_grad():
+        tiny_model.detail_head.output_heads["optical"].weight.fill_(0.01)
+    tiny_model.train()
+    tiny_model.set_detail_confidence_threshold("optical", 1.01)
+    detail = tiny_model.deterministic_detail(
+        pyramid,
+        SENTINEL1,
+        SENTINEL2,
+        (32, 32),
+        torch.zeros(1, 3, 32, 32),
+    )
+    torch.testing.assert_close(detail, torch.zeros_like(detail))
+
+
 def test_optical_anchor_detail_is_physical_aligned_and_checkpoint_persistent(
     tiny_model: SentinelV3,
 ) -> None:
@@ -187,6 +221,46 @@ def test_optical_anchor_detail_is_physical_aligned_and_checkpoint_persistent(
         tiny_model.state_dict()["optical_anchor_band_scales"],
         torch.tensor([0.1, 0.2, 0.3]),
     )
+
+
+def test_optical_anchor_density_only_increases_supported_fine_blocks(
+    tiny_model: SentinelV3,
+) -> None:
+    pyramid = tiny_model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32))
+    base = torch.zeros(1, 3, 32, 32)
+    base[..., 8:24, 15:17] = 0.5
+    tiny_model.eval()
+    tiny_model.set_detail_confidence_threshold("optical", 1.01)
+    tiny_model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    uniform = tiny_model.deterministic_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), base)
+    tiny_model.set_optical_anchor_density(0.4, 1.5)
+    adaptive = tiny_model.deterministic_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), base)
+    assert adaptive[..., 8:24, 12:20].abs().mean() > uniform[..., 8:24, 12:20].abs().mean()
+    gain = (adaptive - uniform).abs()
+    assert gain[..., 8:24, 12:20].mean() > 10.0 * gain[..., :4, :4].mean()
+
+
+def test_optical_source_density_only_modulates_supported_anchor_regions(
+    tiny_model: SentinelV3,
+) -> None:
+    encoded = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    source = torch.zeros_like(encoded[0])
+    source[..., 8:24, 15:17] = 1.0
+    pyramid = (source, encoded[1], encoded[2], encoded[3])
+    base = torch.rand(1, 3, 32, 32)
+    tiny_model.set_detail_confidence_threshold("optical", 1.01)
+    tiny_model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    uniform = tiny_model.deterministic_detail(
+        pyramid, SENTINEL1, SENTINEL2, (32, 32), base
+    )
+    tiny_model.set_optical_anchor_source_density(0.4, 1.5)
+    adaptive = tiny_model.deterministic_detail(
+        pyramid, SENTINEL1, SENTINEL2, (32, 32), base
+    )
+    gain = (adaptive - uniform).abs()
+    assert gain[..., 8:24, 12:20].mean() > 5.0 * gain[..., :4, :4].mean()
 
 
 def test_high_frequency_sampler_excludes_long_gap_shards() -> None:
@@ -253,6 +327,7 @@ def test_sar_deterministic_target_excludes_pixel_speckle() -> None:
         ("codec", "codec"),
         ("flow", "residual_dit"),
         ("risk", "residual_dit"),
+        ("bridge", "residual_dit"),
     ),
 )
 def test_delta_greater_than_one_has_exact_zero_residual_gradient(
@@ -399,11 +474,58 @@ def test_amplitude_calibration_obeys_rmse_guardrail() -> None:
     assert metrics["rmse_ratio"] == 0.0
 
 
+def test_texture_release_selection_falls_back_to_anchor() -> None:
+    physical = {
+        "detail_enabled": False,
+        "alpha": 0.0,
+        "visual_beneficial": False,
+        "release_beneficial": False,
+        "lpips_improvement": 0.0,
+        "dists_improvement": 0.0,
+    }
+    anchor = {
+        "detail_enabled": True,
+        "alpha": 0.0,
+        "visual_beneficial": True,
+        "release_beneficial": False,
+        "lpips_improvement": 0.03,
+        "dists_improvement": 0.04,
+    }
+    unsafe_texture = {
+        "detail_enabled": True,
+        "alpha": 0.2,
+        "visual_beneficial": True,
+        "release_beneficial": False,
+        "lpips_improvement": 0.04,
+        "dists_improvement": 0.04,
+    }
+    selected = select_texture_release_candidate(
+        [physical, anchor, unsafe_texture]
+    )
+    assert selected is anchor
+
+
 def test_scene_conditioned_amplitude_shape(tiny_model: SentinelV3) -> None:
     pyramid = tiny_model.encode(torch.randn(2, 2, 32, 32), SENTINEL1, torch.ones(2, 1, 32, 32))
     amplitude = tiny_model.residual_amplitude(pyramid, SENTINEL2, 3, (32, 32))
     assert amplitude.shape == (2, 3, 8, 8)
     assert bool((amplitude <= tiny_model.config.optical_residual_limit).all())
+
+
+def test_optical_bridge_has_independent_amplitude_calibration(
+    tiny_model: SentinelV3,
+) -> None:
+    pyramid = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    tiny_model.config.optical_bridge_enabled = True
+    tiny_model.optical_alpha_scale.zero_()
+    active = tiny_model.residual_amplitude(pyramid, SENTINEL2, 3, (32, 32))
+    assert int(torch.count_nonzero(active)) > 0
+    tiny_model.set_amplitude_scale("optical", 0.0)
+    suppressed = tiny_model.residual_amplitude(pyramid, SENTINEL2, 3, (32, 32))
+    torch.testing.assert_close(suppressed, torch.zeros_like(suppressed))
+    assert float(tiny_model.optical_alpha_scale) == 0.0
 
 
 def test_optical_texture_release_gate_is_blockwise_and_sar_is_unchanged(
@@ -417,6 +539,13 @@ def test_optical_texture_release_gate_is_blockwise_and_sar_is_unchanged(
     torch.testing.assert_close(sar_gate, torch.ones_like(sar_gate))
 
 
+def test_optical_texture_risk_threshold_is_validated(tiny_model: SentinelV3) -> None:
+    tiny_model.set_optical_texture_risk_threshold(0.65)
+    assert float(tiny_model.optical_texture_risk_threshold) == pytest.approx(0.65)
+    with pytest.raises(ValueError):
+        tiny_model.set_optical_texture_risk_threshold(1.1)
+
+
 def test_optical_texture_floor_suppresses_low_amplitude_blocks(
     tiny_model: SentinelV3,
 ) -> None:
@@ -428,6 +557,28 @@ def test_optical_texture_floor_suppresses_low_amplitude_blocks(
         residual, pyramid, SENTINEL2, amplitude=amplitude
     )
     torch.testing.assert_close(shaped, torch.zeros_like(shaped))
+
+
+def test_optical_bridge_uses_independent_floor_and_skips_legacy_risk(
+    tiny_model: SentinelV3,
+) -> None:
+    pyramid = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    residual = torch.randn(1, 3, 32, 32)
+    amplitude = torch.full((1, 3, 8, 8), 0.02)
+    tiny_model.set_optical_texture_risk_threshold(1.0)
+    tiny_model.optical_texture_amplitude_floor.fill_(0.16)
+    tiny_model.config.optical_bridge_enabled = True
+    shaped = tiny_model.shape_residual_texture(
+        residual, pyramid, SENTINEL2, amplitude=amplitude
+    )
+    assert int(torch.count_nonzero(shaped)) > 0
+    tiny_model.set_optical_texture_amplitude_floor(0.03)
+    suppressed = tiny_model.shape_residual_texture(
+        residual, pyramid, SENTINEL2, amplitude=amplitude
+    )
+    torch.testing.assert_close(suppressed, torch.zeros_like(suppressed))
 
 
 def test_texture_risk_head_predicts_one_probability_per_block(
@@ -485,17 +636,126 @@ def test_shaped_optical_texture_uses_amplitude_and_limits_chroma(
     )
     assert shaped.shape == residual.shape
     chroma = shaped - shaped.mean(dim=1, keepdim=True)
-    assert float(chroma.abs().max()) <= 0.03001
+    assert float(chroma.detach().abs().max()) <= 0.03001
     shaped.abs().mean().backward()
     assert amplitude.grad is not None
     assert int(torch.count_nonzero(amplitude.grad)) > 0
+
+
+def test_shaped_texture_has_finite_gradient_at_zero_block_rms(
+    tiny_model: SentinelV3,
+) -> None:
+    pyramid = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    residual = torch.zeros(1, 3, 32, 32, requires_grad=True)
+    amplitude = torch.full((1, 3, 8, 8), 0.02)
+    shaped = tiny_model.shape_residual_texture(
+        residual, pyramid, SENTINEL2, amplitude=amplitude
+    )
+    shaped.sum().backward()
+    assert residual.grad is not None
+    assert bool(torch.isfinite(residual.grad).all())
 
 
 def test_stage_learning_rates_match_v32_schedule() -> None:
     config = {"learning_rate": 1e-4, "encoder_learning_rate": 2e-5}
     assert _stage_learning_rates(config, "flow") == pytest.approx((0.0, 0.0, 1e-4))
     assert _stage_learning_rates(config, "risk") == pytest.approx((0.0, 0.0, 1e-4))
+    assert _stage_learning_rates(config, "bridge") == pytest.approx((0.0, 0.0, 1e-4))
     assert _stage_learning_rates(config, "balance") == pytest.approx((2e-6, 1e-5, 1e-5))
+
+
+def test_optical_bridge_requires_matching_anchor_latent(tiny_model: SentinelV3) -> None:
+    pyramid = tiny_model.encode(
+        torch.randn(2, 2, 32, 32), SENTINEL1, torch.ones(2, 1, 32, 32)
+    )
+    latent = torch.randn(2, tiny_model.config.codec_latent_channels, 8, 8)
+    time = torch.rand(2)
+    with pytest.raises(ValueError, match="anchor latent"):
+        tiny_model.flow_velocity(
+            latent,
+            time,
+            pyramid,
+            SENTINEL2,
+            3,
+            use_optical_bridge=True,
+        )
+
+
+def test_bridge_stage_only_unfreezes_optical_bridge_parameters(
+    tiny_model: SentinelV3,
+) -> None:
+    _set_trainable(tiny_model, "bridge")
+    trainable = {
+        name for name, parameter in tiny_model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable
+    assert all(name.startswith("residual_dit.optical_bridge_") for name in trainable)
+    assert not tiny_model.residual_dit.output[-1].weight.requires_grad
+    assert not any(parameter.requires_grad for parameter in tiny_model.codec.parameters())
+    assert not any(parameter.requires_grad for parameter in tiny_model.encoder.parameters())
+
+
+def test_bridge_objective_updates_only_optical_bridge(tiny_model: SentinelV3) -> None:
+    tiny_model.config.optical_bridge_enabled = True
+    tiny_model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    _set_trainable(tiny_model, "bridge")
+    objective = JointObjective(tiny_model, [0.5, 0.5], flow_perceptual_every=8)
+    objective.set_progress(1, 10)
+    loss, metrics = objective(_batch(), "bridge")
+    loss.backward()
+    assert torch.isfinite(loss)
+    assert metrics
+    assert all(name.startswith("sar2opt/") or name == "loss" for name in metrics)
+    bridge_output = tiny_model.residual_dit.optical_bridge_output[-1].weight
+    assert bridge_output.grad is not None
+    assert int(torch.count_nonzero(bridge_output.grad)) > 0
+    assert tiny_model.residual_dit.output[-1].weight.grad is None
+    assert all(parameter.grad is None for parameter in tiny_model.codec.parameters())
+
+
+def test_zero_bridge_perceptual_weight_skips_evaluator(tiny_model: SentinelV3) -> None:
+    tiny_model.config.optical_bridge_enabled = True
+    tiny_model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    objective = JointObjective(
+        tiny_model,
+        [0.5, 0.5],
+        flow_visual_perceptual_weight=0.0,
+    )
+    objective._optical_visual_perceptual = lambda *args: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("perceptual evaluator should be skipped")
+    )
+    objective.set_progress(0, 10)
+    loss, _ = objective(_batch(), "bridge")
+    assert torch.isfinite(loss)
+
+
+def test_stable_gradient_clipping_handles_overflowing_naive_norm() -> None:
+    parameter = torch.nn.Parameter(torch.ones(8))
+    parameter.grad = torch.full_like(parameter, 1e30)
+    norm, maximum = _stable_clip_grad_norm_([parameter], 1.0)
+    assert norm == pytest.approx(8**0.5 * 1e30, rel=1e-6)
+    assert maximum == pytest.approx(1e30, rel=1e-6)
+    assert torch.isfinite(parameter.grad).all()
+    assert float(parameter.grad.norm()) == pytest.approx(1.0)
+
+
+def test_enabling_optical_bridge_does_not_change_sar_sampling(
+    tiny_model: SentinelV3,
+) -> None:
+    pyramid = tiny_model.encode(
+        torch.rand(1, 10, 32, 32), SENTINEL2, torch.ones(1, 1, 32, 32)
+    )
+    tiny_model.config.optical_bridge_enabled = False
+    baseline = tiny_model.sample_residual(
+        pyramid, SENTINEL1, (1, 2, 32, 32), seed=19
+    )
+    tiny_model.config.optical_bridge_enabled = True
+    actual = tiny_model.sample_residual(
+        pyramid, SENTINEL1, (1, 2, 32, 32), seed=19
+    )
+    torch.testing.assert_close(actual, baseline)
 
 
 def test_v31_state_is_compatible_initialization_only(tiny_model: SentinelV3) -> None:

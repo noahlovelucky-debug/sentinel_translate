@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -53,6 +54,7 @@ DEFAULT: dict[str, Any] = {
         "flow_rollout_pixel_weight": 0.1,
         "flow_rollout_hf_weight": 0.1,
         "risk_flow_steps": 4,
+        "bridge_flow_steps": 4,
         "codec_perceptual_every": 8,
         "native_gsd_probability": 0.8,
         "full_validate_every": 5000,
@@ -109,11 +111,25 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("model.hidden must be divisible by four")
     if int(model["dit_hidden"]) % int(model["dit_heads"]):
         raise ValueError("model.dit_hidden must be divisible by model.dit_heads")
+    if model["id_bridge_state"] not in {"codec", "haar_packet"}:
+        raise ValueError("model.id_bridge_state must be codec or haar_packet")
+    if model["id_bridge_state"] == "haar_packet" and model["id_bridge_state_channels"] != 48:
+        raise ValueError("model.id_bridge_state_channels must be 48 for haar_packet")
+    for name in ("id_bridge_optical_state_scale", "id_bridge_sar_state_scale"):
+        value = float(model[name])
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError(f"model.{name} must be finite and positive")
+    for name in ("id_bridge_optical_innovation_scale", "id_bridge_sar_innovation_scale"):
+        value = float(model[name])
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"model.{name} must be finite and in [0, 1]")
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:
             raise ValueError(f"model.{name} must be non-negative")
     if not 0.0 <= float(model["optical_texture_risk_threshold"]) <= 1.0:
         raise ValueError("model.optical_texture_risk_threshold must be in [0, 1]")
+    if float(model["optical_bridge_density_threshold"]) <= 0.0:
+        raise ValueError("model.optical_bridge_density_threshold must be positive")
     if train["stage"] not in {
         "overfit",
         "physical",
@@ -121,6 +137,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "codec",
         "flow",
         "risk",
+        "bridge",
+        "id_bridge",
         "visual",
         "balance",
     }:
@@ -148,6 +166,8 @@ def validate_config(config: dict[str, Any]) -> None:
             raise ValueError(f"train.{name} must be positive")
     if int(train["risk_flow_steps"]) < 1:
         raise ValueError("train.risk_flow_steps must be positive")
+    if int(train["bridge_flow_steps"]) < 1:
+        raise ValueError("train.bridge_flow_steps must be positive")
     optical_detail_override = train.get("optical_detail_confidence_threshold_override")
     if (
         optical_detail_override is not None

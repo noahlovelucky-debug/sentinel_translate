@@ -33,7 +33,17 @@ def _parser() -> argparse.ArgumentParser:
     training.add_argument("--limit", type=int)
     training.add_argument(
         "--stage",
-        choices=("overfit", "physical", "detail", "codec", "flow", "risk", "balance"),
+        choices=(
+            "overfit",
+            "physical",
+            "detail",
+            "codec",
+            "flow",
+            "risk",
+            "bridge",
+            "id_bridge",
+            "balance",
+        ),
     )
     training.add_argument("--max-steps", type=int)
     training.add_argument("--output")

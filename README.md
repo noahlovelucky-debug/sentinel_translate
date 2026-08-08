@@ -13,7 +13,7 @@ V3.1.1 checkpoints are never modified.
 This is the primary RMSE/SAM result. `mode="visual"` returns:
 
 ```text
-physical + deterministic_detail + alpha * stochastic_texture
+physical + observable_pixel_detail + sampled_orthogonal_innovation
 ```
 
 Optical composition is performed in logit space and mapped through sigmoid. The result also
@@ -22,20 +22,30 @@ reports `deterministic_detail`, `stochastic_residual`, `residual_amplitude`, and
 validation report passes the 5% RMSE guardrail and all perceptual, edge, PSD, bounds, and SAR
 gates.
 
-## Architecture
+## Current architecture
 
 - The physical encoder retains the shared 12-layer Transformer and adds rank-64 direction
   adapters after layers 3/6/9/12 plus direction-specific radiometric correction.
-- `MultiscaleDetailHead` consumes H/1, H/2, H/4, and H/8 features. It owns predictable roads,
-  roofs, and field boundaries.
-- The shared residual codec has optical RGB and SAR VV/VH I/O heads, 4x compression, and a
-  standardized 16-channel latent.
-- Residual-DiT is 512 wide with 8 layers and 8 heads. Every block receives all four pyramid
-  levels through zero-initialized gates.
-- Scene-conditioned 4x4-block robust RMS predicts texture amplitude. A validation calibration
-  command finds the largest alpha that satisfies the RMSE/bias guardrail.
+- The currently best fully validated Optical detail is a source-aware, physical-frequency
+  anchor. It keeps input-supported edges in pixel space instead of asking a random branch to
+  reconstruct them.
+- The experimental id bridge uses an exact two-level Haar packet state. LL-to-LL coefficients
+  are forced to zero, so generated innovations cannot rewrite the verified physical low
+  frequency. This route replaces the rejected learned-codec bridge that produced off-manifold
+  checkerboard artifacts.
+- A source/physical-conditioned origin predicts `mu`, `log_sigma`, and three-band
+  identifiability `q`. Residual-DiT is 512 wide with 8 layers and 8 heads and transports
+  `mu + sigma(q) * noise` to the paired Haar residual endpoint using rectified flow.
+- Optical currently publishes the deterministic anchor while innovation transport remains
+  disabled pending a measured gain. SAR publishes stochastic residuals and improves PSD, ENL,
+  histogram, and tail statistics on the complete validation set.
 - `delta_days=0/1` high-frequency weights are `1.0/0.25`; gaps 2/3 and patches failing the
   registration/cloud/validity audit have exact zero residual gradient.
+
+The authoritative document linked above contains the exact labels, bridge equations, accepted
+and rejected experiments, current 463-sample metrics, visualizations, and paper acceptance
+criteria. Older codec/detail/flow commands below are retained for reproducibility and ablation;
+they are not claims about the current best visual model.
 
 ## Verify
 

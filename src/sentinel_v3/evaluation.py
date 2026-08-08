@@ -178,8 +178,17 @@ def load_checkpoint(
         "residual_dit.frequency_adapter.",
         "residual_dit.texture_risk_candidate.",
         "residual_dit.texture_risk_head.",
+        "residual_dit.optical_bridge_",
+        "residual_dit.origin_projection.",
+        "id_bridge_origin.",
         "optical_texture_amplitude_floor",
+        "optical_bridge_alpha_scale",
+        "optical_bridge_texture_amplitude_floor",
         "optical_anchor_band_scales",
+        "optical_anchor_density_gain",
+        "optical_anchor_density_threshold",
+        "optical_anchor_source_gain",
+        "optical_anchor_source_threshold",
         "optical_texture_risk_threshold",
         "optical_detail_confidence_threshold",
         "sar_detail_confidence_threshold",
@@ -426,40 +435,48 @@ def evaluate_model(
             sar_mean, sar_prior_coverage, sar_prior_violation = apply_manifest_temporal_prior(
                 model, sar_mean, item, SENTINEL1
             )
+            physical_rgb = s2_mean[:, [2, 1, 0]]
+            target_rgb = s2[:, [2, 1, 0]]
             optical_detail = (
-                model.deterministic_detail(
+                model.visual_detail(
                     sar_pyramid,
                     SENTINEL1,
                     SENTINEL2,
                     tuple(s2.shape[-2:]),
-                    base=s2_mean[:, [2, 1, 0]],
+                    physical_rgb,
                 )
                 * valid
             )
             sar_detail = (
-                model.deterministic_detail(
+                model.visual_detail(
                     optical_pyramid,
                     SENTINEL2,
                     SENTINEL1,
                     tuple(sar.shape[-2:]),
-                    base=sar_mean,
+                    sar_mean,
                 )
                 * valid
             )
             optical_texture = (
-                model.sample_residual(
-                    sar_pyramid, SENTINEL2, (1, 3, *s2.shape[-2:]), seed=seed + index
+                model.sample_visual_residual(
+                    sar_pyramid,
+                    SENTINEL2,
+                    physical_rgb,
+                    optical_detail,
+                    seed=seed + index,
                 )
                 * valid
             )
             sar_texture = (
-                model.sample_residual(
-                    optical_pyramid, SENTINEL1, tuple(sar.shape), seed=seed + index
+                model.sample_visual_residual(
+                    optical_pyramid,
+                    SENTINEL1,
+                    sar_mean,
+                    sar_detail,
+                    seed=seed + index,
                 )
                 * valid
             )
-            physical_rgb = s2_mean[:, [2, 1, 0]]
-            target_rgb = s2[:, [2, 1, 0]]
             optical_visual, violation = model.compose_visual(
                 physical_rgb,
                 optical_detail,

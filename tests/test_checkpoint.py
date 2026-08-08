@@ -27,11 +27,13 @@ def test_checkpoint_is_complete_and_resumable(tmp_path: Path) -> None:
         "config",
         "step",
         "codec_version",
+        "residual_state",
         "validation_protocol_hash",
         "best_metrics",
     }
     assert payload["format_version"] == 4
     assert payload["step"] == 1
+    assert payload["residual_state"]["kind"] == "codec"
     config["train"]["max_steps"] = 2
     train(config, resume=str(checkpoint_path), limit=4)
     resumed = torch.load(checkpoint_path, map_location="cpu", weights_only=False)

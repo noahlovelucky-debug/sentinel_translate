@@ -1,0 +1,33 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  temporal_prior_shards: /data/sentinel_translate/data/shards_v32_temporal_prior/index.json
+  hf_eligibility: /data/sentinel_translate/data/shards_v32_hf_eligibility.json
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_optical_bridge_smoke
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_optical_bridge_smoke
+
+model:
+  flow_noise_scale: 0.35
+  optical_flow_noise_scale: 0.05
+  sar_flow_noise_scale: 0.35
+  optical_bridge_enabled: true
+  optical_bridge_density_threshold: 1.0
+  optical_texture_risk_threshold: 0.0
+
+train:
+  stage: bridge
+  max_steps: 2
+  batch_size: 1
+  num_workers: 0
+  learning_rate: 0.0001
+  init_use_ema: true
+  warmup_steps: 0
+  log_every: 1
+  save_every: 1000
+  save_final: false
+  find_unused_parameters: false
+  bridge_flow_steps: 1
+  optical_detail_confidence_threshold_override: 1.01
+  flow_visual_perceptual_weight: 0.0
+
+validation:
+  enabled: false

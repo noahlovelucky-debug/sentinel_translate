@@ -21,6 +21,79 @@ def charbonnier(values: Tensor, epsilon: float = 1e-3) -> Tensor:
     return torch.sqrt(values.square() + epsilon * epsilon)
 
 
+def haar_dwt2(values: Tensor) -> Tensor:
+    """Return the orthonormal 2D Haar coefficients in LL, LH, HL, HH order."""
+
+    if values.ndim != 4:
+        raise ValueError("Haar DWT expects BCHW values")
+    height, width = values.shape[-2:]
+    if height % 2 or width % 2:
+        raise ValueError("Haar DWT requires even spatial dimensions")
+    top_left = values[..., 0::2, 0::2]
+    top_right = values[..., 0::2, 1::2]
+    bottom_left = values[..., 1::2, 0::2]
+    bottom_right = values[..., 1::2, 1::2]
+    half = values.new_tensor(0.5)
+    return torch.stack(
+        (
+            (top_left + top_right + bottom_left + bottom_right) * half,
+            (top_left - top_right + bottom_left - bottom_right) * half,
+            (top_left + top_right - bottom_left - bottom_right) * half,
+            (top_left - top_right - bottom_left + bottom_right) * half,
+        ),
+        dim=2,
+    )
+
+
+def haar_idwt2(coefficients: Tensor) -> Tensor:
+    """Invert :func:`haar_dwt2` without interpolation or learned filtering."""
+
+    if coefficients.ndim != 5 or coefficients.shape[2] != 4:
+        raise ValueError("Haar IDWT expects BC4HW coefficients")
+    ll, lh, hl, hh = coefficients.unbind(dim=2)
+    half = coefficients.new_tensor(0.5)
+    height, width = ll.shape[-2:]
+    values = ll.new_empty(*ll.shape[:-2], height * 2, width * 2)
+    values[..., 0::2, 0::2] = (ll + lh + hl + hh) * half
+    values[..., 0::2, 1::2] = (ll - lh + hl - hh) * half
+    values[..., 1::2, 0::2] = (ll + lh - hl - hh) * half
+    values[..., 1::2, 1::2] = (ll - lh - hl + hh) * half
+    return values
+
+
+def haar_packet_dwt2(values: Tensor) -> Tensor:
+    """Return a two-level orthonormal Haar packet with flattened 16C channels."""
+
+    if values.ndim != 4:
+        raise ValueError("Haar packet DWT expects BCHW values")
+    height, width = values.shape[-2:]
+    if height % 4 or width % 4:
+        raise ValueError("Haar packet DWT requires dimensions divisible by four")
+    first = haar_dwt2(values).flatten(1, 2)
+    return haar_dwt2(first).flatten(1, 2)
+
+
+def haar_packet_idwt2(coefficients: Tensor) -> Tensor:
+    """Invert :func:`haar_packet_dwt2` exactly from flattened packet channels."""
+
+    if coefficients.ndim != 4:
+        raise ValueError("Haar packet IDWT expects BCHW coefficients")
+    batch, channels, height, width = coefficients.shape
+    if channels % 16:
+        raise ValueError("Haar packet IDWT requires a channel count divisible by sixteen")
+    source_channels = channels // 16
+    first = haar_idwt2(coefficients.reshape(batch, source_channels * 4, 4, height, width))
+    return haar_idwt2(
+        first.reshape(batch, source_channels, 4, first.shape[-2], first.shape[-1])
+    )
+
+
+def complex_magnitude(values: Tensor, epsilon: float = 1e-8) -> Tensor:
+    """Differentiable complex magnitude with a defined derivative at zero."""
+
+    return torch.sqrt(values.real.square() + values.imag.square() + epsilon * epsilon)
+
+
 def robust_rms(values: Tensor, mask: Tensor, block_size: int = 4) -> Tensor:
     squared = values.square()
     # Soft clipping keeps a few strong reflectors from setting every texture amplitude.
@@ -98,10 +171,12 @@ def local_spectrum_loss(
     tiled_mask = tiles(mask)
     pred_spectrum = torch.fft.rfft2(
         (tiles(prediction) * tiled_mask).float(), dim=(-2, -1), norm="ortho"
-    ).abs()
+    )
+    pred_spectrum = complex_magnitude(pred_spectrum)
     target_spectrum = torch.fft.rfft2(
         (tiles(target) * tiled_mask).float(), dim=(-2, -1), norm="ortho"
-    ).abs()
+    )
+    target_spectrum = complex_magnitude(target_spectrum)
     distance = (
         (torch.log1p(pred_spectrum) - torch.log1p(target_spectrum)).abs().mean(dim=(1, 4, 5))
     )
@@ -364,6 +439,51 @@ def detail_reliability_target(
     return torch.cat(targets, dim=1)
 
 
+def cross_modal_identifiability_target(
+    source_features: Tensor,
+    target_bands: tuple[Tensor, ...],
+    mask: Tensor,
+) -> Tensor:
+    """Measure local cross-modal frequency support for each target band."""
+
+    if source_features.ndim != 4 or mask.ndim != 4:
+        raise ValueError("identifiability inputs must be BCHW")
+    source_energy = highpass(source_features.float()).abs().mean(dim=1, keepdim=True)
+    valid = mask.float()
+    targets = []
+    for level, band in enumerate(target_bands):
+        if band.shape[-2:] != source_energy.shape[-2:]:
+            raise ValueError("target bands must match source feature resolution")
+        scale = 2**level
+        if scale > 1:
+            kernel = 2 * scale - 1
+            source = F.avg_pool2d(source_energy, kernel, stride=1, padding=scale - 1)
+            target = F.avg_pool2d(
+                band.float().abs().mean(dim=1, keepdim=True),
+                kernel,
+                stride=1,
+                padding=scale - 1,
+            )
+        else:
+            source = source_energy
+            target = band.float().abs().mean(dim=1, keepdim=True)
+        source = source * valid
+        target = target * valid
+        source_target = F.avg_pool2d(source * target, 4, stride=4)
+        source_square = F.avg_pool2d(source.square(), 4, stride=4)
+        target_square = F.avg_pool2d(target.square(), 4, stride=4)
+        cosine = source_target / torch.sqrt(source_square * target_square + 1e-8)
+        source_mean = F.avg_pool2d(source, 4, stride=4)
+        target_mean = F.avg_pool2d(target, 4, stride=4)
+        balance = 2.0 * torch.sqrt(source_mean * target_mean) / (
+            source_mean + target_mean + 1e-8
+        )
+        coverage = F.avg_pool2d(valid, 4, stride=4)
+        support = (coverage >= 0.999).to(cosine.dtype)
+        targets.append((cosine.clamp_min(0.0) * balance * support).clamp(0.0, 1.0))
+    return torch.cat(targets, dim=1)
+
+
 def texture_reliability_gate(
     source: Tensor,
     texture: Tensor,
@@ -402,7 +522,10 @@ def log_spectral_distance(
     prediction_spectrum = torch.fft.rfft2((prediction * mask).float(), norm="ortho")
     target_spectrum = torch.fft.rfft2((target * mask).float(), norm="ortho")
     distance = (
-        (torch.log1p(prediction_spectrum.abs()) - torch.log1p(target_spectrum.abs()))
+        (
+            torch.log1p(complex_magnitude(prediction_spectrum))
+            - torch.log1p(complex_magnitude(target_spectrum))
+        )
         .abs()
         .mean(dim=(1, 2, 3))
     )
