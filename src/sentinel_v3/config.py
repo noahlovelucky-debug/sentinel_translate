@@ -43,6 +43,17 @@ DEFAULT: dict[str, Any] = {
         "physical_alignment_samples": 4,
         "physical_alignment_weight": 0.02,
         "optical_dists_weight": 0.1,
+        "flow_perceptual_every": 8,
+        "flow_visual_pixel_weight": 0.05,
+        "flow_visual_hf_weight": 0.05,
+        "flow_visual_perceptual_weight": 0.025,
+        "flow_rollout_every": 4,
+        "flow_rollout_steps": 2,
+        "flow_rollout_samples": 2,
+        "flow_rollout_pixel_weight": 0.1,
+        "flow_rollout_hf_weight": 0.1,
+        "risk_flow_steps": 4,
+        "codec_perceptual_every": 8,
         "native_gsd_probability": 0.8,
         "full_validate_every": 5000,
         "early_stop_patience": 5,
@@ -98,12 +109,18 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("model.hidden must be divisible by four")
     if int(model["dit_hidden"]) % int(model["dit_heads"]):
         raise ValueError("model.dit_hidden must be divisible by model.dit_heads")
+    for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
+        if model[name] is not None and float(model[name]) < 0.0:
+            raise ValueError(f"model.{name} must be non-negative")
+    if not 0.0 <= float(model["optical_texture_risk_threshold"]) <= 1.0:
+        raise ValueError("model.optical_texture_risk_threshold must be in [0, 1]")
     if train["stage"] not in {
         "overfit",
         "physical",
         "detail",
         "codec",
         "flow",
+        "risk",
         "visual",
         "balance",
     }:
@@ -117,6 +134,28 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("train.physical_alignment_samples must be at least two")
     if not 0.0 <= float(train["physical_alignment_weight"]):
         raise ValueError("train.physical_alignment_weight must be non-negative")
+    for name in (
+        "flow_visual_pixel_weight",
+        "flow_visual_hf_weight",
+        "flow_visual_perceptual_weight",
+        "flow_rollout_pixel_weight",
+        "flow_rollout_hf_weight",
+    ):
+        if float(train[name]) < 0.0:
+            raise ValueError(f"train.{name} must be non-negative")
+    for name in ("flow_rollout_every", "flow_rollout_steps", "flow_rollout_samples"):
+        if int(train[name]) < 1:
+            raise ValueError(f"train.{name} must be positive")
+    if int(train["risk_flow_steps"]) < 1:
+        raise ValueError("train.risk_flow_steps must be positive")
+    optical_detail_override = train.get("optical_detail_confidence_threshold_override")
+    if (
+        optical_detail_override is not None
+        and not 0.0 <= float(optical_detail_override) <= 1.01
+    ):
+        raise ValueError(
+            "train.optical_detail_confidence_threshold_override must be in [0, 1.01]"
+        )
     if not 0.0 <= float(train["native_gsd_probability"]) <= 1.0:
         raise ValueError("train.native_gsd_probability must be in [0, 1]")
     if train["amp"] not in {"bfloat16", "float16", "float32"}:

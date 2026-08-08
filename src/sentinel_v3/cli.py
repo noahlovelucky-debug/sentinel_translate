@@ -8,7 +8,12 @@ import torch
 
 from .acceptance import acceptance_decision
 from .baselines import evaluate_legacy_sar2opt
-from .calibration import calibrate_checkpoint
+from .calibration import (
+    calibrate_anchor_detail,
+    calibrate_checkpoint,
+    calibrate_detail_confidence_thresholds,
+    calibrate_texture_release,
+)
 from .config import load_config
 from .evaluation import evaluate
 from .model import ModelConfig, SentinelV3
@@ -28,7 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     training.add_argument("--limit", type=int)
     training.add_argument(
         "--stage",
-        choices=("overfit", "physical", "detail", "codec", "flow", "balance"),
+        choices=("overfit", "physical", "detail", "codec", "flow", "risk", "balance"),
     )
     training.add_argument("--max-steps", type=int)
     training.add_argument("--output")
@@ -65,6 +70,19 @@ def _parser() -> argparse.ArgumentParser:
     calibration.add_argument("--output", required=True)
     calibration.add_argument("--limit", type=int)
     calibration.add_argument("--seed", type=int, default=42)
+    detail_calibration = commands.add_parser("calibrate-detail-confidence")
+    detail_calibration.add_argument("--checkpoint", required=True)
+    detail_calibration.add_argument("--output", required=True)
+    detail_calibration.add_argument("--limit", type=int)
+    texture_calibration = commands.add_parser("calibrate-texture-release")
+    texture_calibration.add_argument("--checkpoint", required=True)
+    texture_calibration.add_argument("--output", required=True)
+    texture_calibration.add_argument("--limit", type=int, default=32)
+    texture_calibration.add_argument("--seed", type=int, default=42)
+    anchor_calibration = commands.add_parser("calibrate-anchor-detail")
+    anchor_calibration.add_argument("--checkpoint", required=True)
+    anchor_calibration.add_argument("--output", required=True)
+    anchor_calibration.add_argument("--limit", type=int, default=32)
     temporal = commands.add_parser("configure-temporal-prior")
     temporal.add_argument("--checkpoint", required=True)
     temporal.add_argument("--output", required=True)
@@ -166,6 +184,31 @@ def main() -> None:
             config["paths"]["manifest"],
             args.output,
             seed=args.seed,
+            limit=args.limit,
+        )
+        print(json.dumps(result, indent=2))
+    elif args.command == "calibrate-detail-confidence":
+        result = calibrate_detail_confidence_thresholds(
+            args.checkpoint,
+            config["paths"]["manifest"],
+            args.output,
+            limit=args.limit,
+        )
+        print(json.dumps(result, indent=2))
+    elif args.command == "calibrate-texture-release":
+        result = calibrate_texture_release(
+            args.checkpoint,
+            config["paths"]["manifest"],
+            args.output,
+            seed=args.seed,
+            limit=args.limit,
+        )
+        print(json.dumps(result, indent=2))
+    elif args.command == "calibrate-anchor-detail":
+        result = calibrate_anchor_detail(
+            args.checkpoint,
+            config["paths"]["manifest"],
+            args.output,
             limit=args.limit,
         )
         print(json.dumps(result, indent=2))

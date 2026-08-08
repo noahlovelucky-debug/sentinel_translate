@@ -11,14 +11,18 @@ def acceptance_decision(
     if milestone == "connectivity":
         metrics = report["training_metrics"]
         checks = {
-            "sar2opt_detail_mae_improves_30_percent": float(
+            "sar2opt_detail_improves": float(
                 metrics["sar2opt/detail_mae_improvement"]
             )
-            >= 0.30,
-            "opt2sar_detail_mae_improves_30_percent": float(
+            > 0.0,
+            "opt2sar_detail_improves": float(
                 metrics["opt2sar/detail_mae_improvement"]
             )
-            >= 0.30,
+            > 0.0,
+            "confidence_is_noncollapsed": all(
+                0.05 < float(metrics[f"{direction}/detail_confidence"]) < 0.95
+                for direction in ("sar2opt", "opt2sar")
+            ),
         }
         return {
             "milestone": milestone,

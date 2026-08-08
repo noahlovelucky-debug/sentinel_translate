@@ -7,6 +7,7 @@ import random
 import time
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -20,17 +21,21 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import LambdaLR
 from torch.utils.data import DataLoader, Subset
 
-from .data import StatefulShardSampler, V2ShardDataset, time_weights
+from .data import StatefulIndexSampler, StatefulShardSampler, V2ShardDataset, time_weights
 from .losses import (
+    charbonnier,
     codec_reconstruction_loss,
+    detail_reliability_target,
     deterministic_detail_loss,
     deterministic_detail_target,
+    frequency_bands,
     high_frequency_loss,
     highpass,
     latent_alignment,
     masked_mean,
     physical_loss,
     robust_rms,
+    texture_reliability_gate,
 )
 from .model import ModelConfig, Pyramid, SentinelV3
 from .sensors import SENTINEL1, SENTINEL2, SensorSpec
@@ -43,6 +48,31 @@ def _weighted_zero(module: nn.Module, device: torch.device) -> Tensor:
     return sum(terms, torch.zeros((), device=device))
 
 
+def texture_benefit_target(
+    physical: Tensor,
+    candidate: Tensor,
+    target: Tensor,
+    valid: Tensor,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Return soft block correctness, signed benefit, and strict-valid 4x4 support."""
+
+    def local_risk(prediction: Tensor) -> Tensor:
+        pixel = (prediction - target).abs().mean(dim=1, keepdim=True) / 0.05
+        structure = (highpass(prediction) - highpass(target)).abs().mean(
+            dim=1, keepdim=True
+        ) / 0.02
+        return F.avg_pool2d(pixel + 0.25 * structure, 4, stride=4)
+
+    physical_risk = local_risk(physical)
+    candidate_risk = local_risk(candidate)
+    benefit = physical_risk - candidate_risk
+    margin = 0.05 * physical_risk
+    scale = (0.05 * physical_risk + 0.01).clamp_min(0.01)
+    correctness = torch.sigmoid((benefit - margin) / scale)
+    block_valid = (F.avg_pool2d(valid, 4, stride=4) >= 0.999).to(valid.dtype)
+    return correctness, benefit, block_valid
+
+
 class JointObjective(nn.Module):
     """Stage-aware V3.2 objective with explicit deterministic/stochastic separation."""
 
@@ -53,6 +83,18 @@ class JointObjective(nn.Module):
         physical_alignment_samples: int = 4,
         physical_alignment_weight: float = 0.02,
         optical_dists_weight: float = 0.1,
+        flow_perceptual_every: int = 8,
+        codec_train_modality: str | None = None,
+        codec_perceptual_every: int = 8,
+        flow_visual_pixel_weight: float = 0.1,
+        flow_visual_hf_weight: float = 0.1,
+        flow_visual_perceptual_weight: float = 0.025,
+        flow_rollout_every: int | None = None,
+        flow_rollout_steps: int = 2,
+        flow_rollout_samples: int = 2,
+        flow_rollout_pixel_weight: float = 0.1,
+        flow_rollout_hf_weight: float = 0.1,
+        risk_flow_steps: int = 4,
     ) -> None:
         super().__init__()
         self.model = model
@@ -63,7 +105,38 @@ class JointObjective(nn.Module):
         self.physical_alignment_samples = physical_alignment_samples
         self.physical_alignment_weight = physical_alignment_weight
         self.optical_dists_weight = optical_dists_weight
+        if codec_train_modality not in {None, "optical", "sar"}:
+            raise ValueError("codec_train_modality must be optical, sar, or null")
+        self.codec_train_modality = codec_train_modality
+        self.codec_perceptual_every = max(1, codec_perceptual_every)
+        self.flow_visual_pixel_weight = flow_visual_pixel_weight
+        self.flow_visual_hf_weight = flow_visual_hf_weight
+        self.flow_visual_perceptual_weight = flow_visual_perceptual_weight
+        # flow_perceptual_every remains an initialization alias for v5 configs.
+        self.flow_rollout_every = max(
+            1, flow_perceptual_every if flow_rollout_every is None else flow_rollout_every
+        )
+        self.flow_rollout_steps = max(1, flow_rollout_steps)
+        self.flow_rollout_samples = max(1, flow_rollout_samples)
+        self.flow_rollout_pixel_weight = flow_rollout_pixel_weight
+        self.flow_rollout_hf_weight = flow_rollout_hf_weight
+        self.risk_flow_steps = max(1, risk_flow_steps)
         self.last_direction_losses: list[Tensor] = []
+        self.progress = 0.0
+        self.current_step = 0
+
+    def set_progress(self, step: int, max_steps: int) -> None:
+        self.current_step = step
+        self.progress = min(1.0, max(0.0, step / max(max_steps, 1)))
+
+    def _frequency_curriculum(self, reference: Tensor) -> Tensor:
+        if self.progress < 0.15:
+            values = (0.0, 0.25, 1.0)
+        elif self.progress < 0.45:
+            values = (0.25, 1.0, 1.0)
+        else:
+            values = (1.0, 1.0, 1.0)
+        return reference.new_tensor(values)
 
     @staticmethod
     def _assignments(batch_size: int, device: torch.device) -> Tensor:
@@ -200,17 +273,75 @@ class JointObjective(nn.Module):
             target_spec,
             joint=joint,
         )
-        prediction = self.model.deterministic_detail(
-            pyramid, source_spec, target_spec, tuple(target.shape[-2:])
+        prediction, predicted_bands, confidence = (
+            self.model.deterministic_detail_with_confidence(
+                pyramid, source_spec, target_spec, tuple(target.shape[-2:]), base=base
+            )
         )
         target_detail = self._deterministic_target(target, base, valid, target_spec)
-        loss, metrics = deterministic_detail_loss(
+        target_bands = frequency_bands(target_detail, levels=3)
+        source = batch[source_key][indices]  # type: ignore[index]
+        reliability = detail_reliability_target(source, target_bands, valid)
+        correctness_targets = []
+        for predicted_band, target_band in zip(predicted_bands, target_bands, strict=True):
+            zero_error = target_band.detach().abs().mean(dim=1, keepdim=True)
+            predicted_error = (
+                (predicted_band.detach() - target_band).abs().mean(dim=1, keepdim=True)
+            )
+            error_scale = F.avg_pool2d(zero_error, 4, stride=4).clamp_min(1e-4)
+            benefit = F.avg_pool2d(zero_error - predicted_error, 4, stride=4)
+            correctness_targets.append(torch.sigmoid(4.0 * benefit / error_scale))
+        correctness = torch.cat(correctness_targets, dim=1)
+        curriculum = self._frequency_curriculum(target)
+        loss = target.new_zeros(())
+        metrics: dict[str, Tensor] = {}
+        for level, (predicted_band, target_band) in enumerate(
+            zip(predicted_bands, target_bands, strict=True)
+        ):
+            support = F.interpolate(
+                reliability[:, level : level + 1],
+                size=valid.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            band_loss, band_metrics = deterministic_detail_loss(
+                predicted_band,
+                target_band,
+                valid * support,
+                weights[indices],
+                scale=0.08 if target_spec.modality == "optical" else 4.0,
+            )
+            loss = loss + curriculum[level] * band_loss
+            metrics.update(
+                {f"band{level}_{name}": value for name, value in band_metrics.items()}
+            )
+        confidence_weight = (
+            F.avg_pool2d(valid, 4, stride=4)
+            * weights[indices, None, None, None]
+            * (0.25 + reliability)
+        )
+        probability = confidence.float().clamp(1e-5, 1.0 - 1e-5)
+        confidence_target = correctness.float()
+        confidence_cross_entropy = -(
+            confidence_target * probability.log()
+            + (1.0 - confidence_target) * (1.0 - probability).log()
+        )
+        confidence_loss = masked_mean(confidence_cross_entropy, confidence_weight.float())
+        composed_loss, composed_metrics = deterministic_detail_loss(
             prediction,
             target_detail,
             valid,
             weights[indices],
             scale=0.08 if target_spec.modality == "optical" else 4.0,
         )
+        loss = (
+            loss / curriculum.sum().clamp_min(1.0) + 0.2 * composed_loss + 0.1 * confidence_loss
+        )
+        metrics.update(composed_metrics)
+        metrics["detail_confidence"] = confidence.mean().detach()
+        metrics["detail_reliability"] = reliability.mean().detach()
+        metrics["detail_correctness_target"] = correctness.mean().detach()
+        metrics["detail_confidence_loss"] = confidence_loss.detach()
         zero_mae = masked_mean(target_detail.abs(), valid * weights[indices, None, None, None])
         predicted_mae = masked_mean(
             (prediction - target_detail).abs(), valid * weights[indices, None, None, None]
@@ -257,6 +388,40 @@ class JointObjective(nn.Module):
         weights = sample_weight.to(values.dtype)
         return (values * weights).sum() / weights.sum().clamp_min(1e-8)
 
+    @staticmethod
+    def _optical_visual_perceptual(
+        prediction: Tensor,
+        target: Tensor,
+        valid: Tensor,
+        sample_weight: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        from .evaluation import perceptual_evaluators
+
+        sample_count = min(2, prediction.shape[0])
+        prediction = prediction[:sample_count]
+        target = target[:sample_count]
+        valid = valid[:sample_count]
+        weights = sample_weight[:sample_count].float()
+        size = (min(64, prediction.shape[-2]), min(64, prediction.shape[-1]))
+
+        def image(values: Tensor) -> Tensor:
+            return F.interpolate(
+                (values.clamp(0.0, 1.0) * valid).float(), size=size, mode="area"
+            )
+
+        predicted_image = image(prediction)
+        target_image = image(target)
+        lpips_evaluator, dists_evaluator = perceptual_evaluators(prediction.device)
+        lpips_values = lpips_evaluator(
+            predicted_image * 2.0 - 1.0, target_image * 2.0 - 1.0
+        ).flatten()
+        dists_values = dists_evaluator(predicted_image, target_image).flatten()
+        denominator = weights.sum().clamp_min(1e-8)
+        return (
+            (lpips_values * weights).sum() / denominator,
+            (dists_values * weights).sum() / denominator,
+        )
+
     def _codec_direction(
         self,
         batch: dict[str, object],
@@ -273,18 +438,20 @@ class JointObjective(nn.Module):
         texture = highpass(target * valid) * valid
         raw_latent = self.model.codec.encode(texture, target_spec.modality, standardized=False)
         # Direction filtering differs by rank; collectives inside this branch would deadlock.
-        self.model.codec.update_statistics(
-            raw_latent, target_spec.modality, synchronize=False
-        )
+        self.model.codec.update_statistics(raw_latent, target_spec.modality, synchronize=False)
         latent = self.model.codec.normalize(raw_latent, target_spec.modality)
         decoded = self.model.codec.decode(latent, target_spec.modality)
         weight = weights[indices]
         loss, metrics = codec_reconstruction_loss(
             decoded, texture, valid * weight[:, None, None, None], target_spec.modality
         )
-        if target_spec.modality == "optical" and self.optical_dists_weight > 0:
+        if (
+            target_spec.modality == "optical"
+            and self.optical_dists_weight > 0
+            and self.current_step % self.codec_perceptual_every == 0
+        ):
             dists = self._optical_dists(decoded, texture, valid, weight)
-            loss = loss + self.optical_dists_weight * dists
+            loss = loss + self.optical_dists_weight * self.codec_perceptual_every * dists
             metrics["codec_dists"] = dists.detach()
         return loss, metrics
 
@@ -312,12 +479,29 @@ class JointObjective(nn.Module):
         detail_context = nullcontext() if joint else torch.no_grad()
         with detail_context:
             detail = self.model.deterministic_detail(
-                pyramid, source_spec, target_spec, tuple(target.shape[-2:])
+                pyramid, source_spec, target_spec, tuple(target.shape[-2:]), base=base
             )
         texture = self._texture_target(target, base, detail, valid)
+        teacher_visual_enabled = (
+            self.flow_visual_pixel_weight > 0.0 or self.flow_visual_hf_weight > 0.0
+        )
+        rollout_enabled = (
+            self.flow_rollout_pixel_weight > 0.0
+            or self.flow_rollout_hf_weight > 0.0
+            or self.flow_visual_perceptual_weight > 0.0
+        )
+        if target_spec.modality == "optical" and (teacher_visual_enabled or rollout_enabled):
+            source = batch[source_key][indices]  # type: ignore[index]
+            threshold = 0.35 + 0.05 * torch.rand((), device=texture.device)
+            texture_reliability, texture_gate = texture_reliability_gate(
+                source, texture, valid, threshold=threshold
+            )
+        else:
+            texture_reliability = F.avg_pool2d(valid, 4, stride=4)
+            texture_gate = torch.ones_like(texture_reliability)
         with torch.no_grad():
             endpoint_latent = self.model.codec.encode(texture, target_spec.modality)
-        noise = torch.randn_like(endpoint_latent)
+        noise = self.model.flow_noise_scale(target_spec) * torch.randn_like(endpoint_latent)
         time_values = torch.rand(texture.shape[0], device=texture.device, dtype=texture.dtype)
         interpolation = (1 - time_values[:, None, None, None]) * noise + time_values[
             :, None, None, None
@@ -328,21 +512,34 @@ class JointObjective(nn.Module):
         target_velocity = endpoint_latent - noise
         residual_weights = weights[indices]
         latent_mask = F.interpolate(valid, size=velocity.shape[-2:], mode="area")
-        latent_weight = residual_weights[:, None, None, None] * latent_mask
-        velocity_loss = masked_mean((velocity - target_velocity).square(), latent_weight)
+        latent_gate = F.interpolate(texture_gate, size=velocity.shape[-2:], mode="nearest")
+        latent_mask = latent_mask * latent_gate
+        target_amplitude = robust_rms(texture, valid) * texture_gate
+        richness = F.interpolate(
+            target_amplitude.mean(dim=1, keepdim=True), size=velocity.shape[-2:], mode="area"
+        )
+        richness = richness / richness.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-4)
+        latent_weight = (
+            residual_weights[:, None, None, None]
+            * latent_mask
+            * (0.25 + richness.clamp_max(2.0))
+        )
+        velocity_loss = masked_mean(
+            F.smooth_l1_loss(velocity, target_velocity, reduction="none"), latent_weight
+        )
         predicted_latent = interpolation + (1 - time_values[:, None, None, None]) * velocity
         endpoint = highpass(self.model.codec.decode(predicted_latent, target_spec.modality))
+        endpoint_gate = F.interpolate(texture_gate, size=valid.shape[-2:], mode="nearest")
+        # Near-target interpolants leak endpoint information. Preserve velocity coverage at
+        # every t, but make endpoint supervision concentrate on source-like low-t states.
+        endpoint_weights = residual_weights * (1.0 - time_values).clamp_min(0.05)
         endpoint_loss, endpoint_metrics = high_frequency_loss(
             endpoint,
             texture,
-            valid,
+            valid * endpoint_gate,
             target_spec.modality,
-            sample_weight=residual_weights,
+            sample_weight=endpoint_weights,
         )
-        endpoint_dists = None
-        if target_spec.modality == "optical":
-            endpoint_dists = self._optical_dists(endpoint, texture, valid, residual_weights)
-        target_amplitude = robust_rms(texture, valid)
         amplitude_limit = (
             self.model.config.optical_residual_limit
             if target_spec.modality == "optical"
@@ -358,22 +555,202 @@ class JointObjective(nn.Module):
             residual_weights[:, None, None, None] * amplitude_mask,
         )
         total = velocity_loss + 0.25 * endpoint_loss + 0.2 * amplitude_loss
-        if endpoint_dists is not None:
-            total = total + 0.05 * endpoint_dists
         metrics = {
             "velocity": velocity_loss.detach(),
             "amplitude": amplitude_loss.detach(),
+            "texture_reliability": texture_reliability.mean().detach(),
+            "texture_coverage": texture_gate.mean().detach(),
+            "endpoint_source_weight": (1.0 - time_values).mean().detach(),
             **{f"endpoint_{name}": value for name, value in endpoint_metrics.items()},
         }
-        if endpoint_dists is not None:
-            metrics["endpoint_dists"] = endpoint_dists.detach()
+        if target_spec.modality == "optical":
+            shaped_endpoint = self.model.shape_residual_texture(
+                endpoint, pyramid, target_spec, amplitude=predicted_amplitude
+            )
+            composed_endpoint = self.model.compose_visual(
+                base, detail, shaped_endpoint, "optical"
+            )
+            assert isinstance(composed_endpoint, Tensor)
+            if teacher_visual_enabled:
+                visual_weight = valid * endpoint_weights[:, None, None, None]
+                visual_pixel = masked_mean(
+                    charbonnier((composed_endpoint - target) / 0.05), visual_weight
+                )
+                visual_hf_loss, visual_hf_metrics = high_frequency_loss(
+                    highpass(composed_endpoint),
+                    highpass(target),
+                    valid,
+                    "optical",
+                    sample_weight=endpoint_weights,
+                )
+                total = (
+                    total
+                    + self.flow_visual_pixel_weight * visual_pixel
+                    + self.flow_visual_hf_weight * visual_hf_loss
+                )
+                metrics["composed_pixel"] = visual_pixel.detach()
+                metrics.update(
+                    {f"composed_{name}": value for name, value in visual_hf_metrics.items()}
+                )
+            if rollout_enabled and self.current_step % self.flow_rollout_every == 0:
+                count = min(self.flow_rollout_samples, noise.shape[0])
+                rollout_pyramid = tuple(level[:count] for level in pyramid)
+                rollout_latent = self.model.integrate_flow(
+                    noise[:count],
+                    rollout_pyramid,
+                    target_spec,
+                    texture.shape[1],
+                    steps=self.flow_rollout_steps,
+                )
+                rollout_residual = self.model.codec.decode(rollout_latent, target_spec.modality)
+                rollout_texture = self.model.shape_residual_texture(
+                    rollout_residual,
+                    rollout_pyramid,
+                    target_spec,
+                    amplitude=predicted_amplitude[:count],
+                )
+                rollout_visual = self.model.compose_visual(
+                    base[:count], detail[:count], rollout_texture, "optical"
+                )
+                assert isinstance(rollout_visual, Tensor)
+                rollout_valid = valid[:count]
+                rollout_weights = residual_weights[:count]
+                rollout_pixel = masked_mean(
+                    charbonnier((rollout_visual - target[:count]) / 0.05),
+                    rollout_valid * rollout_weights[:, None, None, None],
+                )
+                rollout_hf, rollout_hf_metrics = high_frequency_loss(
+                    highpass(rollout_visual),
+                    highpass(target[:count]),
+                    rollout_valid,
+                    "optical",
+                    sample_weight=rollout_weights,
+                )
+                rollout_lpips, rollout_dists = self._optical_visual_perceptual(
+                    rollout_visual, target[:count], rollout_valid, rollout_weights
+                )
+                schedule = float(self.flow_rollout_every)
+                total = total + schedule * (
+                    self.flow_rollout_pixel_weight * rollout_pixel
+                    + self.flow_rollout_hf_weight * rollout_hf
+                    + self.flow_visual_perceptual_weight * (rollout_lpips + rollout_dists)
+                )
+                metrics["rollout_pixel"] = rollout_pixel.detach()
+                metrics.update(
+                    {f"rollout_{name}": value for name, value in rollout_hf_metrics.items()}
+                )
+                metrics["rollout_lpips"] = rollout_lpips.detach()
+                metrics["rollout_dists"] = rollout_dists.detach()
         return total, metrics
+
+    def _risk_direction(
+        self,
+        batch: dict[str, object],
+        indices: Tensor,
+        source_key: str,
+        target_key: str,
+        source_spec: SensorSpec,
+        target_spec: SensorSpec,
+        weights: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if target_spec.modality != "optical":
+            raise ValueError("texture risk training is defined for Optical release only")
+        target, base, valid, pyramid = self._physical_context(
+            batch,
+            indices,
+            source_key,
+            target_key,
+            source_spec,
+            target_spec,
+            joint=False,
+        )
+        with torch.no_grad():
+            latent_size = (target.shape[-2] // 4, target.shape[-1] // 4)
+            noise = self.model.flow_noise_scale(target_spec) * torch.randn(
+                target.shape[0],
+                self.model.config.codec_latent_channels,
+                *latent_size,
+                device=target.device,
+                dtype=target.dtype,
+            )
+            latent = self.model.integrate_flow(
+                noise,
+                pyramid,
+                target_spec,
+                target.shape[1],
+                steps=self.risk_flow_steps,
+            )
+            raw = self.model.codec.decode(latent, target_spec.modality)
+            amplitude = self.model.residual_amplitude(
+                pyramid, target_spec, target.shape[1], tuple(target.shape[-2:])
+            )
+            texture = self.model.shape_residual_texture(
+                raw,
+                pyramid,
+                target_spec,
+                amplitude=amplitude,
+                apply_release_gate=False,
+            )
+            candidate = self.model.compose_visual(
+                base, torch.zeros_like(base), texture, "optical"
+            )
+            assert isinstance(candidate, Tensor)
+            correctness, benefit, block_valid = texture_benefit_target(
+                base, candidate, target, valid
+            )
+        descriptors = self.model.descriptors(
+            target_spec.channels[: target.shape[1]], target.device
+        )
+        logits = self.model.residual_dit.predict_texture_risk_logits(
+            pyramid, descriptors, texture
+        )
+        probability = torch.sigmoid(logits.float())
+        hard_positive = (correctness > 0.5).to(probability.dtype)
+        positive_fraction = masked_mean(hard_positive, block_valid).detach()
+        positive_weight = ((1.0 - positive_fraction) / positive_fraction.clamp_min(0.02)).clamp(
+            1.0, 12.0
+        )
+        class_weight = torch.where(hard_positive.bool(), positive_weight, 1.0)
+        evidence = (2.0 * (correctness - 0.5).abs()).clamp_min(0.10)
+        sample_weight = (
+            weights[indices, None, None, None] * block_valid * class_weight * evidence
+        )
+        cross_entropy = F.binary_cross_entropy_with_logits(
+            logits.float(), correctness.float(), reduction="none"
+        )
+        classification = masked_mean(cross_entropy, sample_weight)
+        calibration = masked_mean(
+            (probability - correctness.float()).square(),
+            weights[indices, None, None, None] * block_valid,
+        )
+        total = classification + 0.25 * calibration
+        released = probability >= self.model.optical_texture_risk_threshold
+        released_benefit = masked_mean(
+            benefit,
+            block_valid * released.to(block_valid.dtype),
+        )
+        return total, {
+            "classification": classification.detach(),
+            "calibration": calibration.detach(),
+            "positive_fraction": positive_fraction,
+            "target_probability": masked_mean(correctness, block_valid).detach(),
+            "predicted_probability": masked_mean(probability, block_valid).detach(),
+            "release_fraction": masked_mean(
+                released.to(block_valid.dtype), block_valid
+            ).detach(),
+            "released_benefit": released_benefit.detach(),
+            "candidate_benefit": masked_mean(benefit, block_valid).detach(),
+        }
 
     def forward(self, batch: dict[str, object], stage: str) -> tuple[Tensor, dict[str, Tensor]]:
         stage = "flow" if stage == "visual" else stage
         device = batch["s2"].device  # type: ignore[union-attr]
         batch_size = batch["s2"].shape[0]  # type: ignore[union-attr]
-        tasks = self._assignments(batch_size, device)
+        tasks = (
+            torch.zeros(batch_size, device=device, dtype=torch.long)
+            if stage == "risk"
+            else self._assignments(batch_size, device)
+        )
         physical_weights, high_frequency_weights = time_weights(batch["delta_days"])  # type: ignore[arg-type]
         if "hf_eligible" in batch:
             high_frequency_weights = high_frequency_weights * batch["hf_eligible"].to(  # type: ignore[union-attr]
@@ -390,8 +767,14 @@ class JointObjective(nn.Module):
         for task_index, (source_key, target_key, source_spec, target_spec) in enumerate(
             specifications
         ):
+            if (
+                stage == "codec"
+                and self.codec_train_modality is not None
+                and target_spec.modality != self.codec_train_modality
+            ):
+                continue
             indices = torch.nonzero(tasks == task_index, as_tuple=False).flatten()
-            if stage in {"detail", "codec", "flow"}:
+            if stage in {"detail", "codec", "flow", "risk"}:
                 indices = indices[high_frequency_weights[indices] > 0]
             if indices.numel() == 0:
                 continue
@@ -430,6 +813,16 @@ class JointObjective(nn.Module):
                 )
             elif stage == "flow":
                 loss, direction_metrics = self._flow_direction(
+                    batch,
+                    indices,
+                    source_key,
+                    target_key,
+                    source_spec,
+                    target_spec,
+                    high_frequency_weights,
+                )
+            elif stage == "risk":
+                loss, direction_metrics = self._risk_direction(
                     batch,
                     indices,
                     source_key,
@@ -508,11 +901,14 @@ class JointObjective(nn.Module):
                 {f"latent/{name}": value for name, value in alignment_metrics.items()}
             )
 
-        if stage in {"detail", "codec", "flow"} and not bool(high_frequency_weights.any()):
+        if stage in {"detail", "codec", "flow", "risk"} and not bool(
+            high_frequency_weights.any()
+        ):
             branch = {
                 "detail": self.model.detail_head,
                 "codec": self.model.codec,
                 "flow": self.model.residual_dit,
+                "risk": self.model.residual_dit,
             }[stage]
             total = total + _weighted_zero(branch, device)
         metrics["loss"] = total.detach()
@@ -611,7 +1007,7 @@ def _stage_learning_rates(
 ) -> tuple[float, float, float]:
     base = float(train_config.get("learning_rate", 1e-4))
     encoder = float(train_config.get("encoder_learning_rate", 2e-5))
-    if stage == "flow" or stage == "visual":
+    if stage in {"flow", "visual", "risk"}:
         return 0.0, 0.0, base
     if stage == "balance":
         balance = train_config.get("balance_learning_rates", {})
@@ -679,6 +1075,11 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
         modules = (model.codec,)
     elif stage == "flow":
         modules = (model.residual_dit,)
+    elif stage == "risk":
+        modules = (
+            model.residual_dit.texture_risk_candidate,
+            model.residual_dit.texture_risk_head,
+        )
     elif stage in {"balance", "overfit"}:
         modules = (model.encoder, model.decoder, model.detail_head, model.residual_dit)
     else:
@@ -959,7 +1360,11 @@ def train(
     distributed = world_size > 1
     if distributed:
         torch.cuda.set_device(local_rank)
-        dist.init_process_group("nccl" if torch.cuda.is_available() else "gloo")
+        timeout_minutes = float(config.get("distributed", {}).get("timeout_minutes", 120.0))
+        dist.init_process_group(
+            "nccl" if torch.cuda.is_available() else "gloo",
+            timeout=timedelta(minutes=timeout_minutes),
+        )
     device = torch.device(f"cuda:{local_rank}" if torch.cuda.is_available() else "cpu")
     train_config = config["train"]
     stage = "flow" if train_config["stage"] == "visual" else str(train_config["stage"])
@@ -977,19 +1382,20 @@ def train(
         random_gsd=True,
         native_gsd_probability=(
             1.0
-            if stage in {"detail", "codec", "flow", "balance"}
+            if stage in {"detail", "codec", "flow", "risk", "balance"}
             else float(train_config.get("native_gsd_probability", 0.8))
         ),
-        audit_high_frequency=stage in {"detail", "codec", "flow", "balance"}
-        and bool(train_config.get("registration_audit", True)),
+        audit_high_frequency=stage in {"detail", "codec", "flow", "risk", "balance"}
+        and bool(train_config.get("registration_audit", True))
+        and not bool(config["paths"].get("hf_eligibility")),
         temporal_prior_index=(
             config["paths"].get("temporal_prior_shards")
-            if stage in {"detail", "flow", "balance"}
+            if stage in {"detail", "flow", "risk", "balance"}
             else None
         ),
     )
     if limit is not None:
-        if stage in {"detail", "codec", "flow", "balance"}:
+        if stage in {"detail", "codec", "flow", "risk", "balance"}:
             eligible_indices: list[int] = []
             for index in range(len(dataset)):
                 if bool(dataset[index]["hf_eligible"]):
@@ -1004,11 +1410,33 @@ def train(
             dataset = Subset(dataset, eligible_indices)
         else:
             dataset = Subset(dataset, range(min(limit, len(dataset))))
-    sampler = (
-        None
-        if isinstance(dataset, Subset)
-        else StatefulShardSampler(dataset, replicas=world_size, rank=rank, seed=seed)
-    )
+    high_frequency_stage = stage in {"detail", "codec", "flow", "risk", "balance"}
+    eligibility_path = config["paths"].get("hf_eligibility")
+    if isinstance(dataset, Subset):
+        sampler = None
+    elif high_frequency_stage and eligibility_path:
+        eligibility_file = Path(str(eligibility_path))
+        if not eligibility_file.is_file():
+            raise RuntimeError(
+                f"high-frequency eligibility sidecar is missing: {eligibility_file}"
+            )
+        eligibility = json.loads(eligibility_file.read_text(encoding="utf-8"))
+        if str(eligibility.get("source_index")) != str(config["paths"]["train_shards"]):
+            raise RuntimeError("eligibility sidecar belongs to a different training index")
+        sampler = StatefulIndexSampler(
+            [int(value) for value in eligibility["eligible_indices"]],
+            replicas=world_size,
+            rank=rank,
+            seed=seed,
+        )
+    else:
+        sampler = StatefulShardSampler(
+            dataset,
+            replicas=world_size,
+            rank=rank,
+            seed=seed,
+            high_frequency_only=high_frequency_stage,
+        )
     loader = DataLoader(
         dataset,
         batch_size=int(train_config["batch_size"]),
@@ -1022,6 +1450,14 @@ def train(
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     _set_trainable(model, stage)
+    if stage == "detail" and bool(train_config.get("detail_confidence_only", False)):
+        model.detail_head.requires_grad_(False)
+        model.detail_head.confidence_heads.requires_grad_(True)
+    if stage == "codec" and train_config.get("codec_train_modality"):
+        modality = str(train_config["codec_train_modality"])
+        model.codec.requires_grad_(False)
+        model.codec.input_heads[modality].requires_grad_(True)
+        model.codec.output_heads[modality].requires_grad_(True)
     if stage == "physical" and not bool(
         train_config.get("train_full_resolution_fusion", False)
     ):
@@ -1033,10 +1469,24 @@ def train(
     )
     objective = JointObjective(
         model,
-        list(train_config.get("task_probabilities", [0.5, 0.5])),
-        int(train_config.get("physical_alignment_samples", 4)),
-        float(train_config.get("physical_alignment_weight", 0.02)),
-        float(train_config.get("optical_dists_weight", 0.1)),
+        task_probabilities=list(train_config.get("task_probabilities", [0.5, 0.5])),
+        physical_alignment_samples=int(train_config.get("physical_alignment_samples", 4)),
+        physical_alignment_weight=float(train_config.get("physical_alignment_weight", 0.02)),
+        optical_dists_weight=float(train_config.get("optical_dists_weight", 0.1)),
+        flow_perceptual_every=int(train_config.get("flow_perceptual_every", 8)),
+        codec_train_modality=train_config.get("codec_train_modality"),
+        codec_perceptual_every=int(train_config.get("codec_perceptual_every", 8)),
+        flow_visual_pixel_weight=float(train_config.get("flow_visual_pixel_weight", 0.1)),
+        flow_visual_hf_weight=float(train_config.get("flow_visual_hf_weight", 0.1)),
+        flow_visual_perceptual_weight=float(
+            train_config.get("flow_visual_perceptual_weight", 0.025)
+        ),
+        flow_rollout_every=int(train_config.get("flow_rollout_every", 4)),
+        flow_rollout_steps=int(train_config.get("flow_rollout_steps", 2)),
+        flow_rollout_samples=int(train_config.get("flow_rollout_samples", 2)),
+        flow_rollout_pixel_weight=float(train_config.get("flow_rollout_pixel_weight", 0.1)),
+        flow_rollout_hf_weight=float(train_config.get("flow_rollout_hf_weight", 0.1)),
+        risk_flow_steps=int(train_config.get("risk_flow_steps", 4)),
     ).to(device)
     ema = EMA(model, float(train_config["ema_decay"]))
     step = 0
@@ -1068,8 +1518,13 @@ def train(
         if bool(train_config.get("init_use_ema", False)) and "ema" in initial:
             initial_state.update(initial["ema"]["state"])
         loaded, initialized = _load_compatible_state(model, initial_state)
+        optical_detail_override = train_config.get(
+            "optical_detail_confidence_threshold_override"
+        )
+        if optical_detail_override is not None:
+            model.set_detail_confidence_threshold("optical", float(optical_detail_override))
         if (
-            stage in {"detail", "codec", "flow", "balance"}
+            stage in {"detail", "codec", "flow", "risk", "balance"}
             and bool(train_config.get("require_physical_gate", True))
             and not bool(initial.get("quality_gates", {}).get("physical", False))
         ):
@@ -1077,7 +1532,7 @@ def train(
                 "high-frequency training requires a frozen physical checkpoint that passed validation"
             )
         if (
-            stage in {"flow", "balance"}
+            stage in {"flow", "risk", "balance"}
             and bool(train_config.get("require_codec_gate", True))
             and not bool(initial.get("quality_gates", {}).get("codec", False))
         ):
@@ -1085,7 +1540,7 @@ def train(
                 "flow training requires a frozen codec checkpoint that passed reconstruction gates"
             )
         if (
-            stage in {"flow", "balance"}
+            stage in {"flow", "risk", "balance"}
             and bool(train_config.get("require_detail_gate", True))
             and not bool(initial.get("quality_gates", {}).get("detail", False))
         ):
@@ -1144,7 +1599,7 @@ def train(
             _match_optimizer_layout(optimizer)
 
     if (
-        stage in {"detail", "codec", "flow", "balance"}
+        stage in {"detail", "codec", "flow", "risk", "balance"}
         and bool(train_config.get("require_physical_gate", True))
         and not (resume or init_model)
     ):
@@ -1152,7 +1607,7 @@ def train(
             "high-frequency stages require --init-model with a passing physical v4 checkpoint"
         )
     if (
-        stage in {"flow", "balance"}
+        stage in {"flow", "risk", "balance"}
         and bool(train_config.get("require_codec_gate", True))
         and not (resume or init_model)
     ):
@@ -1165,9 +1620,7 @@ def train(
         wrapped = DistributedDataParallel(
             objective,
             device_ids=[local_rank] if device.type == "cuda" else None,
-            find_unused_parameters=bool(
-                train_config.get("find_unused_parameters", True)
-            ),
+            find_unused_parameters=bool(train_config.get("find_unused_parameters", True)),
             gradient_as_bucket_view=True,
             broadcast_buffers=False,
         )
@@ -1185,6 +1638,7 @@ def train(
     starting_step = step
     stale_validations = 0
     while step < int(train_config["max_steps"]):
+        objective.set_progress(step, int(train_config["max_steps"]))
         aggregate: dict[str, float] = {}
         pcgrad_corrections: tuple[list[nn.Parameter], list[Tensor | None]] | None = None
         for micro_step in range(accumulation):
@@ -1278,9 +1732,14 @@ def train(
             is_full_validation = step % full_every == 0 or step in full_steps
             if rank == 0:
                 with ema.apply_to(model):
-                    report = _validate_training_state(
-                        model, config, stage, step, full=is_full_validation
-                    )
+                    was_training = model.training
+                    model.eval()
+                    try:
+                        report = _validate_training_state(
+                            model, config, stage, step, full=is_full_validation
+                        )
+                    finally:
+                        model.train(was_training)
             if distributed:
                 report_objects = [report]
                 dist.broadcast_object_list(report_objects, src=0)

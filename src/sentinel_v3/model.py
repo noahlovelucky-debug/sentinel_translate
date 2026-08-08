@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from .api import Observation, TargetRequest, TranslationResult
-from .losses import highpass
+from .losses import frequency_bands, highpass
 from .physics import gsd_condition
 from .sensors import ChannelSpec, SensorSpec
 from .temporal_prior import TemporalPriorConfig, TemporalPriorStore
@@ -447,6 +447,12 @@ class MultiscaleDetailHead(nn.Module):
                 "sar": nn.Conv2d(width, width, 3, padding=1),
             }
         )
+        self.base_heads = nn.ModuleDict(
+            {
+                "optical": nn.Conv2d(3, width, 3, padding=1),
+                "sar": nn.Conv2d(2, width, 3, padding=1),
+            }
+        )
         self.projections = nn.ModuleList(
             [
                 nn.Conv2d(width * 2, width, 1),
@@ -466,19 +472,41 @@ class MultiscaleDetailHead(nn.Module):
                 "sar": nn.Conv2d(width, 2, 3, padding=1),
             }
         )
+        self.confidence_heads = nn.ModuleDict(
+            {
+                "optical": nn.Conv2d(width, 3, 3, padding=1),
+                "sar": nn.Conv2d(width, 3, 3, padding=1),
+            }
+        )
         for head in self.output_heads.values():
             nn.init.zeros_(head.weight)
             nn.init.zeros_(head.bias)
+        for head in self.base_heads.values():
+            nn.init.zeros_(head.weight)
+            nn.init.zeros_(head.bias)
+        for head in self.confidence_heads.values():
+            nn.init.zeros_(head.weight)
+            nn.init.constant_(head.bias, -0.5)
 
-    def forward(
+    def forward_with_confidence(
         self,
         pyramid: Pyramid,
         source_modality: str,
         target_modality: str,
         output_size: tuple[int, int],
-    ) -> Tensor:
+        base: Tensor | None = None,
+        confidence_threshold: Tensor | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, ...], Tensor]:
         full, half, quarter, eighth = pyramid
         levels = [self.input_heads[source_modality](full)]
+        if base is not None:
+            normalized_base = base if target_modality == "optical" else (base + 20.0) / 20.0
+            base_features = self.base_heads[target_modality](normalized_base)
+            if base_features.shape[-2:] != full.shape[-2:]:
+                base_features = F.interpolate(
+                    base_features, size=full.shape[-2:], mode="bilinear", align_corners=False
+                )
+            levels[0] = levels[0] + base_features
         for level, projection in zip((half, quarter, eighth), self.projections, strict=True):
             projected = projection(level)
             levels.append(
@@ -487,10 +515,70 @@ class MultiscaleDetailHead(nn.Module):
                 )
             )
         features = self.trunk(torch.cat(levels, dim=1))
-        detail = self.output_heads[target_modality](features)
-        detail = F.interpolate(detail, size=output_size, mode="bilinear", align_corners=False)
+        raw = self.output_heads[target_modality](features)
+        raw = F.interpolate(raw, size=output_size, mode="bilinear", align_corners=False)
         limit = 0.08 if target_modality == "optical" else 4.0
-        return highpass(limit * torch.tanh(detail / limit))
+        bands = frequency_bands(limit * torch.tanh(raw / limit), levels=3)
+        confidence = torch.sigmoid(self.confidence_heads[target_modality](features))
+        confidence = F.interpolate(
+            confidence, size=(output_size[0] // 4, output_size[1] // 4), mode="area"
+        )
+        if self.training:
+            gate = confidence
+        else:
+            threshold = (
+                confidence.new_tensor(0.55)
+                if confidence_threshold is None
+                else confidence_threshold
+            )
+            gate = (confidence >= threshold.to(confidence)).to(confidence.dtype)
+        full_confidence = F.interpolate(gate, size=output_size, mode="nearest")
+        detail = sum(
+            band * full_confidence[:, index : index + 1] for index, band in enumerate(bands)
+        )
+        return highpass(detail), bands, confidence
+
+    def forward(
+        self,
+        pyramid: Pyramid,
+        source_modality: str,
+        target_modality: str,
+        output_size: tuple[int, int],
+        base: Tensor | None = None,
+    ) -> Tensor:
+        return self.forward_with_confidence(
+            pyramid, source_modality, target_modality, output_size, base
+        )[0]
+
+
+class SpatialFrequencyAdapter(nn.Module):
+    """Zero-gated spatial/frequency correction for the multiscale DiT condition."""
+
+    def __init__(self, hidden: int, bottleneck: int = 32) -> None:
+        super().__init__()
+        self.down = nn.Conv2d(hidden, bottleneck, 1)
+        self.spatial = nn.Conv2d(bottleneck, bottleneck, 3, padding=1, groups=bottleneck)
+        self.up = nn.Conv2d(bottleneck, hidden, 1)
+        self.low_gain = nn.Parameter(torch.zeros(bottleneck))
+        self.high_gain = nn.Parameter(torch.zeros(bottleneck))
+        self.output_gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, values: Tensor) -> Tensor:
+        reduced = F.silu(self.down(values))
+        spectrum = torch.fft.rfft2(reduced.float(), norm="ortho")
+        height, width = reduced.shape[-2], reduced.shape[-1]
+        fy = torch.fft.fftfreq(height, device=values.device).abs()[:, None]
+        fx = torch.fft.rfftfreq(width, device=values.device).abs()[None, :]
+        radius = torch.sqrt(fy.square() + fx.square()).clamp(0.0, 0.5) * 2.0
+        gain = (
+            self.low_gain[:, None, None] * (1.0 - radius)
+            + self.high_gain[:, None, None] * radius
+        )
+        frequency = torch.fft.irfft2(
+            spectrum * (1.0 + torch.tanh(gain)[None]), s=(height, width), norm="ortho"
+        ).to(values.dtype)
+        correction = self.up(self.spatial(reduced) + frequency - reduced)
+        return values + torch.tanh(self.output_gate) * correction
 
 
 class ResidualCodec(nn.Module):
@@ -631,6 +719,7 @@ class ResidualDiT(nn.Module):
         )
         self.legacy_scene = nn.Conv2d(pyramid_channels[-1], hidden, 1)
         self.condition_gates = nn.Parameter(torch.zeros(depth, 4))
+        self.frequency_adapter = SpatialFrequencyAdapter(hidden)
         self.time = nn.Sequential(
             nn.Linear(hidden, hidden), nn.SiLU(), nn.Linear(hidden, hidden)
         )
@@ -638,8 +727,20 @@ class ResidualDiT(nn.Module):
         self.blocks = nn.ModuleList([FlowBlock(hidden, heads) for _ in range(depth)])
         self.output = nn.Sequential(nn.LayerNorm(hidden), nn.Linear(hidden, latent_channels))
         self.amplitude_head = nn.Conv2d(hidden, 3, 1)
+        self.texture_risk_candidate = nn.Sequential(
+            nn.Conv2d(4, hidden // 4, 1),
+            nn.SiLU(),
+            nn.Conv2d(hidden // 4, hidden, 1),
+        )
+        self.texture_risk_head = nn.Sequential(
+            nn.Conv2d(hidden, hidden // 4, 3, padding=1),
+            nn.SiLU(),
+            nn.Conv2d(hidden // 4, 1, 1),
+        )
         nn.init.zeros_(self.amplitude_head.weight)
         nn.init.constant_(self.amplitude_head.bias, math.log(0.1 / 0.9))
+        nn.init.zeros_(self.texture_risk_head[-1].weight)
+        nn.init.constant_(self.texture_risk_head[-1].bias, -2.2)
 
     def multiscale_condition(
         self, pyramid: Pyramid | Tensor, latent_size: tuple[int, int]
@@ -670,9 +771,10 @@ class ResidualDiT(nn.Module):
             weights = torch.ones(4, device=conditions[0].device, dtype=conditions[0].dtype)
         else:
             weights = torch.tanh(self.condition_gates[block_index]).to(conditions[0].dtype)
-        return sum(
+        fused = sum(
             weight * condition for weight, condition in zip(weights, conditions, strict=True)
         )
+        return self.frequency_adapter(fused)
 
     def predict_amplitude(
         self,
@@ -686,6 +788,36 @@ class ResidualDiT(nn.Module):
         scene = self._fused_condition(conditions)
         target = self.target(target_descriptors.mean(dim=0)).view(1, -1, 1, 1)
         return torch.sigmoid(self.amplitude_head(F.silu(scene + target))[:, :channels])
+
+    @staticmethod
+    def _texture_candidate_features(texture: Tensor) -> Tensor:
+        luminance = texture.mean(dim=1, keepdim=True)
+        chroma = (texture - luminance).abs().mean(dim=1, keepdim=True)
+        dx = F.pad(luminance[..., :, 1:] - luminance[..., :, :-1], (0, 1))
+        dy = F.pad(luminance[..., 1:, :] - luminance[..., :-1, :], (0, 0, 0, 1))
+        gradient = torch.sqrt(dx.square() + dy.square() + 1e-8)
+        return torch.cat(
+            (
+                F.avg_pool2d(luminance.abs(), 4, stride=4),
+                F.avg_pool2d(luminance.square(), 4, stride=4).sqrt(),
+                F.avg_pool2d(chroma, 4, stride=4),
+                F.avg_pool2d(gradient, 4, stride=4),
+            ),
+            dim=1,
+        )
+
+    def predict_texture_risk_logits(
+        self,
+        pyramid: Pyramid | Tensor,
+        target_descriptors: Tensor,
+        texture: Tensor,
+    ) -> Tensor:
+        latent_size = (texture.shape[-2] // 4, texture.shape[-1] // 4)
+        conditions = self.multiscale_condition(pyramid, latent_size)
+        scene = self._fused_condition(conditions)
+        target = self.target(target_descriptors.mean(dim=0)).view(1, -1, 1, 1)
+        candidate = self.texture_risk_candidate(self._texture_candidate_features(texture))
+        return self.texture_risk_head(F.silu(scene + target + candidate))
 
     def forward(
         self,
@@ -723,8 +855,12 @@ class ModelConfig:
     codec_width: int = 64
     codec_latent_channels: int = 16
     flow_steps: int = 16
+    flow_noise_scale: float = 0.35
+    optical_flow_noise_scale: float | None = None
+    sar_flow_noise_scale: float | None = None
     optical_residual_limit: float = 0.15
     sar_residual_limit_db: float = 6.0
+    optical_texture_risk_threshold: float = 0.0
     architecture: str = "v3.2"
 
 
@@ -748,6 +884,14 @@ class SentinelV3(nn.Module):
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("sar_alpha_scale", torch.ones(()))
+        self.register_buffer("optical_texture_amplitude_floor", torch.zeros(()))
+        self.register_buffer("optical_anchor_band_scales", torch.zeros(3))
+        self.register_buffer(
+            "optical_texture_risk_threshold",
+            torch.tensor(cfg.optical_texture_risk_threshold),
+        )
+        self.register_buffer("optical_detail_confidence_threshold", torch.tensor(0.55))
+        self.register_buffer("sar_detail_confidence_threshold", torch.tensor(0.55))
         self.temporal_prior: TemporalPriorStore | None = None
 
     def configure_temporal_prior(self, config: dict[str, object] | None) -> None:
@@ -786,17 +930,12 @@ class SentinelV3(nn.Module):
         if spatial_transform is not None:
             flip_x, flip_y, rotations = spatial_transform
             if flip_x:
-                prior, coverage = (
-                    torch.flip(values, (-1,)) for values in (prior, coverage)
-                )
+                prior, coverage = (torch.flip(values, (-1,)) for values in (prior, coverage))
             if flip_y:
-                prior, coverage = (
-                    torch.flip(values, (-2,)) for values in (prior, coverage)
-                )
+                prior, coverage = (torch.flip(values, (-2,)) for values in (prior, coverage))
             if rotations:
                 prior, coverage = (
-                    torch.rot90(values, rotations, (-2, -1))
-                    for values in (prior, coverage)
+                    torch.rot90(values, rotations, (-2, -1)) for values in (prior, coverage)
                 )
         composed, violation = self.temporal_prior.compose(
             physical, prior, coverage, target.modality
@@ -903,8 +1042,58 @@ class SentinelV3(nn.Module):
         source: SensorSpec,
         target: SensorSpec,
         output_size: tuple[int, int],
+        base: Tensor | None = None,
     ) -> Tensor:
-        return self.detail_head(pyramid, source.modality, target.modality, output_size)
+        detail = self.detail_head.forward_with_confidence(
+            pyramid,
+            source.modality,
+            target.modality,
+            output_size,
+            base,
+            getattr(self, f"{target.modality}_detail_confidence_threshold"),
+        )[0]
+        if target.modality == "optical" and base is not None:
+            anchor_bands = frequency_bands(base, levels=3)
+            detail = detail + sum(
+                scale * band
+                for scale, band in zip(
+                    self.optical_anchor_band_scales.to(base), anchor_bands, strict=True
+                )
+            )
+        return highpass(detail)
+
+    def deterministic_detail_with_confidence(
+        self,
+        pyramid: Pyramid,
+        source: SensorSpec,
+        target: SensorSpec,
+        output_size: tuple[int, int],
+        base: Tensor | None = None,
+    ) -> tuple[Tensor, tuple[Tensor, ...], Tensor]:
+        return self.detail_head.forward_with_confidence(
+            pyramid,
+            source.modality,
+            target.modality,
+            output_size,
+            base,
+            getattr(self, f"{target.modality}_detail_confidence_threshold"),
+        )
+
+    @torch.no_grad()
+    def set_detail_confidence_threshold(self, modality: str, value: float) -> None:
+        if modality not in {"optical", "sar"} or not 0.0 <= value <= 1.01:
+            raise ValueError("detail confidence threshold must be in [0, 1.01]")
+        getattr(self, f"{modality}_detail_confidence_threshold").fill_(value)
+
+    @torch.no_grad()
+    def set_optical_anchor_band_scales(self, values: Sequence[float]) -> None:
+        if len(values) != 3 or any(not math.isfinite(value) or value < 0.0 for value in values):
+            raise ValueError(
+                "three finite non-negative Optical anchor band scales are required"
+            )
+        self.optical_anchor_band_scales.copy_(
+            torch.tensor(values, device=self.optical_anchor_band_scales.device)
+        )
 
     def flow_velocity(
         self,
@@ -944,6 +1133,78 @@ class SentinelV3(nn.Module):
         if modality not in {"optical", "sar"} or not 0.0 <= value <= 1.0:
             raise ValueError("amplitude scale must be in [0, 1] for optical or sar")
         getattr(self, f"{modality}_alpha_scale").fill_(value)
+
+    @torch.no_grad()
+    def set_optical_texture_amplitude_floor(self, value: float) -> None:
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError("optical texture amplitude floor must be finite and non-negative")
+        self.optical_texture_amplitude_floor.fill_(value)
+
+    def texture_release_gate(self, amplitude: Tensor, target: SensorSpec) -> Tensor:
+        """Release complete 4x4 texture blocks only when their predicted amplitude is sufficient."""
+        if target.modality != "optical":
+            return torch.ones_like(amplitude[:, :1])
+        block_amplitude = amplitude.mean(dim=1, keepdim=True)
+        return (block_amplitude >= self.optical_texture_amplitude_floor).to(amplitude.dtype)
+
+    def texture_release_probability(
+        self, pyramid: Pyramid | Tensor, target: SensorSpec, texture: Tensor
+    ) -> Tensor:
+        if target.modality != "optical":
+            return torch.ones(
+                texture.shape[0],
+                1,
+                texture.shape[-2] // 4,
+                texture.shape[-1] // 4,
+                device=texture.device,
+                dtype=texture.dtype,
+            )
+        descriptors = self.descriptors(target.channels[: texture.shape[1]], texture.device)
+        logits = self.residual_dit.predict_texture_risk_logits(pyramid, descriptors, texture)
+        return torch.sigmoid(logits)
+
+    def shape_residual_texture(
+        self,
+        residual: Tensor,
+        pyramid: Pyramid | Tensor,
+        target: SensorSpec,
+        *,
+        amplitude: Tensor | None = None,
+        apply_release_gate: bool = True,
+    ) -> Tensor:
+        """Apply the same zero-mean, block-RMS and amplitude path used at inference."""
+        channels = residual.shape[1]
+        output_size = tuple(residual.shape[-2:])
+        residual = highpass(residual)
+        if target.modality == "sar":
+            local_mean = F.avg_pool2d(residual, 4, stride=4)
+            residual = residual - F.interpolate(local_mean, size=output_size, mode="nearest")
+        block_rms = F.avg_pool2d(residual.square(), 4, stride=4).sqrt().clamp_min(1e-4)
+        unit = residual / F.interpolate(block_rms, size=output_size, mode="nearest")
+        if amplitude is None:
+            amplitude = self.residual_amplitude(pyramid, target, channels, output_size)
+        amplitude = amplitude * self.texture_release_gate(amplitude, target)
+        residual = highpass(unit) * F.interpolate(amplitude, size=output_size, mode="nearest")
+        if target.modality == "optical" and channels == 3:
+            luminance = residual.mean(dim=1, keepdim=True)
+            chroma = residual - luminance
+            chroma_scale = (
+                0.03 / chroma.abs().amax(dim=1, keepdim=True).clamp_min(1e-6)
+            ).clamp_max(1.0)
+            chroma = chroma * chroma_scale
+            residual = luminance + chroma
+        elif target.modality == "sar":
+            local_mean = F.avg_pool2d(residual, 4, stride=4)
+            residual = residual - F.interpolate(local_mean, size=output_size, mode="nearest")
+        if (
+            apply_release_gate
+            and target.modality == "optical"
+            and float(self.optical_texture_risk_threshold) > 0.0
+        ):
+            probability = self.texture_release_probability(pyramid, target, residual)
+            gate = (probability >= self.optical_texture_risk_threshold).to(residual.dtype)
+            residual = residual * F.interpolate(gate, size=output_size, mode="nearest")
+        return residual
 
     @staticmethod
     def compose_visual(
@@ -990,13 +1251,35 @@ class SentinelV3(nn.Module):
     ) -> Tensor:
         batch, channels, height, width = shape
         generator = torch.Generator(device=next(self.parameters()).device).manual_seed(seed)
-        latent = torch.randn(
+        latent = self.flow_noise_scale(target) * torch.randn(
             (batch, self.config.codec_latent_channels, height // 4, width // 4),
             generator=generator,
             device=next(self.parameters()).device,
             dtype=next(self.parameters()).dtype,
         )
-        steps = steps or self.config.flow_steps
+        latent = self.integrate_flow(
+            latent, pyramid, target, channels, steps=steps or self.config.flow_steps
+        )
+        residual = self.codec.decode(latent, target.modality)
+        return self.shape_residual_texture(residual, pyramid, target)
+
+    def flow_noise_scale(self, target: SensorSpec) -> float:
+        configured = getattr(self.config, f"{target.modality}_flow_noise_scale")
+        return self.config.flow_noise_scale if configured is None else float(configured)
+
+    def integrate_flow(
+        self,
+        latent: Tensor,
+        pyramid: Pyramid | Tensor,
+        target: SensorSpec,
+        channels: int,
+        *,
+        steps: int,
+    ) -> Tensor:
+        """Integrate a residual flow with the same differentiable Heun solver used at inference."""
+        if steps < 1:
+            raise ValueError("flow integration steps must be positive")
+        batch = latent.shape[0]
         dt = 1.0 / steps
         for index in range(steps):
             time = torch.full((batch,), index / steps, device=latent.device, dtype=latent.dtype)
@@ -1007,11 +1290,7 @@ class SentinelV3(nn.Module):
             )
             second = self.flow_velocity(proposal, next_time, pyramid, target, channels)
             latent = latent + 0.5 * dt * (first + second)
-        residual = highpass(self.codec.decode(latent, target.modality))
-        block_rms = F.avg_pool2d(residual.square(), 4, stride=4).sqrt().clamp_min(1e-4)
-        unit = residual / block_rms.repeat_interleave(4, -2).repeat_interleave(4, -1)
-        amplitude = self.residual_amplitude(pyramid, target, channels, (height, width))
-        return highpass(unit) * amplitude.repeat_interleave(4, -2).repeat_interleave(4, -1)
+        return latent
 
     def forward(self, action: str, **kwargs: object) -> object:
         if action == "physical":
@@ -1106,7 +1385,11 @@ class SentinelV3(nn.Module):
         base = physical[:, visual_indices]
         detail = (
             self.deterministic_detail(
-                pyramid, observation.spec, target.spec, tuple(base.shape[-2:])
+                pyramid,
+                observation.spec,
+                target.spec,
+                tuple(base.shape[-2:]),
+                base=base,
             )
             * valid
         )

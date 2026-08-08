@@ -68,12 +68,18 @@ def deterministic_detail_loss(
     active = (weight.sum() > 0).to(prediction.dtype)
     edge = edge * active
     local_structure = local_structure * active
-    total = reconstruction + 0.25 * gradient + 0.2 * edge + 0.1 * local_structure
+    # MAE is the hard deterministic-detail gate; auxiliary terms shape edges without
+    # rewarding a dense hallucinated residual that is worse than the zero baseline.
+    sparsity = masked_mean(prediction.abs(), weight)
+    total = (
+        reconstruction + 0.1 * gradient + 0.03 * edge + 0.02 * local_structure + 0.02 * sparsity
+    )
     return total, {
         "detail_charbonnier": reconstruction.detach(),
         "detail_gradient": gradient.detach(),
         "detail_edge": edge.detach(),
         "detail_ssim": local_structure.detach(),
+        "detail_sparsity": sparsity.detach(),
     }
 
 
@@ -293,12 +299,84 @@ def low_frequency_loss(
     return masked_mean(low.square(), low_mask)
 
 
-def highpass(values: Tensor, block_size: int = 4) -> Tensor:
-    if values.shape[-2] % block_size or values.shape[-1] % block_size:
-        raise ValueError("highpass dimensions must be divisible by block_size")
-    block_mean = F.avg_pool2d(values, block_size, stride=block_size)
-    low = block_mean.repeat_interleave(block_size, -2).repeat_interleave(block_size, -1)
-    return values - low
+def frequency_bands(values: Tensor, levels: int = 3) -> tuple[Tensor, ...]:
+    """Return fine-to-coarse Laplacian bands on the original pixel grid."""
+    if levels < 1:
+        raise ValueError("frequency decomposition needs at least one level")
+    smallest = 2**levels
+    if values.shape[-2] % smallest or values.shape[-1] % smallest:
+        raise ValueError(f"frequency dimensions must be divisible by {smallest}")
+    bands: list[Tensor] = []
+    current = values
+    output_size = values.shape[-2:]
+    for _ in range(levels):
+        low = F.avg_pool2d(current, 2, stride=2)
+        reconstructed = F.interpolate(
+            low, size=current.shape[-2:], mode="bilinear", align_corners=False
+        )
+        band = current - reconstructed
+        bands.append(
+            F.interpolate(band, size=output_size, mode="bilinear", align_corners=False)
+            if band.shape[-2:] != output_size
+            else band
+        )
+        current = low
+    return tuple(bands)
+
+
+def highpass(values: Tensor, block_size: int = 8) -> Tensor:
+    levels = int(math.log2(block_size))
+    if 2**levels != block_size:
+        raise ValueError("highpass block_size must be a power of two")
+    return sum(frequency_bands(values, levels), torch.zeros_like(values))
+
+
+def detail_reliability_target(
+    source: Tensor,
+    target_bands: tuple[Tensor, ...],
+    mask: Tensor,
+) -> Tensor:
+    """Soft oracle used only to teach whether target edges are supported by the source."""
+    source_gray = source.float().mean(dim=1, keepdim=True)
+    source_gray = (
+        source_gray - source_gray.mean(dim=(-2, -1), keepdim=True)
+    ) / source_gray.std(dim=(-2, -1), keepdim=True).clamp_min(1e-3)
+    source_dy, source_dx = gradients(source_gray)
+    source_energy = F.pad(source_dx.abs(), (0, 1, 0, 0)) + F.pad(source_dy.abs(), (0, 0, 0, 1))
+    source_energy = source_energy / source_energy.mean(dim=(-2, -1), keepdim=True).clamp_min(
+        1e-3
+    )
+    targets = []
+    for level, band in enumerate(target_bands):
+        target_energy = band.float().abs().mean(dim=1, keepdim=True)
+        target_energy = target_energy / target_energy.mean(
+            dim=(-2, -1), keepdim=True
+        ).clamp_min(1e-4)
+        scale = 2**level
+        support = torch.minimum(source_energy, target_energy).clamp(0.0, 2.0) / 2.0
+        if scale > 1:
+            support = F.avg_pool2d(support, scale, stride=scale)
+            support = F.interpolate(
+                support, size=mask.shape[-2:], mode="bilinear", align_corners=False
+            )
+        support = F.avg_pool2d(support * mask, 4, stride=4)
+        targets.append(support.clamp(0.0, 1.0))
+    return torch.cat(targets, dim=1)
+
+
+def texture_reliability_gate(
+    source: Tensor,
+    texture: Tensor,
+    mask: Tensor,
+    *,
+    threshold: Tensor | float,
+) -> tuple[Tensor, Tensor]:
+    """Return source-supported texture reliability and a binary 4x4 release gate."""
+    reliability = detail_reliability_target(
+        source, frequency_bands(texture, levels=3), mask
+    ).mean(dim=1, keepdim=True)
+    cutoff = torch.as_tensor(threshold, device=reliability.device, dtype=reliability.dtype)
+    return reliability, (reliability >= cutoff).to(reliability.dtype)
 
 
 def deterministic_detail_target(

@@ -1,0 +1,32 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  temporal_prior_shards: /data/sentinel_translate/data/shards_v32_temporal_prior/index.json
+  hf_eligibility: /data/sentinel_translate/data/shards_v32_hf_eligibility.json
+
+model:
+  flow_noise_scale: 0.35
+  optical_flow_noise_scale: 0.05
+  sar_flow_noise_scale: 0.35
+
+train:
+  stage: flow
+  max_steps: 2
+  batch_size: 8
+  num_workers: 2
+  learning_rate: 0.0001
+  flow_visual_pixel_weight: 0.05
+  flow_visual_hf_weight: 0.05
+  flow_visual_perceptual_weight: 0.025
+  flow_rollout_every: 1
+  flow_rollout_steps: 2
+  flow_rollout_samples: 2
+  flow_rollout_pixel_weight: 0.1
+  flow_rollout_hf_weight: 0.1
+  warmup_steps: 1
+  log_every: 1
+  validate_every: 1000
+  save_every: 1000
+  require_detail_gate: false
+
+validation:
+  enabled: false

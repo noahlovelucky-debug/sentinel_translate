@@ -1,0 +1,23 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  temporal_prior_shards: /data/sentinel_translate/data/shards_v32_temporal_prior/index.json
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_frequency_bridge
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_frequency_bridge
+
+model:
+  flow_noise_scale: 0.35
+
+train:
+  stage: detail
+  max_steps: 20000
+  batch_size: 16
+  num_workers: 4
+  learning_rate: 0.0001
+  warmup_steps: 1000
+  validate_every: 1000
+  full_validate_every: 5000
+  save_every: 1000
+  early_stop_patience: 5
+
+validation:
+  full_steps: [5000, 10000, 15000, 20000]

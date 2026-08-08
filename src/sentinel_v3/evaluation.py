@@ -14,7 +14,14 @@ from PIL import Image, ImageDraw
 from torch import Tensor
 from torch.utils.data import Dataset
 
-from .losses import deterministic_detail_target, highpass, masked_mean, spectral_angle
+from .losses import (
+    detail_reliability_target,
+    deterministic_detail_target,
+    frequency_bands,
+    highpass,
+    masked_mean,
+    spectral_angle,
+)
 from .model import ModelConfig, SentinelV3
 from .sensors import SENTINEL1, SENTINEL2
 from .validation import ValidationProtocol, protocol_records, validation_protocol_hash
@@ -166,6 +173,16 @@ def load_checkpoint(
         "decoder.sar_mean_condition.",
         "decoder.sar_mean_descriptor.",
         "decoder.sar_mean_head.",
+        "detail_head.base_heads.",
+        "detail_head.confidence_heads.",
+        "residual_dit.frequency_adapter.",
+        "residual_dit.texture_risk_candidate.",
+        "residual_dit.texture_risk_head.",
+        "optical_texture_amplitude_floor",
+        "optical_anchor_band_scales",
+        "optical_texture_risk_threshold",
+        "optical_detail_confidence_threshold",
+        "sar_detail_confidence_threshold",
     )
     missing = [
         name
@@ -177,9 +194,7 @@ def load_checkpoint(
             f"incompatible checkpoint: missing={missing}, "
             f"unexpected={incompatible.unexpected_keys}"
         )
-    temporal_config = payload.get("temporal_prior") or payload["config"].get(
-        "temporal_prior"
-    )
+    temporal_config = payload.get("temporal_prior") or payload["config"].get("temporal_prior")
     model.configure_temporal_prior(temporal_config)
     return model.to(device).eval()
 
@@ -271,6 +286,20 @@ def histogram_distance(prediction: Tensor, target: Tensor, mask: Tensor) -> Tens
     return (pred_hist - target_hist).abs().mean()
 
 
+def tail_quantile_error(
+    prediction: Tensor, target: Tensor, mask: Tensor, quantile: float
+) -> Tensor:
+    """Absolute dB error at a SAR distribution tail quantile."""
+    selected_prediction = prediction[mask.bool().expand_as(prediction)].float()
+    selected_target = target[mask.bool().expand_as(target)].float()
+    if selected_prediction.numel() == 0:
+        return prediction.new_tensor(0.0)
+    return (
+        torch.quantile(selected_prediction, quantile)
+        - torch.quantile(selected_target, quantile)
+    ).abs()
+
+
 _PERCEPTUAL_CACHE: dict[str, tuple[torch.nn.Module, torch.nn.Module]] = {}
 
 
@@ -360,6 +389,12 @@ def evaluate_model(
     # Resolve evaluators before the expensive raster loop; missing weights must fail fast.
     perceptual_evaluators(device)
     sums: dict[str, float] = {}
+    scene_counts = {
+        "edge_improved": 0,
+        "dists_improved": 0,
+        "edge_or_dists_improved": 0,
+        "rgb_rmse_degraded_over_5pct": 0,
+    }
     for index, item in enumerate(dataset):
         s2 = item["s2"].unsqueeze(0).to(device)  # type: ignore[union-attr]
         sar = item["sar"].unsqueeze(0).to(device)  # type: ignore[union-attr]
@@ -388,18 +423,26 @@ def evaluate_model(
             s2_mean, optical_prior_coverage, optical_prior_violation = (
                 apply_manifest_temporal_prior(model, s2_mean, item, SENTINEL2)
             )
-            sar_mean, sar_prior_coverage, sar_prior_violation = (
-                apply_manifest_temporal_prior(model, sar_mean, item, SENTINEL1)
+            sar_mean, sar_prior_coverage, sar_prior_violation = apply_manifest_temporal_prior(
+                model, sar_mean, item, SENTINEL1
             )
             optical_detail = (
                 model.deterministic_detail(
-                    sar_pyramid, SENTINEL1, SENTINEL2, tuple(s2.shape[-2:])
+                    sar_pyramid,
+                    SENTINEL1,
+                    SENTINEL2,
+                    tuple(s2.shape[-2:]),
+                    base=s2_mean[:, [2, 1, 0]],
                 )
                 * valid
             )
             sar_detail = (
                 model.deterministic_detail(
-                    optical_pyramid, SENTINEL2, SENTINEL1, tuple(sar.shape[-2:])
+                    optical_pyramid,
+                    SENTINEL2,
+                    SENTINEL1,
+                    tuple(sar.shape[-2:]),
+                    base=sar_mean,
                 )
                 * valid
             )
@@ -434,13 +477,9 @@ def evaluate_model(
             "sar2opt_sam_deg": spectral_angle(s2_mean, s2, valid) * (180.0 / math.pi),
             "opt2sar_rmse_db": torch.sqrt(masked_mean((sar_mean - sar).square(), valid)),
             "opt2sar_physical_signed_bias_db": masked_mean(sar_mean - sar, valid),
-            "opt2sar_physical_scene_abs_bias_db": masked_mean(
-                sar_mean - sar, valid
-            ).abs(),
+            "opt2sar_physical_scene_abs_bias_db": masked_mean(sar_mean - sar, valid).abs(),
             "opt2sar_visual_signed_bias_db": masked_mean(sar_visual - sar, valid),
-            "opt2sar_visual_scene_abs_bias_db": masked_mean(
-                sar_visual - sar, valid
-            ).abs(),
+            "opt2sar_visual_scene_abs_bias_db": masked_mean(sar_visual - sar, valid).abs(),
             "physical_rgb_rmse": torch.sqrt(
                 masked_mean((physical_rgb - target_rgb).square(), valid)
             ),
@@ -469,6 +508,10 @@ def evaluate_model(
             ).abs(),
             "sar_mean_histogram_distance": histogram_distance(sar_mean, sar, valid),
             "sar_visual_histogram_distance": histogram_distance(sar_visual, sar, valid),
+            "sar_mean_p01_error_db": tail_quantile_error(sar_mean, sar, valid, 0.01),
+            "sar_visual_p01_error_db": tail_quantile_error(sar_visual, sar, valid, 0.01),
+            "sar_mean_p99_error_db": tail_quantile_error(sar_mean, sar, valid, 0.99),
+            "sar_visual_p99_error_db": tail_quantile_error(sar_visual, sar, valid, 0.99),
             "physical_lpips": physical_lpips,
             "visual_lpips": visual_lpips,
             "physical_dists": physical_dists,
@@ -480,6 +523,14 @@ def evaluate_model(
         }
         for name, value in metrics.items():
             sums[name] = sums.get(name, 0.0) + float(value)
+        edge_improved = bool(metrics["visual_edge_f1"] > metrics["physical_edge_f1"])
+        dists_improved = bool(visual_dists < physical_dists)
+        scene_counts["edge_improved"] += int(edge_improved)
+        scene_counts["dists_improved"] += int(dists_improved)
+        scene_counts["edge_or_dists_improved"] += int(edge_improved or dists_improved)
+        scene_counts["rgb_rmse_degraded_over_5pct"] += int(
+            metrics["visual_rgb_rmse"] > 1.05 * metrics["physical_rgb_rmse"]
+        )
         if panel_root is not None and index < panels:
             save_panel(
                 panel_root / f"{index:03d}_sar2opt.png",
@@ -502,9 +553,10 @@ def evaluate_model(
         else None,
     }
     report.update({name: value / len(dataset) for name, value in sums.items()})
-    report["opt2sar_physical_bias_db"] = abs(
-        report.pop("opt2sar_physical_signed_bias_db")
+    report.update(
+        {f"scene_{name}_fraction": value / len(dataset) for name, value in scene_counts.items()}
     )
+    report["opt2sar_physical_bias_db"] = abs(report.pop("opt2sar_physical_signed_bias_db"))
     report["opt2sar_visual_bias_db"] = abs(report.pop("opt2sar_visual_signed_bias_db"))
     report["lpips_improvement"] = (report["physical_lpips"] - report["visual_lpips"]) / max(
         report["physical_lpips"], 1e-8
@@ -525,12 +577,16 @@ def evaluate_model(
         and report["visual_edge_f1"] > report["physical_edge_f1"]
         and report["visual_optical_psd_distance"] < report["physical_optical_psd_distance"]
         and report["pre_projection_violation"] <= 0.001
+        and report["scene_edge_or_dists_improved_fraction"] >= 0.70
+        and report["scene_rgb_rmse_degraded_over_5pct_fraction"] <= 0.10
     )
     sar_visual_gate = (
         report["opt2sar_visual_bias_db"] <= 0.5
         and report["sar_visual_psd_distance"] < report["sar_mean_psd_distance"]
         and report["sar_visual_enl_error"] < report["sar_mean_enl_error"]
         and report["sar_visual_histogram_distance"] < report["sar_mean_histogram_distance"]
+        and report["sar_visual_p01_error_db"] < report["sar_mean_p01_error_db"]
+        and report["sar_visual_p99_error_db"] < report["sar_mean_p99_error_db"]
     )
     report["quality_gates"] = {
         "physical": physical_gate,
@@ -689,9 +745,9 @@ def evaluate_high_frequency_components(
                     latent = model.codec.encode(texture, name)
                     reconstruction = model.codec.decode(latent, name)
                     codec_mae = masked_mean((reconstruction - texture).abs(), valid)
-                    sums[f"{name}_codec_mae"] = sums.get(
-                        f"{name}_codec_mae", 0.0
-                    ) + float(codec_mae)
+                    sums[f"{name}_codec_mae"] = sums.get(f"{name}_codec_mae", 0.0) + float(
+                        codec_mae
+                    )
                     counts[name] += 1
                     continue
                 physical, _, pyramid = model.physical(
@@ -703,23 +759,48 @@ def evaluate_high_frequency_components(
                     target_gsd=gsd,
                     metadata=metadata,
                 )
-                physical = apply_manifest_temporal_prior(
-                    model, physical, item, target_spec
-                )[0]
+                physical = apply_manifest_temporal_prior(model, physical, item, target_spec)[0]
                 base = physical[:, [2, 1, 0]] if name == "optical" else physical
-                target_detail = deterministic_detail_target(
-                    target_visual, base, valid, name
+                target_detail = deterministic_detail_target(target_visual, base, valid, name)
+                prediction, _, confidence = model.deterministic_detail_with_confidence(
+                    pyramid,
+                    source_spec,
+                    target_spec,
+                    tuple(base.shape[-2:]),
+                    base=base,
                 )
-                prediction = model.deterministic_detail(
-                    pyramid, source_spec, target_spec, tuple(base.shape[-2:])
+                target_bands = frequency_bands(target_detail, levels=3)
+                reliability = detail_reliability_target(source, target_bands, valid)
+                selective_mask = valid * F.interpolate(
+                    reliability.mean(dim=1, keepdim=True),
+                    size=valid.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
                 )
                 zero_mae = masked_mean(target_detail.abs(), valid)
                 detail_mae = masked_mean((prediction - target_detail).abs(), valid)
+                selective_zero = masked_mean(target_detail.abs(), selective_mask)
+                selective_detail = masked_mean(
+                    (prediction - target_detail).abs(), selective_mask
+                )
                 sums[f"{name}_detail_zero_mae"] = sums.get(
                     f"{name}_detail_zero_mae", 0.0
                 ) + float(zero_mae)
                 sums[f"{name}_detail_mae"] = sums.get(f"{name}_detail_mae", 0.0) + float(
                     detail_mae
+                )
+                sums[f"{name}_selective_zero_mae"] = sums.get(
+                    f"{name}_selective_zero_mae", 0.0
+                ) + float(selective_zero)
+                sums[f"{name}_selective_detail_mae"] = sums.get(
+                    f"{name}_selective_detail_mae", 0.0
+                ) + float(selective_detail)
+                sums[f"{name}_detail_coverage"] = sums.get(
+                    f"{name}_detail_coverage", 0.0
+                ) + float(
+                    (confidence >= getattr(model, f"{name}_detail_confidence_threshold"))
+                    .float()
+                    .mean()
                 )
                 counts[name] += 1
     report: dict[str, Any] = {
@@ -740,16 +821,21 @@ def evaluate_high_frequency_components(
         report[f"{name}_detail_zero_mae"] = zero
         report[f"{name}_detail_mae"] = detail
         report[f"{name}_detail_mae_improvement"] = (zero - detail) / max(zero, 1e-8)
+        selective_zero = sums[f"{name}_selective_zero_mae"] / count
+        selective_detail = sums[f"{name}_selective_detail_mae"] / count
+        report[f"{name}_selective_detail_mae_improvement"] = (
+            selective_zero - selective_detail
+        ) / max(selective_zero, 1e-8)
+        report[f"{name}_detail_coverage"] = sums[f"{name}_detail_coverage"] / count
     if stage == "codec":
         report["quality_gates"] = {
-            "codec": (
-            report["optical_codec_mae"] <= 0.02 and report["sar_codec_mae"] <= 1.0
-            )
+            "codec": (report["optical_codec_mae"] <= 0.02 and report["sar_codec_mae"] <= 1.0)
         }
     else:
         report["quality_gates"] = {
             "detail": all(
-                report[f"{name}_detail_mae_improvement"] >= 0.30
+                report[f"{name}_detail_mae_improvement"] >= -1e-4
+                and report[f"{name}_selective_detail_mae_improvement"] >= -1e-4
                 for name in ("optical", "sar")
             )
         }

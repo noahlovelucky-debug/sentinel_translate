@@ -1,0 +1,67 @@
+{
+  "split": "validation_temporal",
+  "samples": 463,
+  "protocol_hash": "891d34fe1e507ce66b8f6d7f93d096ad911f77112ad57fe22611c8ec4b46594b",
+  "sar2opt_rmse": 0.038236941734465374,
+  "sar2opt_sam_deg": 5.595739679254157,
+  "opt2sar_rmse_db": 4.875651498816238,
+  "opt2sar_physical_bias_db": 0.15233680758359752,
+  "opt2sar_scene_abs_bias_db": 0.8387993743148336,
+  "slices": {
+    "delta_days": {
+      "0": {
+        "samples": 97,
+        "sar2opt_rmse": 0.04132350450303577,
+        "sar2opt_sam_deg": 6.513940668597664,
+        "opt2sar_rmse_db": 5.0646549390164415,
+        "opt2sar_physical_bias_db": 0.0694116161003248,
+        "opt2sar_scene_abs_bias_db": 0.9825817450458548
+      },
+      "1": {
+        "samples": 155,
+        "sar2opt_rmse": 0.03681973821638622,
+        "sar2opt_sam_deg": 5.446687303050872,
+        "opt2sar_rmse_db": 4.830514164938349,
+        "opt2sar_physical_bias_db": 0.1747289545173126,
+        "opt2sar_scene_abs_bias_db": 0.754938135133876
+      },
+      "3": {
+        "samples": 82,
+        "sar2opt_rmse": 0.0356198804198938,
+        "sar2opt_sam_deg": 4.767472168294395,
+        "opt2sar_rmse_db": 4.689967525420731,
+        "opt2sar_physical_bias_db": 0.2541935140403306,
+        "opt2sar_scene_abs_bias_db": 0.6635509615809452
+      },
+      "2": {
+        "samples": 129,
+        "sar2opt_rmse": 0.03909074481882847,
+        "sar2opt_sam_deg": 5.6108990454858585,
+        "opt2sar_rmse_db": 4.900482654442533,
+        "opt2sar_physical_bias_db": 0.2274264540422217,
+        "opt2sar_scene_abs_bias_db": 0.9428456685498587
+      }
+    },
+    "orbit": {
+      "descending": {
+        "samples": 174,
+        "sar2opt_rmse": 0.03648864555028505,
+        "sar2opt_sam_deg": 5.0122777312651445,
+        "opt2sar_rmse_db": 4.688505761414366,
+        "opt2sar_physical_bias_db": 0.19800585307095242,
+        "opt2sar_scene_abs_bias_db": 0.9803952436851359
+      },
+      "ascending": {
+        "samples": 289,
+        "sar2opt_rmse": 0.03925201165150842,
+        "sar2opt_sam_deg": 5.947028187731971,
+        "opt2sar_rmse_db": 4.984940153400985,
+        "opt2sar_physical_bias_db": 0.12484056566387518,
+        "opt2sar_scene_abs_bias_db": 0.7535478820295998
+      }
+    }
+  },
+  "quality_gates": {
+    "physical": true
+  }
+}

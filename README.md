@@ -1,5 +1,8 @@
 # Sentinel Translate V3.2
 
+> 当前完整中文技术说明、模型框架、监督标签、训练流程、真实指标和可视化：
+> [docs/V32_CURRENT_PIPELINE_ZH.md](docs/V32_CURRENT_PIPELINE_ZH.md)
+
 V3.2 separates low-error deterministic translation from predictable detail and stochastic
 texture. It is an independent repository at `/data/code/sentinel_translat/v3.2`; V3.1 and
 V3.1.1 checkpoints are never modified.
@@ -84,6 +87,22 @@ balance 5k. Run the 64-patch connectivity test first:
 ```bash
 bash scripts/connectivity_64.sh
 ```
+
+Before detail/flow, build the train-only leave-one-out temporal-prior sidecars once. Each source
+pair is aggregated at full-tile resolution and then cropped to exactly the windows recorded in
+the immutable training shards. This keeps GeoTIFF access outside the optimizer loop and stores
+float16 priors plus coverage masks; reruns reuse completed sidecars.
+
+```bash
+PYTHONPATH=src python scripts/precompute_temporal_prior_shards.py \
+  --shard-index /data/sentinel_translate/data/shards_v2/train/index.json \
+  --manifest /data/sentinel_translate/data/manifests/pairs.jsonl \
+  --output /data/sentinel_translate/data/shards_v32_temporal_prior \
+  --workers 8
+```
+
+The DataLoader verifies every sidecar's pair IDs and windows against its source shard, and applies
+the exact same flip/rotation augmentation to imagery, prior, and coverage mask.
 
 The full eight-GPU launcher resumes each stage automatically. It stops after the 1k and 5k
 pilots unless automated checks and explicit manual panel review pass:

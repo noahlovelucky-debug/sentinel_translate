@@ -3,6 +3,7 @@ from __future__ import annotations
 import bisect
 import json
 import math
+from datetime import date
 from pathlib import Path
 
 import torch
@@ -102,6 +103,25 @@ class V2ShardDataset(Dataset[dict[str, object]]):
 
     def __len__(self) -> int:
         return self.total
+
+    def high_frequency_shard_indices(self) -> list[int]:
+        if self.prior_shards is None:
+            return list(range(len(self.shards)))
+        eligible = []
+        for index, shard in enumerate(self.prior_shards):
+            parts = str(shard.get("pair_id", "")).split(":")
+            try:
+                year = int(parts[0])
+                delta_days = abs(
+                    (date.fromisoformat(parts[-1]) - date.fromisoformat(parts[-3])).days
+                )
+            except (ValueError, IndexError):
+                continue
+            if year in {2017, 2018} and delta_days <= 1:
+                eligible.append(index)
+        if not eligible:
+            raise RuntimeError("no delta-t <= 1 training shards are available")
+        return eligible
 
     def _load(
         self, index: int
@@ -292,19 +312,34 @@ class V2ShardDataset(Dataset[dict[str, object]]):
 
 class StatefulShardSampler(Sampler[int]):
     def __init__(
-        self, dataset: V2ShardDataset, *, replicas: int = 1, rank: int = 0, seed: int = 42
+        self,
+        dataset: V2ShardDataset,
+        *,
+        replicas: int = 1,
+        rank: int = 0,
+        seed: int = 42,
+        high_frequency_only: bool = False,
     ) -> None:
         self.dataset = dataset
         self.replicas = replicas
         self.rank = rank
         self.seed = seed
+        self.shard_indices = (
+            dataset.high_frequency_shard_indices()
+            if high_frequency_only
+            else list(range(len(dataset.shards)))
+        )
         self.epoch = 0
         self.offset = 0
-        self.num_samples = (len(dataset) + replicas - 1) // replicas
+        eligible_samples = sum(
+            int(dataset.shards[index]["count"]) for index in self.shard_indices
+        )
+        self.num_samples = (eligible_samples + replicas - 1) // replicas
 
     def _indices(self) -> list[int]:
         generator = torch.Generator().manual_seed(self.seed + self.epoch)
-        shard_order = torch.randperm(len(self.dataset.shards), generator=generator).tolist()
+        order = torch.randperm(len(self.shard_indices), generator=generator).tolist()
+        shard_order = [self.shard_indices[index] for index in order]
         indices: list[int] = []
         for shard_index in shard_order[self.rank :: self.replicas]:
             start = 0 if shard_index == 0 else self.dataset.ends[shard_index - 1]
@@ -317,6 +352,54 @@ class StatefulShardSampler(Sampler[int]):
             repeats = (self.num_samples + len(indices) - 1) // len(indices)
             indices = (indices * repeats)[: self.num_samples]
         return indices[: self.num_samples]
+
+    def __iter__(self):
+        indices = self._indices()
+        for position in range(self.offset, len(indices)):
+            self.offset = position + 1
+            yield indices[position]
+        self.epoch += 1
+        self.offset = 0
+
+    def __len__(self) -> int:
+        return self.num_samples
+
+    def state_dict(self) -> dict[str, int]:
+        return {"epoch": self.epoch, "offset": self.offset}
+
+    def load_state_dict(self, state: dict[str, int]) -> None:
+        self.epoch = int(state["epoch"])
+        self.offset = int(state["offset"])
+
+
+class StatefulIndexSampler(Sampler[int]):
+    """Distributed resumable sampler over an audited subset of dataset indices."""
+
+    def __init__(
+        self,
+        indices: list[int],
+        *,
+        replicas: int = 1,
+        rank: int = 0,
+        seed: int = 42,
+    ) -> None:
+        if not indices:
+            raise ValueError("audited sampler requires at least one eligible index")
+        self.indices = indices
+        self.replicas = replicas
+        self.rank = rank
+        self.seed = seed
+        self.epoch = 0
+        self.offset = 0
+        self.num_samples = (len(indices) + replicas - 1) // replicas
+
+    def _indices(self) -> list[int]:
+        generator = torch.Generator().manual_seed(self.seed + self.epoch)
+        order = torch.randperm(len(self.indices), generator=generator).tolist()
+        total_size = self.num_samples * self.replicas
+        if len(order) < total_size:
+            order.extend(order[: total_size - len(order)])
+        return [self.indices[position] for position in order[self.rank : total_size : self.replicas]]
 
     def __iter__(self):
         indices = self._indices()
