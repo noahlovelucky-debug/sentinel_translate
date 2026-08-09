@@ -8,11 +8,35 @@ REPORTS=${REPORTS:-$ROOT/reports_v32_canonical_2017_2024}
 PHYSICAL_SOURCE=${PHYSICAL_SOURCE:-/data/code/sentinel_translat/v3.2/checkpoints_v32_temporal/best_physical.pt}
 LOGS=$OUTPUT/logs
 BOOTSTRAP=$OUTPUT/bootstrap
+TRAIN_INDEX=$DATASET/shards/train/index.json
+MANIFEST=$DATASET/manifests/pairs.jsonl
+HF_ELIGIBILITY=$DATASET/hf_eligibility.json
+TEMPORAL_PRIOR_INDEX=$DATASET/temporal_prior/index.json
 
 export PYTHONPATH=$ROOT/src
-export TMPDIR=$DATASET/.tmp_training
+export TMPDIR=${TRAIN_TMPDIR:-/dev/shm/sentinel_v32_canonical_2017_2024_${UID}}
 export PYTHONUNBUFFERED=1
 mkdir -p "$OUTPUT" "$REPORTS" "$LOGS" "$BOOTSTRAP" "$TMPDIR"
+
+for required in "$TRAIN_INDEX" "$MANIFEST" "$HF_ELIGIBILITY" "$TEMPORAL_PRIOR_INDEX"; do
+  if [[ ! -f "$required" ]]; then
+    echo "[$(date -Is)] ERROR missing required canonical data artifact: $required" >&2
+    exit 1
+  fi
+done
+python - "$HF_ELIGIBILITY" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+try:
+    with open(path, encoding="utf-8") as handle:
+        eligibility = json.load(handle)
+except (OSError, json.JSONDecodeError) as error:
+    raise SystemExit(f"invalid HF eligibility sidecar {path}: {error}")
+if eligibility.get("registration_audited") is not True:
+    raise SystemExit(f"HF eligibility sidecar is not registration audited: {path}")
+PY
 
 stage_config() {
   case "$1" in

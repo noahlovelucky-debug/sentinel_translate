@@ -12,6 +12,7 @@ from sentinel_v3.calibration import (
 from sentinel_v3.data import StatefulIndexSampler, StatefulShardSampler, V2ShardDataset
 from sentinel_v3.evaluation import tail_quantile_error
 from sentinel_v3.losses import (
+    codec_reconstruction_loss,
     deterministic_detail_target,
     frequency_bands,
     high_frequency_loss,
@@ -84,6 +85,42 @@ def test_sar_frequency_loss_is_finite() -> None:
     loss, metrics = high_frequency_loss(prediction, target, torch.ones(2, 1, 32, 32), "sar")
     assert torch.isfinite(loss)
     assert "speckle_scale" in metrics
+
+
+@pytest.mark.parametrize("near_constant", (False, True))
+def test_codec_sar_loss_has_finite_backward_for_constant_local_variance(
+    near_constant: bool,
+) -> None:
+    prediction = torch.full((2, 2, 32, 32), -18.0)
+    target = torch.full_like(prediction, -18.0)
+    if near_constant:
+        perturbation = torch.zeros_like(prediction)
+        perturbation[..., 8, 9] = 1e-4
+        prediction = prediction + perturbation
+        target = target - perturbation
+    prediction.requires_grad_()
+
+    loss, metrics = codec_reconstruction_loss(
+        prediction, target, torch.ones(2, 1, 32, 32), "sar"
+    )
+    assert bool(torch.isfinite(loss))
+    assert all(bool(torch.isfinite(value)) for value in metrics.values())
+    loss.backward()
+    assert prediction.grad is not None
+    assert bool(torch.isfinite(prediction.grad).all())
+
+
+def test_codec_sar_loss_bfloat16_constant_input_has_finite_backward() -> None:
+    prediction = torch.full((2, 2, 32, 32), -18.0, dtype=torch.bfloat16, requires_grad=True)
+    target = torch.full_like(prediction, -18.0)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss, _ = codec_reconstruction_loss(
+            prediction, target, torch.ones(2, 1, 32, 32), "sar"
+        )
+    assert bool(torch.isfinite(loss))
+    loss.backward()
+    assert prediction.grad is not None
+    assert bool(torch.isfinite(prediction.grad).all())
 
 
 def test_frequency_loss_has_finite_gradient_at_zero_spectrum() -> None:

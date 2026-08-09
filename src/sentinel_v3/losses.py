@@ -189,8 +189,11 @@ def codec_reconstruction_loss(
     prediction: Tensor, target: Tensor, mask: Tensor, modality: str
 ) -> tuple[Tensor, dict[str, Tensor]]:
     scale = 0.08 if modality == "optical" else 4.0
-    prediction = prediction / scale
-    target = target / scale
+    # Codec loss terms include centered local variance. Keep that arithmetic in
+    # FP32 so near-constant SAR patches retain a finite derivative at zero.
+    prediction = prediction.float() / scale
+    target = target.float() / scale
+    mask = mask.float()
     reconstruction = masked_mean(charbonnier(prediction - target), mask)
     pred_dy, pred_dx = gradients(prediction)
     target_dy, target_dx = gradients(target)
@@ -221,7 +224,10 @@ def codec_reconstruction_loss(
             F.avg_pool2d(target.square(), 9, 1, 4) - F.avg_pool2d(target, 9, 1, 4).square()
         )
         variance = masked_mean(
-            (pred_variance.clamp_min(0).sqrt() - target_variance.clamp_min(0).sqrt()).abs(),
+            (
+                torch.sqrt(pred_variance.clamp_min(0.0) + 1e-6)
+                - torch.sqrt(target_variance.clamp_min(0.0) + 1e-6)
+            ).abs(),
             mask,
         )
         total = total + 0.2 * variance
