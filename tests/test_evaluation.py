@@ -131,6 +131,9 @@ def test_id_bridge_extensions_are_optional_for_legacy_v4_checkpoints(
         "phase_transport_gain_caps",
         "phase_transport_offset_caps_px",
         "phase_transport_initial_gate",
+        "phase_transport_null_calibrated",
+        "phase_transport_null_quantile",
+        "phase_transport_support_epsilon",
     ):
         legacy_config.pop(name)
     checkpoint = tmp_path / "legacy_v4_without_id_bridge.pt"

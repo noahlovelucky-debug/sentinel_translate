@@ -168,6 +168,16 @@ def validate_config(config: dict[str, Any]) -> None:
     if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
         raise ValueError("model.phase_transport_initial_gate must be finite and in (0, 1)")
     model["phase_transport_initial_gate"] = initial_gate
+    if not isinstance(model["phase_transport_null_calibrated"], bool):
+        raise TypeError("model.phase_transport_null_calibrated must be a bool")
+    null_quantile = float(model["phase_transport_null_quantile"])
+    if not math.isfinite(null_quantile) or not 0.0 < null_quantile < 1.0:
+        raise ValueError("model.phase_transport_null_quantile must be finite and in (0, 1)")
+    model["phase_transport_null_quantile"] = null_quantile
+    support_epsilon = float(model["phase_transport_support_epsilon"])
+    if not math.isfinite(support_epsilon) or support_epsilon <= 0.0:
+        raise ValueError("model.phase_transport_support_epsilon must be finite and positive")
+    model["phase_transport_support_epsilon"] = support_epsilon
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:
             raise ValueError(f"model.{name} must be non-negative")

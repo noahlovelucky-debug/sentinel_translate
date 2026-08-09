@@ -14,6 +14,7 @@ from sentinel_v3.config import load_config, validate_config
 from sentinel_v3.losses import (
     anchor_gain_target,
     cross_modal_identifiability_target,
+    frequency_bands,
     haar_dwt2,
     haar_idwt2,
     haar_packet_dwt2,
@@ -68,6 +69,9 @@ def _haar_model(
     phase_transport_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1),
     phase_transport_offset_caps_px: tuple[float, float, float] = (0.5, 0.5, 0.5),
     phase_transport_initial_gate: float = 0.02,
+    phase_transport_null_calibrated: bool = False,
+    phase_transport_null_quantile: float = 0.75,
+    phase_transport_support_epsilon: float = 0.01,
 ) -> SentinelV3:
     return SentinelV3(
         ModelConfig(
@@ -99,6 +103,9 @@ def _haar_model(
             phase_transport_gain_caps=phase_transport_gain_caps,
             phase_transport_offset_caps_px=phase_transport_offset_caps_px,
             phase_transport_initial_gate=phase_transport_initial_gate,
+            phase_transport_null_calibrated=phase_transport_null_calibrated,
+            phase_transport_null_quantile=phase_transport_null_quantile,
+            phase_transport_support_epsilon=phase_transport_support_epsilon,
         )
     )
 
@@ -228,6 +235,12 @@ def test_phase_transport_config_ranges_and_configs() -> None:
         ModelConfig(phase_transport_initial_gate=0.0)
     with pytest.raises(ValueError, match=r"\(0, 1\)"):
         ModelConfig(phase_transport_initial_gate=float("inf"))
+    with pytest.raises(TypeError, match="null_calibrated"):
+        ModelConfig(phase_transport_null_calibrated=1)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="null_quantile"):
+        ModelConfig(phase_transport_null_quantile=1.0)
+    with pytest.raises(ValueError, match="support_epsilon"):
+        ModelConfig(phase_transport_support_epsilon=0.0)
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_hf_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_hf_weight"):
@@ -242,6 +255,10 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["model"]["phase_transport_initial_gate"] = 1.0
     with pytest.raises(ValueError, match="phase_transport_initial_gate"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_null_quantile"] = 0.0
+    with pytest.raises(ValueError, match="phase_transport_null_quantile"):
         validate_config(config)
 
     root = Path(__file__).parents[1] / "configs"
@@ -281,6 +298,33 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     assert pilot["train"]["validate_every"] == 250
     assert pilot["train"]["save_every"] == 250
     assert pilot["validation"]["full_steps"] == []
+
+
+def test_null_calibrated_phase_transport_configs() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "smoke_phase_transport_nc.yaml",
+        "phase_transport_nc_connectivity.yaml",
+        "phase_transport_nc_pilot.yaml",
+    )
+    expected_steps = (2, 100, 1000)
+    for name, steps in zip(names, expected_steps, strict=True):
+        config = load_config(root / name)
+        model = config["model"]
+        train = config["train"]
+        assert train["stage"] == "phase_transport"
+        assert train["max_steps"] == steps
+        assert train["phase_transport_utility_weight"] == pytest.approx(0.25)
+        assert train["phase_transport_hf_weight"] == pytest.approx(0.05)
+        assert train["flow_visual_perceptual_weight"] == pytest.approx(0.10)
+        assert train["find_unused_parameters"] is False
+        assert model["phase_transport_null_calibrated"] is True
+        assert model["phase_transport_null_quantile"] == pytest.approx(0.75)
+        assert model["phase_transport_support_epsilon"] == pytest.approx(0.01)
+        assert config["paths"]["output"].endswith("_v4")
+        assert config["paths"]["reports"].endswith("_v4")
+    assert load_config(root / names[0])["validation"]["enabled"] is False
+    assert load_config(root / names[-1])["validation"]["full_steps"] == []
 
 
 def test_phase_identifiability_target_is_oriented_masked_and_scale_invariant() -> None:
@@ -684,6 +728,9 @@ def test_observable_phase_transport_is_bounded_and_preserves_the_protected_ancho
     assert metadata["phase_transport_gain_caps"] == (0.5, 0.25, 0.1)
     assert metadata["phase_transport_offset_caps_px"] == (0.5, 0.25, 0.125)
     assert metadata["phase_transport_initial_gate"] == pytest.approx(0.02)
+    assert metadata["phase_transport_null_calibrated"] is False
+    assert metadata["phase_transport_null_quantile"] == pytest.approx(0.75)
+    assert metadata["phase_transport_support_epsilon"] == pytest.approx(0.01)
     anchor = model.id_bridge_anchor_detail(pyramid, base, SENTINEL2)
     delta, diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
     assert delta.shape == base.shape
@@ -702,6 +749,7 @@ def test_observable_phase_transport_is_bounded_and_preserves_the_protected_ancho
         rtol=1e-7,
     )
     head = model.phase_transport_head
+    assert head.output[-1].out_channels == 9
     assert int(torch.count_nonzero(head.output[-1].weight)) == 0
     torch.testing.assert_close(
         head.output[-1].bias[:3],
@@ -739,6 +787,116 @@ def test_observable_phase_transport_is_bounded_and_preserves_the_protected_ancho
     _, negative_diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
     assert bool((negative_diagnostics["gain"] >= 0.0).all())
     assert float(negative_diagnostics["gate"].detach().amax()) < 1e-5
+
+
+def test_null_calibrated_phase_transport_uses_roll_nulls_without_offsets() -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+    ).eval()
+    head = model.phase_transport_head
+    assert head.output[-1].out_channels == 3
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    first_delta, diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
+    second_delta, second_diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
+    torch.testing.assert_close(first_delta, second_delta, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(diagnostics["null_level"], second_diagnostics["null_level"])
+    assert "offset_px" not in diagnostics
+    assert {
+        "gain",
+        "gate",
+        "effective_gate",
+        "gain_support",
+        "coherence",
+        "null_level",
+        "null_coherence",
+        "source_phase",
+    } <= diagnostics.keys()
+    assert bool(torch.isfinite(first_delta).all())
+    assert bool((diagnostics["gain"] >= 0.0).all())
+    assert bool((diagnostics["effective_gate"] <= diagnostics["gate"]).all())
+    assert bool((diagnostics["gain_support"] >= 0.0).all())
+    assert bool((diagnostics["gain_support"] <= 1.0).all())
+    metadata = model.residual_state_metadata()
+    assert metadata["phase_transport_null_calibrated"] is True
+    assert metadata["phase_transport_null_quantile"] == pytest.approx(0.75)
+    assert metadata["phase_transport_support_epsilon"] == pytest.approx(0.01)
+
+    physical_bands = torch.stack(frequency_bands(base, levels=3), dim=1)
+    source_phase = diagnostics["source_phase"]
+    null_height = head.phase_coherence(source_phase.roll(16, dims=-2), physical_bands)
+    null_width = head.phase_coherence(source_phase.roll(16, dims=-1), physical_bands)
+    torch.testing.assert_close(
+        diagnostics["null_coherence"], 0.5 * (null_height + null_width)
+    )
+
+    detail = model.visual_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), base)
+    sample_a = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=17)
+    sample_b = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=17)
+    torch.testing.assert_close(sample_a, sample_b, atol=0.0, rtol=0.0)
+
+
+def test_null_calibrated_support_rejects_roll_controls_and_has_finite_zero_energy_gradients() -> None:
+    model = _haar_model(phase_transport=True, phase_transport_null_calibrated=True)
+    head = model.phase_transport_head
+    height = width = 32
+    signal = torch.zeros(1, 1, height, width)
+    signal[..., 4:12, 5:13] = torch.arange(64, dtype=torch.float32).reshape(1, 1, 8, 8)
+    source = signal.expand(1, 3, -1, -1).clone()
+    physical = signal.unsqueeze(1).expand(1, 3, 3, -1, -1).clone()
+    aligned = head.phase_coherence(source, physical)
+    rolled_height = head.phase_coherence(source.roll(height // 2, dims=-2), physical)
+    rolled_width = head.phase_coherence(source.roll(width // 2, dims=-1), physical)
+    _, support, _ = head._null_calibrated_support(source, physical, aligned)
+    assert float(aligned.mean()) > float(rolled_height.mean()) + 0.05
+    assert float(aligned.mean()) > float(rolled_width.mean()) + 0.05
+    assert float(support.max()) > 0.5
+
+    constant_source = torch.ones(1, 3, height, width, requires_grad=True)
+    constant_physical = torch.ones(1, 3, 3, height, width)
+    zero_coherence = head.phase_coherence(constant_source, constant_physical)
+    _, zero_support, _ = head._null_calibrated_support(
+        constant_source, constant_physical, zero_coherence
+    )
+    assert int(torch.count_nonzero(zero_support)) == 0
+    (zero_coherence.mean() + zero_support.mean()).backward()
+    assert constant_source.grad is not None
+    assert bool(torch.isfinite(constant_source.grad).all())
+
+
+def test_null_calibrated_phase_transport_migrates_v3_gain_rows_after_ema_overlay() -> None:
+    legacy = _haar_model(phase_transport=True)
+    initialized = _haar_model(phase_transport=True, phase_transport_null_calibrated=True)
+    weight_name = "phase_transport_head.output.2.weight"
+    bias_name = "phase_transport_head.output.2.bias"
+    legacy_output = legacy.phase_transport_head.output[-1]
+    with torch.no_grad():
+        legacy_output.weight.copy_(
+            torch.arange(legacy_output.weight.numel(), dtype=legacy_output.weight.dtype).reshape_as(
+                legacy_output.weight
+            )
+        )
+        legacy_output.bias.copy_(
+            torch.arange(legacy_output.bias.numel(), dtype=legacy_output.bias.dtype)
+        )
+    initial_state = {name: value.detach().clone() for name, value in legacy.state_dict().items()}
+    # This mirrors init_use_ema, where EMA values overlay the raw checkpoint state.
+    initial_state[weight_name] = initial_state[weight_name] + 17.0
+    initial_state[bias_name] = initial_state[bias_name] + 23.0
+
+    loaded, _ = training_module._load_compatible_state(initialized, initial_state)
+
+    assert loaded > 0
+    target_output = initialized.phase_transport_head.output[-1]
+    torch.testing.assert_close(target_output.weight, initial_state[weight_name][:3])
+    torch.testing.assert_close(target_output.bias, initial_state[bias_name][:3])
 
 
 def test_observable_phase_transport_sigmoid_gate_is_smooth_and_bounded() -> None:
@@ -1856,6 +2014,9 @@ def test_id_bridge_optimizer_updates_origin_and_checkpoint_ema(tiny_model: Senti
         "phase_transport_gain_caps": (0.5, 0.25, 0.1),
         "phase_transport_offset_caps_px": (0.5, 0.5, 0.5),
         "phase_transport_initial_gate": 0.02,
+        "phase_transport_null_calibrated": False,
+        "phase_transport_null_quantile": 0.75,
+        "phase_transport_support_epsilon": 0.01,
         "antithetic_weight": 0.0,
     }
 
@@ -1909,6 +2070,9 @@ def test_haar_id_bridge_optimizer_and_checkpoint_metadata() -> None:
         "phase_transport_gain_caps": (0.5, 0.25, 0.1),
         "phase_transport_offset_caps_px": (0.5, 0.5, 0.5),
         "phase_transport_initial_gate": 0.02,
+        "phase_transport_null_calibrated": False,
+        "phase_transport_null_quantile": 0.75,
+        "phase_transport_support_epsilon": 0.01,
         "antithetic_weight": 0.0,
     }
 
@@ -2105,6 +2269,71 @@ def test_phase_transport_trains_only_the_observable_head_and_keeps_long_gaps_zer
     for parameter in model.phase_transport_head.parameters():
         assert parameter.grad is not None
         assert bool(torch.isfinite(parameter.grad).all())
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith("phase_transport_head.")
+    )
+
+    model.zero_grad(set_to_none=True)
+    zero_loss, _ = objective(_batch(delta_days=2), "phase_transport")
+    zero_loss.backward()
+    assert float(zero_loss.detach()) == 0.0
+    assert all(
+        parameter.grad is not None and int(torch.count_nonzero(parameter.grad)) == 0
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_null_calibrated_phase_transport_trains_without_offsets_and_keeps_long_gaps_zero() -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+    )
+    _set_trainable(model, "phase_transport")
+    assert all(
+        name.startswith("phase_transport_head.")
+        for name, parameter in model.named_parameters()
+        if parameter.requires_grad
+    )
+    assert model.phase_transport_head.output[-1].out_channels == 3
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+        phase_transport_utility_weight=0.25,
+    )
+    objective.set_progress(1, 100)
+    loss, metrics = objective(_batch(), "phase_transport")
+    assert bool(torch.isfinite(loss))
+    required = (
+        "gain_utility",
+        "null_level_fine",
+        "null_level_mid",
+        "null_level_coarse",
+        "gain_support_fine",
+        "gain_support_mid",
+        "gain_support_coarse",
+        "effective_gate_fine",
+        "effective_gate_mid",
+        "effective_gate_coarse",
+        "support_active_fraction",
+    )
+    for name in required:
+        value = metrics[f"sar2opt/{name}"]
+        assert bool(torch.isfinite(value))
+    assert not any("offset" in name for name in metrics)
+    loss.backward()
+    output = model.phase_transport_head.output[-1]
+    assert output.weight.grad is not None and bool(torch.isfinite(output.weight.grad).all())
+    assert output.bias.grad is not None and bool(torch.isfinite(output.bias.grad).all())
     assert all(
         parameter.grad is None
         for name, parameter in model.named_parameters()

@@ -832,15 +832,27 @@ class ObservablePhaseTransportHead(nn.Module):
         gain_caps: Sequence[float] = (0.5, 0.25, 0.1),
         offset_caps_px: Sequence[float] = (0.5, 0.5, 0.5),
         initial_gate: float = 0.02,
+        null_calibrated: bool = False,
+        null_quantile: float = 0.75,
+        support_epsilon: float = 0.01,
     ) -> None:
         super().__init__()
         if len(gain_caps) != 3 or len(offset_caps_px) != 3:
             raise ValueError("phase transport requires three gain and offset caps")
         if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
             raise ValueError("phase transport initial_gate must be finite and in (0, 1)")
+        if not isinstance(null_calibrated, bool):
+            raise TypeError("phase transport null_calibrated must be a bool")
+        if not math.isfinite(null_quantile) or not 0.0 < null_quantile < 1.0:
+            raise ValueError("phase transport null_quantile must be finite and in (0, 1)")
+        if not math.isfinite(support_epsilon) or support_epsilon <= 0.0:
+            raise ValueError("phase transport support_epsilon must be finite and positive")
         self.gain_caps = tuple(float(value) for value in gain_caps)
         self.offset_caps_px = tuple(float(value) for value in offset_caps_px)
         self.initial_gate = float(initial_gate)
+        self.null_calibrated = null_calibrated
+        self.null_quantile = float(null_quantile)
+        self.support_epsilon = float(support_epsilon)
         self.pyramid_projections = nn.ModuleList(
             [nn.Conv2d(channels, 32, 1) for channels in pyramid_channels]
         )
@@ -851,7 +863,7 @@ class ObservablePhaseTransportHead(nn.Module):
         self.output = nn.Sequential(
             nn.GroupNorm(_groups(hidden), hidden),
             nn.SiLU(),
-            nn.Conv2d(hidden, 9, 1),
+            nn.Conv2d(hidden, 3 if null_calibrated else 9, 1),
         )
         nn.init.zeros_(self.output[-1].weight)
         nn.init.zeros_(self.output[-1].bias)
@@ -909,6 +921,37 @@ class ObservablePhaseTransportHead(nn.Module):
             stride=4,
         ).reshape(batch, 3, height // 4, width // 4)
         return torch.nan_to_num(coherence, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+    def _null_calibrated_support(
+        self,
+        source_phase: Tensor,
+        physical_bands: Tensor,
+        coherence: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return detached null threshold, excess support, and mean null coherence."""
+
+        if not self.null_calibrated:
+            raise ValueError("null-calibrated support requires the null-calibrated head")
+        expected = (*coherence.shape[:2], source_phase.shape[-2] // 4, source_phase.shape[-1] // 4)
+        if coherence.shape != expected:
+            raise ValueError("phase transport coherence must match the source latent grid")
+        height, width = source_phase.shape[-2:]
+        with torch.no_grad():
+            null_height = self.phase_coherence(
+                source_phase.roll(height // 2, dims=-2), physical_bands
+            )
+            null_width = self.phase_coherence(
+                source_phase.roll(width // 2, dims=-1), physical_bands
+            )
+            null_values = torch.stack((null_height, null_width), dim=2).flatten(2)
+            null_level = torch.quantile(
+                null_values.float(), self.null_quantile, dim=2, keepdim=True
+            ).reshape(*coherence.shape[:2], 1, 1)
+            null_coherence = 0.5 * (null_height + null_width)
+        null_level = null_level.to(coherence).detach()
+        excess = F.relu(coherence - null_level)
+        gain_support = excess / (excess + null_level + self.support_epsilon)
+        return null_level, gain_support, null_coherence
 
     @staticmethod
     def warp_bands(physical_bands: Tensor, offset_px: Tensor) -> Tensor:
@@ -970,16 +1013,37 @@ class ObservablePhaseTransportHead(nn.Module):
         )
         features = self.trunk(self.fuse(torch.cat((*scene_features, physical_features), dim=1)))
         output = self.output(features)
-        raw_gain, raw_offset = output[:, :3], output[:, 3:]
-        raw_offset = raw_offset.reshape(physical.shape[0], 3, 2, *latent_size)
+        raw_gain = output[:, :3]
         source_phase = self.source_phase_projection(pyramid[0])
         source_phase = F.interpolate(
             source_phase, size=(height, width), mode="bilinear", align_corners=False
         )
         coherence = self.phase_coherence(source_phase, physical_bands)
         gain_caps = raw_gain.new_tensor(self.gain_caps).view(1, 3, 1, 1)
-        offset_caps = raw_offset.new_tensor(self.offset_caps_px).view(1, 3, 1, 1, 1)
         gate = self.gain_gate(raw_gain)
+        if self.null_calibrated:
+            null_level, gain_support, null_coherence = self._null_calibrated_support(
+                source_phase, physical_bands, coherence
+            )
+            effective_gate = gate * gain_support
+            gains = gain_caps * effective_gate
+            full_gains = F.interpolate(
+                gains, size=(height, width), mode="bilinear", align_corners=False
+            )
+            delta = highpass((full_gains.unsqueeze(2) * physical_bands).sum(dim=1))
+            return delta, {
+                "gain": gains,
+                "gate": gate,
+                "effective_gate": effective_gate,
+                "gain_support": gain_support,
+                "coherence": coherence,
+                "null_level": null_level,
+                "null_coherence": null_coherence,
+                "source_phase": source_phase,
+            }
+
+        raw_offset = output[:, 3:].reshape(physical.shape[0], 3, 2, *latent_size)
+        offset_caps = raw_offset.new_tensor(self.offset_caps_px).view(1, 3, 1, 1, 1)
         gains = gain_caps * gate * coherence
         offsets = offset_caps * torch.tanh(raw_offset)
         full_offsets = F.interpolate(
@@ -1244,6 +1308,9 @@ class ModelConfig:
     phase_transport_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1)
     phase_transport_offset_caps_px: tuple[float, float, float] = (0.5, 0.5, 0.5)
     phase_transport_initial_gate: float = 0.02
+    phase_transport_null_calibrated: bool = False
+    phase_transport_null_quantile: float = 0.75
+    phase_transport_support_epsilon: float = 0.01
     architecture: str = "v3.2"
 
     def __post_init__(self) -> None:
@@ -1301,6 +1368,16 @@ class ModelConfig:
         if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
             raise ValueError("phase_transport_initial_gate must be finite and in (0, 1)")
         self.phase_transport_initial_gate = initial_gate
+        if not isinstance(self.phase_transport_null_calibrated, bool):
+            raise TypeError("phase_transport_null_calibrated must be a bool")
+        null_quantile = float(self.phase_transport_null_quantile)
+        if not math.isfinite(null_quantile) or not 0.0 < null_quantile < 1.0:
+            raise ValueError("phase_transport_null_quantile must be finite and in (0, 1)")
+        self.phase_transport_null_quantile = null_quantile
+        support_epsilon = float(self.phase_transport_support_epsilon)
+        if not math.isfinite(support_epsilon) or support_epsilon <= 0.0:
+            raise ValueError("phase_transport_support_epsilon must be finite and positive")
+        self.phase_transport_support_epsilon = support_epsilon
 
 
 class SentinelV3(nn.Module):
@@ -1350,6 +1427,9 @@ class SentinelV3(nn.Module):
             cfg.phase_transport_gain_caps,
             cfg.phase_transport_offset_caps_px,
             cfg.phase_transport_initial_gate,
+            cfg.phase_transport_null_calibrated,
+            cfg.phase_transport_null_quantile,
+            cfg.phase_transport_support_epsilon,
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("optical_bridge_alpha_scale", torch.ones(()))
@@ -2123,6 +2203,9 @@ class SentinelV3(nn.Module):
             "phase_transport_gain_caps": tuple(self.config.phase_transport_gain_caps),
             "phase_transport_offset_caps_px": tuple(self.config.phase_transport_offset_caps_px),
             "phase_transport_initial_gate": self.config.phase_transport_initial_gate,
+            "phase_transport_null_calibrated": self.config.phase_transport_null_calibrated,
+            "phase_transport_null_quantile": self.config.phase_transport_null_quantile,
+            "phase_transport_support_epsilon": self.config.phase_transport_support_epsilon,
         }
 
     def sample_id_bridge_residual(

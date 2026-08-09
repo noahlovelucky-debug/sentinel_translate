@@ -1467,8 +1467,8 @@ class JointObjective(nn.Module):
         )
         gains = diagnostics["gain"]
         gate = diagnostics["gate"]
-        offsets = diagnostics["offset_px"]
         coherence = diagnostics["coherence"]
+        null_calibrated = self.model.config.phase_transport_null_calibrated
         latent_valid = F.interpolate(valid, size=gains.shape[-2:], mode="area")
         latent_weight = residual_weights[:, None, None, None] * latent_valid
         physical_bands = torch.stack(frequency_bands(base.detach(), levels=3), dim=1)
@@ -1478,11 +1478,6 @@ class JointObjective(nn.Module):
             valid,
             self.model.config.phase_transport_gain_caps,
         ).detach()
-        utility_weight = latent_weight * coherence.detach()
-        gain_utility = masked_mean(
-            F.smooth_l1_loss(gate.float(), oracle_gate.float(), beta=0.1, reduction="none"),
-            utility_weight.float(),
-        )
         physical_energy = F.avg_pool2d(
             physical_bands.float().square().sum(dim=2), 4, stride=4
         )
@@ -1506,13 +1501,35 @@ class JointObjective(nn.Module):
             (oracle_supported.to(latent_block_weight) * latent_block_weight).sum()
             / latent_block_weight.sum().clamp_min(1e-8)
         )
+        if null_calibrated:
+            gain_support = diagnostics["gain_support"]
+            effective_gate = diagnostics["effective_gate"]
+            strict_valid = (latent_valid >= 0.999).to(gain_support)
+            support_active = (gain_support.detach() > 0.0).to(gain_support)
+            utility_weight = (
+                residual_weights[:, None, None, None] * strict_valid * support_active
+            )
+            gain_utility = masked_mean(
+                F.smooth_l1_loss(
+                    effective_gate.float(), oracle_gate.float(), beta=0.1, reduction="none"
+                ),
+                utility_weight.float(),
+            )
+            support_weight = residual_weights[:, None, None, None] * strict_valid
+            support_active_fraction = (
+                (support_active * support_weight).sum()
+                / support_weight.expand_as(support_active).sum().clamp_min(1e-8)
+            )
+        else:
+            offsets = diagnostics["offset_px"]
+            utility_weight = latent_weight * coherence.detach()
+            gain_utility = masked_mean(
+                F.smooth_l1_loss(
+                    gate.float(), oracle_gate.float(), beta=0.1, reduction="none"
+                ),
+                utility_weight.float(),
+            )
         gain_l1 = masked_mean(gains.abs(), latent_weight)
-        offset_magnitude = masked_mean(offsets.abs(), latent_weight)
-        offset_tv = masked_mean(offsets.diff(dim=-2).abs(), latent_weight[..., 1:, :])
-        offset_tv = offset_tv + masked_mean(
-            offsets.diff(dim=-1).abs(), latent_weight[..., :, 1:]
-        )
-        offset_regularizer = offset_magnitude + offset_tv
         phase_alignment = phase_alignment_loss(
             diagnostics["source_phase"],
             frequency_bands(target, levels=3),
@@ -1520,18 +1537,32 @@ class JointObjective(nn.Module):
             residual_weights,
         )
         low_frequency_leakage = low_frequency_loss(phase_delta, valid, residual_weights)
-        total = (
-            self.phase_transport_hf_weight * hf_loss
-            + 0.25 * rmse_hinge
-            + 0.01 * offset_regularizer
-            + 0.005 * gain_l1
-            + 0.05 * phase_alignment
-            + self.phase_transport_utility_weight * gain_utility
-        )
+        if null_calibrated:
+            total = (
+                self.phase_transport_hf_weight * hf_loss
+                + 0.25 * rmse_hinge
+                + 0.005 * gain_l1
+                + 0.05 * phase_alignment
+                + self.phase_transport_utility_weight * gain_utility
+            )
+        else:
+            offset_magnitude = masked_mean(offsets.abs(), latent_weight)
+            offset_tv = masked_mean(offsets.diff(dim=-2).abs(), latent_weight[..., 1:, :])
+            offset_tv = offset_tv + masked_mean(
+                offsets.diff(dim=-1).abs(), latent_weight[..., :, 1:]
+            )
+            offset_regularizer = offset_magnitude + offset_tv
+            total = (
+                self.phase_transport_hf_weight * hf_loss
+                + 0.25 * rmse_hinge
+                + 0.01 * offset_regularizer
+                + 0.005 * gain_l1
+                + 0.05 * phase_alignment
+                + self.phase_transport_utility_weight * gain_utility
+            )
         metrics = {
             **hf_metrics,
             "rmse_hinge": rmse_hinge.detach(),
-            "offset_regularizer": offset_regularizer.detach(),
             "gain_l1": gain_l1.detach(),
             "gain_utility": gain_utility.detach(),
             "phase_alignment": phase_alignment.detach(),
@@ -1547,12 +1578,34 @@ class JointObjective(nn.Module):
             "oracle_gate_coarse": oracle_gate[:, 2].mean().detach(),
             "oracle_active_fraction": oracle_active_fraction.detach(),
             "oracle_supported_fraction": oracle_supported_fraction.detach(),
-            "offset_px_abs_mean": offsets.abs().mean().detach(),
             "coherence_fine": coherence[:, 0].mean().detach(),
             "coherence_mid": coherence[:, 1].mean().detach(),
             "coherence_coarse": coherence[:, 2].mean().detach(),
             "low_frequency_leakage": low_frequency_leakage.detach(),
         }
+        if null_calibrated:
+            null_level = diagnostics["null_level"]
+            metrics.update(
+                {
+                    "null_level_fine": null_level[:, 0].mean().detach(),
+                    "null_level_mid": null_level[:, 1].mean().detach(),
+                    "null_level_coarse": null_level[:, 2].mean().detach(),
+                    "gain_support_fine": gain_support[:, 0].mean().detach(),
+                    "gain_support_mid": gain_support[:, 1].mean().detach(),
+                    "gain_support_coarse": gain_support[:, 2].mean().detach(),
+                    "effective_gate_fine": effective_gate[:, 0].mean().detach(),
+                    "effective_gate_mid": effective_gate[:, 1].mean().detach(),
+                    "effective_gate_coarse": effective_gate[:, 2].mean().detach(),
+                    "support_active_fraction": support_active_fraction.detach(),
+                }
+            )
+        else:
+            metrics.update(
+                {
+                    "offset_regularizer": offset_regularizer.detach(),
+                    "offset_px_abs_mean": offsets.abs().mean().detach(),
+                }
+            )
         if self.current_step % self.flow_rollout_every == 0:
             lpips, dists = self._optical_visual_perceptual(
                 visual, target, valid, residual_weights
@@ -1937,6 +1990,20 @@ def _replace_symlink(target: Path, link: Path) -> None:
 def _load_compatible_state(model: nn.Module, state: dict[str, Tensor]) -> tuple[int, int]:
     current = model.state_dict()
     candidates = dict(state)
+    if isinstance(model, SentinelV3) and model.config.phase_transport_null_calibrated:
+        for suffix in ("weight", "bias"):
+            name = f"phase_transport_head.output.2.{suffix}"
+            value = candidates.get(name)
+            target = current.get(name)
+            if (
+                value is not None
+                and target is not None
+                and value.ndim == target.ndim
+                and value.shape[0] == 9
+                and target.shape[0] == 3
+                and value.shape[1:] == target.shape[1:]
+            ):
+                candidates[name] = value[:3].clone()
     if isinstance(model, SentinelV3) and model.legacy_residual_dit is not None:
         for name, value in state.items():
             if not name.startswith("residual_dit."):
