@@ -1,0 +1,43 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  manifest: /data/sentinel_translate/data/manifests/pairs.jsonl
+  temporal_prior_shards: /data/sentinel_translate/data/shards_v32_temporal_prior/index.json
+  hf_eligibility: /data/sentinel_translate/data/shards_v32_hf_eligibility.json
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_existing_full_20260809
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_existing_full_20260809
+
+model:
+  flow_noise_scale: 0.35
+  optical_flow_noise_scale: 0.05
+  sar_flow_noise_scale: 0.35
+
+train:
+  stage: flow
+  max_steps: 40000
+  batch_size: 2
+  gradient_accumulation: 4
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  amp: bfloat16
+  init_use_ema: true
+  log_every: 20
+  validate_every: 1000
+  save_every: 1000
+  early_stop_patience: 5
+  find_unused_parameters: true
+  learning_rate: 0.0001
+  warmup_steps: 2000
+  ema_decay: 0.999
+  flow_visual_pixel_weight: 0.05
+  flow_visual_hf_weight: 0.05
+  flow_visual_perceptual_weight: 0.025
+  flow_rollout_every: 4
+  flow_rollout_steps: 2
+  flow_rollout_samples: 2
+  flow_rollout_pixel_weight: 0.1
+  flow_rollout_hf_weight: 0.1
+  full_validate_every: 5000
+
+validation:
+  full_steps: [5000, 20000, 40000]
