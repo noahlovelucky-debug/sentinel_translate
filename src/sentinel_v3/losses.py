@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -482,6 +483,246 @@ def cross_modal_identifiability_target(
         support = (coverage >= 0.999).to(cosine.dtype)
         targets.append((cosine.clamp_min(0.0) * balance * support).clamp(0.0, 1.0))
     return torch.cat(targets, dim=1)
+
+
+def phase_identifiability_target(
+    source: Tensor,
+    target_bands: tuple[Tensor, ...],
+    mask: Tensor,
+) -> Tensor:
+    """Return blockwise cross-modal orientation support for three frequency bands.
+
+    The squared gradient dot product makes the target invariant to contrast-sign
+    reversals while still rejecting perpendicular structure.  It is a train-only
+    oracle: inference never receives target pixels through this path.
+    """
+
+    if source.ndim != 4 or mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError("phase identifiability inputs require source BCHW and mask B1HW")
+    if len(target_bands) != 3:
+        raise ValueError("phase identifiability requires fine, mid, and coarse target bands")
+    batch, _, height, width = source.shape
+    if (
+        mask.shape[0] != batch
+        or mask.shape[-2:] != (height, width)
+        or height % 4
+        or width % 4
+    ):
+        raise ValueError("phase identifiability inputs must share dimensions divisible by four")
+    for band in target_bands:
+        if not isinstance(band, Tensor) or band.ndim != 4:
+            raise ValueError("phase target bands must be BCHW tensors")
+        if band.shape[0] != batch or band.shape[-2:] != (height, width):
+            raise ValueError("phase target bands must match the source resolution")
+
+    source_gray = source.float().mean(dim=1, keepdim=True)
+    source_gray = (source_gray - source_gray.mean(dim=(-2, -1), keepdim=True)) / (
+        source_gray.std(dim=(-2, -1), keepdim=True, unbiased=False).clamp_min(1e-6)
+    )
+    valid = mask.float()
+    targets: list[Tensor] = []
+    for level, band in enumerate(target_bands):
+        scale = 2**level
+        if scale > 1:
+            source_level = F.interpolate(
+                F.avg_pool2d(source_gray, scale, stride=scale),
+                size=(height, width),
+                mode="bilinear",
+                align_corners=False,
+            )
+        else:
+            source_level = source_gray
+        target_level = band.float().mean(dim=1, keepdim=True)
+        source_dy, source_dx = gradients(source_level)
+        target_dy, target_dx = gradients(target_level)
+        source_dy = F.pad(source_dy, (0, 0, 0, 1))
+        source_dx = F.pad(source_dx, (0, 1, 0, 0))
+        target_dy = F.pad(target_dy, (0, 0, 0, 1))
+        target_dx = F.pad(target_dx, (0, 1, 0, 0))
+        source_energy = source_dx.square() + source_dy.square()
+        target_energy = target_dx.square() + target_dy.square()
+        valid_count = valid.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+        source_mean_energy = (source_energy * valid).sum(
+            dim=(-2, -1), keepdim=True
+        ) / valid_count
+        target_mean_energy = (target_energy * valid).sum(
+            dim=(-2, -1), keepdim=True
+        ) / valid_count
+        source_dx = source_dx / source_mean_energy.clamp_min(1e-12).sqrt()
+        source_dy = source_dy / source_mean_energy.clamp_min(1e-12).sqrt()
+        target_dx = target_dx / target_mean_energy.clamp_min(1e-12).sqrt()
+        target_dy = target_dy / target_mean_energy.clamp_min(1e-12).sqrt()
+        source_normalized = source_dx.square() + source_dy.square()
+        target_normalized = target_dx.square() + target_dy.square()
+        dot = source_dx * target_dx + source_dy * target_dy
+        coherence = dot.square() / (source_normalized * target_normalized + 1e-8)
+        balance = 2.0 * torch.sqrt(source_normalized * target_normalized) / (
+            source_normalized + target_normalized + 1e-8
+        )
+        score = F.avg_pool2d(coherence * balance * valid, 4, stride=4)
+        coverage = F.avg_pool2d(valid, 4, stride=4)
+        targets.append(torch.where(coverage >= 0.999, score, torch.zeros_like(score)))
+    return torch.cat(targets, dim=1).clamp(0.0, 1.0)
+
+
+def phase_alignment_loss(
+    source_phase: Tensor,
+    target_bands: tuple[Tensor, ...],
+    mask: Tensor,
+    sample_weight: Tensor | None = None,
+) -> Tensor:
+    """Align source phase maps with target-band orientations during training only."""
+
+    if source_phase.ndim != 4 or source_phase.shape[1] != 3:
+        raise ValueError("phase alignment source maps must be B3HW")
+    if len(target_bands) != 3:
+        raise ValueError("phase alignment requires three target bands")
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError("phase alignment mask must be B1HW")
+    batch, _, height, width = source_phase.shape
+    if mask.shape != (batch, 1, height, width):
+        raise ValueError("phase alignment mask must match source phase dimensions")
+    for band in target_bands:
+        if not isinstance(band, Tensor) or band.ndim != 4:
+            raise ValueError("phase alignment target bands must be BCHW tensors")
+        if band.shape[0] != batch or band.shape[-2:] != (height, width):
+            raise ValueError("phase alignment target bands must match source maps")
+    if sample_weight is not None and sample_weight.shape not in {(batch,), (batch, 1)}:
+        raise ValueError("phase alignment sample weights must be B or B1")
+
+    target_phase = torch.cat(
+        tuple(band.float().mean(dim=1, keepdim=True) for band in target_bands), dim=1
+    )
+    source_dy, source_dx = gradients(source_phase.float())
+    target_dy, target_dx = gradients(target_phase)
+    source_dy = F.pad(source_dy, (0, 0, 0, 1))
+    source_dx = F.pad(source_dx, (0, 1, 0, 0))
+    target_dy = F.pad(target_dy, (0, 0, 0, 1))
+    target_dx = F.pad(target_dx, (0, 1, 0, 0))
+    source_energy = source_dx.square() + source_dy.square()
+    target_energy = target_dx.square() + target_dy.square()
+    epsilon = 1e-6
+    orientation = (source_dx * target_dx + source_dy * target_dy).square() / (
+        (source_energy + epsilon) * (target_energy + epsilon)
+    )
+    weight = target_energy * mask.float()
+    if sample_weight is not None:
+        weight = weight * sample_weight.to(weight).reshape(batch, 1, 1, 1)
+    denominator = weight.sum(dim=(-2, -1))
+    coherence = (orientation * weight).sum(dim=(-2, -1)) / denominator.clamp_min(1e-8)
+    active = (denominator > 1e-8).to(coherence.dtype)
+    values = (1.0 - coherence.clamp(0.0, 1.0)) * active
+    return values.sum() / active.sum().clamp_min(1.0)
+
+
+def phase_transport_gain_target(
+    physical_bands: Tensor,
+    residual_after_anchor: Tensor,
+    valid: Tensor,
+    gain_caps: Sequence[float],
+    block_size: int = 4,
+) -> Tensor:
+    """Return strict-valid blockwise sigmoid-gate targets for phase transport."""
+
+    if not isinstance(physical_bands, Tensor) or physical_bands.ndim != 5:
+        raise ValueError("phase transport bands must be B3CHW")
+    if physical_bands.shape[1] != 3 or physical_bands.shape[2] < 1:
+        raise ValueError("phase transport bands must contain three nonempty frequency bands")
+    if not isinstance(residual_after_anchor, Tensor) or residual_after_anchor.ndim != 4:
+        raise ValueError("phase transport residual must be BCHW")
+    if not isinstance(valid, Tensor) or valid.ndim != 4 or valid.shape[1] != 1:
+        raise ValueError("phase transport valid mask must be B1HW")
+    batch, _, channels, height, width = physical_bands.shape
+    if (
+        residual_after_anchor.shape != (batch, channels, height, width)
+        or valid.shape != (batch, 1, height, width)
+    ):
+        raise ValueError("phase transport inputs must share B, C, H, and W")
+    if (
+        physical_bands.device != residual_after_anchor.device
+        or physical_bands.device != valid.device
+    ):
+        raise ValueError("phase transport inputs must share a device")
+    if not physical_bands.is_floating_point() or not residual_after_anchor.is_floating_point():
+        raise TypeError("phase transport bands and residual must be floating point")
+    if not (valid.is_floating_point() or valid.dtype == torch.bool):
+        raise TypeError("phase transport valid mask must be floating point or bool")
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
+        raise ValueError("phase transport block_size must be a positive integer")
+    if height % block_size or width % block_size:
+        raise ValueError("phase transport dimensions must be divisible by block_size")
+    if not isinstance(gain_caps, (tuple, list)) or len(gain_caps) != 3:
+        raise ValueError("phase transport gain_caps must contain three values")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in gain_caps):
+        raise TypeError("phase transport gain_caps must contain numeric values")
+    caps = tuple(float(value) for value in gain_caps)
+    if any(not math.isfinite(value) or value < 0.0 for value in caps):
+        raise ValueError("phase transport gain_caps must be finite and non-negative")
+    # Keep this training oracle free of host synchronizations on the GPU hot path.
+    mask = torch.nan_to_num(valid.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    components = torch.nan_to_num(
+        physical_bands.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ) * mask.unsqueeze(1)
+    residual = torch.nan_to_num(
+        residual_after_anchor.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ) * mask
+    numerator = F.avg_pool2d(
+        (components * residual.unsqueeze(1)).sum(dim=2), block_size, stride=block_size
+    )
+    energy = F.avg_pool2d(components.square().sum(dim=2), block_size, stride=block_size)
+    coverage = F.avg_pool2d(mask, block_size, stride=block_size)
+    cap_values = numerator.new_tensor(caps).view(1, 3, 1, 1)
+    beta = torch.minimum((numerator / energy.clamp_min(1e-8)).clamp_min(0.0), cap_values)
+    gate = beta / cap_values.clamp_min(1e-8)
+    supported = (energy > 1e-7) & (coverage >= 0.999) & (cap_values > 0.0)
+    return torch.where(supported, gate, torch.zeros_like(gate)).clamp(0.0, 1.0)
+
+
+def anchor_gain_target(
+    raw_components: tuple[Tensor, Tensor, Tensor],
+    full_residual: Tensor,
+    valid: Tensor,
+    maximum_gain: float = 3.0,
+) -> Tensor:
+    """Return soft local utility targets for the three Optical anchor components."""
+
+    if isinstance(maximum_gain, bool) or not isinstance(maximum_gain, (int, float)):
+        raise TypeError("maximum_gain must be a finite positive scalar")
+    if not math.isfinite(maximum_gain) or maximum_gain <= 0.0:
+        raise ValueError("maximum_gain must be finite and positive")
+    if not isinstance(raw_components, tuple) or len(raw_components) != 3:
+        raise ValueError("anchor gain target requires exactly three components")
+    if full_residual.ndim != 4 or valid.ndim != 4 or valid.shape[1] != 1:
+        raise ValueError("anchor gain inputs require residual BCHW and valid B1HW tensors")
+    if full_residual.shape[0] != valid.shape[0] or full_residual.shape[-2:] != valid.shape[-2:]:
+        raise ValueError("anchor gain residual and valid shapes must match")
+    height, width = full_residual.shape[-2:]
+    if height % 8 or width % 8:
+        raise ValueError("anchor gain inputs require dimensions divisible by eight")
+    for component in raw_components:
+        if not isinstance(component, Tensor) or component.shape != full_residual.shape:
+            raise ValueError("anchor gain components must match the full residual shape")
+        if component.device != full_residual.device:
+            raise ValueError("anchor gain components must share the residual device")
+
+    mask = valid.to(full_residual)
+    components = torch.stack(
+        tuple(highpass(component) * mask for component in raw_components), dim=1
+    )
+    residual = full_residual * mask
+    numerator = F.avg_pool2d(
+        (components * residual.unsqueeze(1)).sum(dim=2), 4, stride=4
+    )
+    energy = F.avg_pool2d(components.square().sum(dim=2), 4, stride=4)
+    beta = (numerator / (energy + 1e-8)).clamp(0.0, maximum_gain)
+    coverage = F.avg_pool2d(mask, 4, stride=4)
+    supported = (energy > 1e-7) & (coverage >= 0.999)
+    default = torch.zeros_like(beta)
+    default[:, :1] = 1.0
+    beta = torch.where(supported, beta, default)
+    beta = F.avg_pool2d(beta, 3, stride=1, padding=1)
+    beta = torch.where(supported, beta, default)
+    return beta / (1.0 + beta)
 
 
 def texture_reliability_gate(

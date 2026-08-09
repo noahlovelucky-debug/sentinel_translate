@@ -23,6 +23,7 @@ from torch.utils.data import DataLoader, Subset
 
 from .data import StatefulIndexSampler, StatefulShardSampler, V2ShardDataset, time_weights
 from .losses import (
+    anchor_gain_target,
     charbonnier,
     codec_reconstruction_loss,
     cross_modal_identifiability_target,
@@ -33,7 +34,11 @@ from .losses import (
     high_frequency_loss,
     highpass,
     latent_alignment,
+    low_frequency_loss,
     masked_mean,
+    phase_alignment_loss,
+    phase_identifiability_target,
+    phase_transport_gain_target,
     physical_loss,
     robust_rms,
     texture_reliability_gate,
@@ -120,8 +125,11 @@ class JointObjective(nn.Module):
         flow_rollout_samples: int = 2,
         flow_rollout_pixel_weight: float = 0.1,
         flow_rollout_hf_weight: float = 0.1,
+        id_bridge_antithetic_weight: float = 0.0,
         risk_flow_steps: int = 4,
         bridge_flow_steps: int = 4,
+        phase_transport_hf_weight: float = 0.05,
+        phase_transport_utility_weight: float = 0.10,
     ) -> None:
         super().__init__()
         self.model = model
@@ -147,6 +155,15 @@ class JointObjective(nn.Module):
         self.flow_rollout_samples = max(1, flow_rollout_samples)
         self.flow_rollout_pixel_weight = flow_rollout_pixel_weight
         self.flow_rollout_hf_weight = flow_rollout_hf_weight
+        if not math.isfinite(id_bridge_antithetic_weight) or id_bridge_antithetic_weight < 0.0:
+            raise ValueError("id_bridge_antithetic_weight must be finite and non-negative")
+        self.id_bridge_antithetic_weight = id_bridge_antithetic_weight
+        if not math.isfinite(phase_transport_hf_weight) or phase_transport_hf_weight < 0.0:
+            raise ValueError("phase_transport_hf_weight must be finite and non-negative")
+        self.phase_transport_hf_weight = phase_transport_hf_weight
+        if not math.isfinite(phase_transport_utility_weight) or phase_transport_utility_weight < 0.0:
+            raise ValueError("phase_transport_utility_weight must be finite and non-negative")
+        self.phase_transport_utility_weight = phase_transport_utility_weight
         self.risk_flow_steps = max(1, risk_flow_steps)
         self.bridge_flow_steps = max(1, bridge_flow_steps)
         self.last_direction_losses: list[Tensor] = []
@@ -180,7 +197,21 @@ class JointObjective(nn.Module):
     ) -> Tensor:
         if rank is None:
             rank = dist.get_rank() if dist.is_available() and dist.is_initialized() else 0
+        if self.model.config.id_bridge_optical_only:
+            return torch.zeros(batch_size, device=device, dtype=torch.long)
         return (torch.arange(batch_size, device=device) + self.current_step + rank) % 2
+
+    @staticmethod
+    def _id_utility_assignments(batch_size: int, device: torch.device) -> Tensor:
+        """Train the Optical anchor utility on SAR-to-Optical examples only."""
+
+        return torch.zeros(batch_size, device=device, dtype=torch.long)
+
+    @staticmethod
+    def _phase_transport_assignments(batch_size: int, device: torch.device) -> Tensor:
+        """Train observable Optical transport from SAR inputs only."""
+
+        return torch.zeros(batch_size, device=device, dtype=torch.long)
 
     @staticmethod
     def _id_bridge_start(
@@ -189,8 +220,18 @@ class JointObjective(nn.Module):
         reliability_logits: Tensor,
         noise_scale: float,
         epsilon: Tensor,
+        *,
+        q_state: Tensor | None = None,
     ) -> tuple[Tensor, Tensor, Tensor]:
-        q_pred = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
+        if q_state is None:
+            q_pred = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
+        else:
+            if q_state.shape not in {
+                mu.shape,
+                (mu.shape[0], 1, *mu.shape[-2:]),
+            }:
+                raise ValueError("id bridge reliability state must be B1HW or match the latent")
+            q_pred = q_state
         sigma = noise_scale * torch.sigmoid(log_sigma) * (1.0 - q_pred)
         # Distribution parameters are trained by their own calibrated objectives only.
         return mu + sigma.detach() * epsilon, q_pred, sigma
@@ -204,8 +245,11 @@ class JointObjective(nn.Module):
     ) -> Tensor:
         if mu.shape != correction.shape or mu.shape != endpoint.shape:
             raise ValueError("id bridge anchor tensors must share a latent shape")
-        if q_oracle.shape != (mu.shape[0], 1, *mu.shape[-2:]):
-            raise ValueError("id bridge oracle must be B1HW on the latent grid")
+        if q_oracle.shape not in {
+            mu.shape,
+            (mu.shape[0], 1, *mu.shape[-2:]),
+        }:
+            raise ValueError("id bridge oracle must be B1HW or match the latent grid")
         values = q_oracle * F.smooth_l1_loss(mu, endpoint, reduction="none")
         return values + (1.0 - q_oracle) * 0.05 * correction.abs()
 
@@ -971,12 +1015,30 @@ class JointObjective(nn.Module):
         mu, correction, anchor_detail, log_sigma, reliability_logits = (
             self.model.predict_id_bridge_origin_components(pyramid, base, target_spec)
         )
+        utility_optical = (
+            self.model.config.id_bridge_anchor_utility
+            and self.model.id_bridge_uses_observable_anchor
+            and target_spec.modality == "optical"
+        )
+        phase_optical = (
+            self.model.id_bridge_uses_phase_identifiability
+            and target_spec.modality == "optical"
+        )
+        if phase_optical and self.model.config.id_bridge_anchor_utility:
+            raise ValueError("phase id bridge requires an ungated protected Optical anchor")
         if self.model.id_bridge_uses_observable_anchor and target_spec.modality == "optical":
             # Keep the observable prior in pixels; the Haar state transports only its
             # orthogonal innovation and therefore cannot project away anchor detail.
-            full_residual = highpass(delta) * valid
+            full_residual = (
+                highpass(target - base.detach()) * valid
+                if phase_optical
+                else highpass(delta) * valid
+            )
+            innovation_anchor = (
+                anchor_detail.detach() if utility_optical or phase_optical else anchor_detail
+            )
             innovation_target = self.model.project_id_bridge_residual(
-                (full_residual - anchor_detail) * valid, target_spec
+                (full_residual - innovation_anchor) * valid, target_spec
             ) * valid
         else:
             # This bridge owns all high-frequency residuals, including SAR speckle and tails.
@@ -984,16 +1046,43 @@ class JointObjective(nn.Module):
             innovation_target = full_residual
         with torch.no_grad():
             endpoint_latent = self.model.encode_id_bridge_residual(innovation_target, target_spec)
-        oracle = cross_modal_identifiability_target(
-            pyramid[0].detach(), frequency_bands(full_residual, levels=3), valid
-        ).detach()
-        q_oracle = oracle.mean(dim=1, keepdim=True)
+        if phase_optical:
+            oracle = phase_identifiability_target(
+                batch[source_key][indices],  # type: ignore[index]
+                frequency_bands(innovation_target, levels=3),
+                valid,
+            ).detach()
+        elif utility_optical:
+            oracle = anchor_gain_target(
+                self.model.id_bridge_anchor_components(pyramid, base, target_spec),
+                full_residual,
+                valid,
+            ).detach()
+        else:
+            oracle = cross_modal_identifiability_target(
+                pyramid[0].detach(), frequency_bands(full_residual, levels=3), valid
+            ).detach()
+        if phase_optical:
+            q_oracle = self.model.id_bridge_band_fields_to_state(oracle, target_spec)
+            q_pred_state = self.model.id_bridge_q_state(reliability_logits, target_spec).detach()
+            transport_field = self.model.id_bridge_transport_field(
+                reliability_logits, log_sigma, detach=True
+            )
+            with torch.no_grad():
+                anchor_state = self.model.id_bridge_anchor_state(anchor_detail.detach(), target_spec)
+        else:
+            q_oracle = oracle.mean(dim=1, keepdim=True)
+            q_pred_state = None
+            transport_field = None
+            anchor_state = None
+        epsilon = torch.randn_like(mu)
         z0, q_pred, sigma = self._id_bridge_start(
             mu,
             log_sigma,
             reliability_logits,
             self.model.flow_noise_scale(target_spec),
-            torch.randn_like(mu),
+            epsilon,
+            q_state=q_pred_state,
         )
         time_values = torch.rand(
             innovation_target.shape[0],
@@ -1009,6 +1098,8 @@ class JointObjective(nn.Module):
             target_spec,
             innovation_target.shape[1],
             origin_latent=mu,
+            transport_field=transport_field,
+            id_bridge_anchor_state=anchor_state,
             use_optical_bridge=False,
         )
         residual_weights = weights[indices]
@@ -1066,6 +1157,71 @@ class JointObjective(nn.Module):
             "sigma": sigma.mean().detach(),
             **{f"endpoint_{name}": value for name, value in endpoint_metrics.items()},
         }
+        if phase_optical:
+            q_bands = torch.sigmoid(reliability_logits)
+            release_bands = self.model.id_bridge_innovation_release_bands(
+                reliability_logits, target_spec
+            ) * (1.0 - q_bands)
+            diagnostic_q = q_bands.detach().float()
+            diagnostic_oracle = oracle.detach().float()
+            valid_blocks = latent_valid.detach() > 0.999
+
+            def q_statistics(predicted: Tensor, target: Tensor) -> tuple[Tensor, Tensor]:
+                finite_blocks = valid_blocks & torch.isfinite(predicted) & torch.isfinite(target)
+                if not bool(finite_blocks.any()):
+                    zero = predicted.new_zeros(())
+                    return zero, zero
+                predicted_values = predicted[finite_blocks]
+                target_values = target[finite_blocks]
+                mae = (predicted_values - target_values).abs().mean()
+                predicted_centered = predicted_values - predicted_values.mean()
+                target_centered = target_values - target_values.mean()
+                denominator = torch.sqrt(
+                    predicted_centered.square().mean() * target_centered.square().mean()
+                )
+                if not bool(torch.isfinite(denominator)) or float(denominator) <= 1e-12:
+                    return mae, predicted.new_zeros(())
+                correlation = (predicted_centered * target_centered).mean() / denominator
+                return mae, torch.nan_to_num(correlation, nan=0.0, posinf=0.0, neginf=0.0)
+
+            q_statistics_per_band = tuple(
+                q_statistics(
+                    diagnostic_q[:, band_index : band_index + 1],
+                    diagnostic_oracle[:, band_index : band_index + 1],
+                )
+                for band_index in range(3)
+            )
+            q_mae = torch.stack(tuple(values[0] for values in q_statistics_per_band)).mean()
+            q_corr_bands = torch.stack(tuple(values[1] for values in q_statistics_per_band))
+            q_corr = q_corr_bands.mean()
+            metrics.update(
+                {
+                    "q_fine": q_bands[:, 0].mean().detach(),
+                    "q_mid": q_bands[:, 1].mean().detach(),
+                    "q_coarse": q_bands[:, 2].mean().detach(),
+                    "oracle_q_fine": diagnostic_oracle[:, 0].mean(),
+                    "oracle_q_mid": diagnostic_oracle[:, 1].mean(),
+                    "oracle_q_coarse": diagnostic_oracle[:, 2].mean(),
+                    "q_mae": q_mae,
+                    "q_corr": q_corr,
+                    "q_corr_fine": q_corr_bands[0],
+                    "q_corr_mid": q_corr_bands[1],
+                    "q_corr_coarse": q_corr_bands[2],
+                    "release_fine": release_bands[:, 0].mean().detach(),
+                    "release_mid": release_bands[:, 1].mean().detach(),
+                    "release_coarse": release_bands[:, 2].mean().detach(),
+                }
+            )
+        elif utility_optical:
+            anchor_gains = self.model.id_bridge_anchor_gains(reliability_logits)
+            metrics.update(
+                {
+                    "anchor_gain": anchor_gains.mean().detach(),
+                    "anchor_gain_fine": anchor_gains[:, 0].mean().detach(),
+                    "anchor_gain_mid": anchor_gains[:, 1].mean().detach(),
+                    "anchor_gain_coarse": anchor_gains[:, 2].mean().detach(),
+                }
+            )
         if self.model.id_bridge_uses_observable_anchor and target_spec.modality == "optical":
             origin_residual = anchor_detail + self.model.decode_id_bridge_residual(mu, target_spec)
             origin_hf_loss, origin_hf_metrics = high_frequency_loss(
@@ -1083,12 +1239,37 @@ class JointObjective(nn.Module):
                 pyramid,
                 target_spec,
                 innovation_target.shape[1],
-                steps=2,
+                steps=self.flow_rollout_steps,
                 origin_latent=mu,
+                transport_field=transport_field,
+                id_bridge_anchor_state=anchor_state,
                 use_optical_bridge=False,
             )
+            if phase_optical and self.id_bridge_antithetic_weight > 0.0:
+                z0_minus = mu - sigma.detach() * epsilon
+                rollout_minus = self.model.integrate_flow(
+                    z0_minus,
+                    pyramid,
+                    target_spec,
+                    innovation_target.shape[1],
+                    steps=self.flow_rollout_steps,
+                    origin_latent=mu,
+                    transport_field=transport_field,
+                    id_bridge_anchor_state=anchor_state,
+                    use_optical_bridge=False,
+                )
+                rollout_weight = residual_weights[:, None, None, None] * latent_valid
+                antithetic_center = masked_mean(
+                    charbonnier(0.5 * (rollout_latent + rollout_minus) - mu), rollout_weight
+                )
+                total = total + self.id_bridge_antithetic_weight * antithetic_center
+                metrics["antithetic_center"] = antithetic_center.detach()
             rollout_latent = self.model.gate_id_bridge_innovation(
-                rollout_latent, mu, reliability_logits, target_spec
+                rollout_latent,
+                mu,
+                reliability_logits,
+                target_spec,
+                q_state=q_pred_state,
             )
             rollout_innovation = self.model.decode_id_bridge_residual(rollout_latent, target_spec)
             rollout_visual = self.model.compose_visual(
@@ -1112,8 +1293,11 @@ class JointObjective(nn.Module):
             metrics["rollout_distortion_hinge"] = distortion_loss.detach()
             if target_spec.modality == "optical":
                 if self.flow_visual_perceptual_weight > 0.0:
+                    perceptual_weights = residual_weights
+                    if phase_optical:
+                        perceptual_weights = perceptual_weights * oracle.mean(dim=(1, 2, 3))
                     rollout_lpips, rollout_dists = self._optical_visual_perceptual(
-                        rollout_visual, target, valid, residual_weights
+                        rollout_visual, target, valid, perceptual_weights
                     )
                     total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
                         rollout_lpips + rollout_dists
@@ -1134,12 +1318,262 @@ class JointObjective(nn.Module):
                 )
         return total, metrics
 
+    def _id_utility_direction(
+        self,
+        batch: dict[str, object],
+        indices: Tensor,
+        source_key: str,
+        target_key: str,
+        source_spec: SensorSpec,
+        target_spec: SensorSpec,
+        weights: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if source_spec.modality != "sar" or target_spec.modality != "optical":
+            raise ValueError("id_utility only supports SAR-to-Optical training")
+        if not self.model.config.id_bridge_anchor_utility:
+            raise ValueError("id_utility requires id_bridge_anchor_utility")
+        target, base, valid, pyramid = self._physical_context(
+            batch,
+            indices,
+            source_key,
+            target_key,
+            source_spec,
+            target_spec,
+            joint=False,
+        )
+        full_residual = highpass(target - base.detach()) * valid
+        _, _, anchor_detail, _, reliability_logits = (
+            self.model.predict_id_bridge_origin_components(pyramid, base, target_spec)
+        )
+        oracle = anchor_gain_target(
+            self.model.id_bridge_anchor_components(pyramid, base, target_spec),
+            full_residual,
+            valid,
+        ).detach()
+        residual_weights = weights[indices]
+        latent_valid = F.interpolate(valid, size=reliability_logits.shape[-2:], mode="area")
+        latent_weight = residual_weights[:, None, None, None] * latent_valid
+        reliability_loss = masked_mean(
+            F.binary_cross_entropy_with_logits(
+                reliability_logits.float(), oracle.float(), reduction="none"
+            ),
+            latent_weight.float(),
+        )
+        origin_hf_loss, origin_hf_metrics = high_frequency_loss(
+            anchor_detail,
+            full_residual,
+            valid,
+            "optical",
+            sample_weight=residual_weights,
+        )
+        composed = self.model.compose_visual(
+            base, anchor_detail, torch.zeros_like(anchor_detail), "optical"
+        )
+        assert isinstance(composed, Tensor)
+        expanded_valid = valid.expand_as(composed)
+        denominator = expanded_valid.sum(dim=(1, 2, 3)).clamp_min(1.0)
+        visual_rmse = torch.sqrt(
+            ((composed - target).square() * expanded_valid).sum(dim=(1, 2, 3))
+            / denominator
+        )
+        base_rmse = torch.sqrt(
+            ((base - target).square() * expanded_valid).sum(dim=(1, 2, 3)) / denominator
+        )
+        distortion = torch.relu(visual_rmse / (base_rmse + 1e-6) - 1.05)
+        distortion_loss = (distortion * residual_weights).sum() / residual_weights.sum().clamp_min(
+            1e-8
+        )
+        total = reliability_loss + 0.25 * origin_hf_loss + 0.25 * distortion_loss
+        q = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
+        anchor_gains = self.model.id_bridge_anchor_gains(reliability_logits)
+        metrics = {
+            "reliability": reliability_loss.detach(),
+            "q": q.mean().detach(),
+            "oracle_q": oracle.mean().detach(),
+            "anchor_gain": anchor_gains.mean().detach(),
+            "anchor_gain_fine": anchor_gains[:, 0].mean().detach(),
+            "anchor_gain_mid": anchor_gains[:, 1].mean().detach(),
+            "anchor_gain_coarse": anchor_gains[:, 2].mean().detach(),
+            "distortion_hinge": distortion_loss.detach(),
+            **{f"origin_{name}": value for name, value in origin_hf_metrics.items()},
+        }
+        if (
+            self.flow_visual_perceptual_weight > 0.0
+            and self.current_step % self.flow_rollout_every == 0
+        ):
+            lpips, dists = self._optical_visual_perceptual(
+                composed, target, valid, residual_weights
+            )
+            total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
+                lpips + dists
+            )
+            metrics["lpips"] = lpips.detach()
+            metrics["dists"] = dists.detach()
+        return total, metrics
+
+    def _phase_transport_direction(
+        self,
+        batch: dict[str, object],
+        indices: Tensor,
+        source_key: str,
+        target_key: str,
+        source_spec: SensorSpec,
+        target_spec: SensorSpec,
+        weights: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Train only the observable Optical pixel-detail transport head."""
+
+        if source_spec.modality != "sar" or target_spec.modality != "optical":
+            raise ValueError("phase_transport only supports SAR-to-Optical training")
+        if not self.model.config.phase_transport_enabled:
+            raise ValueError("phase_transport requires phase_transport_enabled")
+        target, base, valid, pyramid = self._physical_context(
+            batch,
+            indices,
+            source_key,
+            target_key,
+            source_spec,
+            target_spec,
+            joint=False,
+        )
+        full_residual = highpass(target - base.detach()) * valid
+        protected_anchor = self.model.id_bridge_anchor_detail(pyramid, base, target_spec).detach()
+        residual_after_anchor = full_residual - protected_anchor
+        phase_delta, diagnostics = self.model.phase_transport_delta(pyramid, base, target_spec)
+        detail = protected_anchor + phase_delta
+        residual_weights = weights[indices]
+        hf_loss, hf_metrics = high_frequency_loss(
+            detail,
+            full_residual,
+            valid,
+            "optical",
+            sample_weight=residual_weights,
+        )
+        visual = self.model.compose_visual(
+            base, detail, torch.zeros_like(detail), "optical"
+        )
+        assert isinstance(visual, Tensor)
+        expanded_valid = valid.expand_as(visual)
+        denominator = expanded_valid.sum(dim=(1, 2, 3)).clamp_min(1.0)
+        visual_rmse = torch.sqrt(
+            ((visual - target).square() * expanded_valid).sum(dim=(1, 2, 3)) / denominator
+        )
+        base_rmse = torch.sqrt(
+            ((base - target).square() * expanded_valid).sum(dim=(1, 2, 3)) / denominator
+        )
+        distortion = torch.relu(visual_rmse / (base_rmse + 1e-6) - 1.05)
+        rmse_hinge = (distortion * residual_weights).sum() / residual_weights.sum().clamp_min(
+            1e-8
+        )
+        gains = diagnostics["gain"]
+        gate = diagnostics["gate"]
+        offsets = diagnostics["offset_px"]
+        coherence = diagnostics["coherence"]
+        latent_valid = F.interpolate(valid, size=gains.shape[-2:], mode="area")
+        latent_weight = residual_weights[:, None, None, None] * latent_valid
+        physical_bands = torch.stack(frequency_bands(base.detach(), levels=3), dim=1)
+        oracle_gate = phase_transport_gain_target(
+            physical_bands,
+            residual_after_anchor,
+            valid,
+            self.model.config.phase_transport_gain_caps,
+        ).detach()
+        utility_weight = latent_weight * coherence.detach()
+        gain_utility = masked_mean(
+            F.smooth_l1_loss(gate.float(), oracle_gate.float(), beta=0.1, reduction="none"),
+            utility_weight.float(),
+        )
+        physical_energy = F.avg_pool2d(
+            physical_bands.float().square().sum(dim=2), 4, stride=4
+        )
+        cap_values = physical_energy.new_tensor(self.model.config.phase_transport_gain_caps).view(
+            1, 3, 1, 1
+        )
+        oracle_supported = (
+            (physical_energy > 1e-7)
+            & (latent_valid.expand_as(physical_energy) >= 0.999)
+            & (cap_values > 0.0)
+        )
+        oracle_weight = residual_weights[:, None, None, None] * oracle_supported.float()
+        oracle_active_fraction = (
+            ((oracle_gate > 0.0).to(oracle_weight) * oracle_weight).sum()
+            / oracle_weight.sum().clamp_min(1e-8)
+        )
+        latent_block_weight = residual_weights[:, None, None, None] * latent_valid.expand_as(
+            physical_energy
+        )
+        oracle_supported_fraction = (
+            (oracle_supported.to(latent_block_weight) * latent_block_weight).sum()
+            / latent_block_weight.sum().clamp_min(1e-8)
+        )
+        gain_l1 = masked_mean(gains.abs(), latent_weight)
+        offset_magnitude = masked_mean(offsets.abs(), latent_weight)
+        offset_tv = masked_mean(offsets.diff(dim=-2).abs(), latent_weight[..., 1:, :])
+        offset_tv = offset_tv + masked_mean(
+            offsets.diff(dim=-1).abs(), latent_weight[..., :, 1:]
+        )
+        offset_regularizer = offset_magnitude + offset_tv
+        phase_alignment = phase_alignment_loss(
+            diagnostics["source_phase"],
+            frequency_bands(target, levels=3),
+            valid,
+            residual_weights,
+        )
+        low_frequency_leakage = low_frequency_loss(phase_delta, valid, residual_weights)
+        total = (
+            self.phase_transport_hf_weight * hf_loss
+            + 0.25 * rmse_hinge
+            + 0.01 * offset_regularizer
+            + 0.005 * gain_l1
+            + 0.05 * phase_alignment
+            + self.phase_transport_utility_weight * gain_utility
+        )
+        metrics = {
+            **hf_metrics,
+            "rmse_hinge": rmse_hinge.detach(),
+            "offset_regularizer": offset_regularizer.detach(),
+            "gain_l1": gain_l1.detach(),
+            "gain_utility": gain_utility.detach(),
+            "phase_alignment": phase_alignment.detach(),
+            "gain_signed_mean": gains.mean().detach(),
+            "gain_fine": gains[:, 0].mean().detach(),
+            "gain_mid": gains[:, 1].mean().detach(),
+            "gain_coarse": gains[:, 2].mean().detach(),
+            "gate_fine": gate[:, 0].mean().detach(),
+            "gate_mid": gate[:, 1].mean().detach(),
+            "gate_coarse": gate[:, 2].mean().detach(),
+            "oracle_gate_fine": oracle_gate[:, 0].mean().detach(),
+            "oracle_gate_mid": oracle_gate[:, 1].mean().detach(),
+            "oracle_gate_coarse": oracle_gate[:, 2].mean().detach(),
+            "oracle_active_fraction": oracle_active_fraction.detach(),
+            "oracle_supported_fraction": oracle_supported_fraction.detach(),
+            "offset_px_abs_mean": offsets.abs().mean().detach(),
+            "coherence_fine": coherence[:, 0].mean().detach(),
+            "coherence_mid": coherence[:, 1].mean().detach(),
+            "coherence_coarse": coherence[:, 2].mean().detach(),
+            "low_frequency_leakage": low_frequency_leakage.detach(),
+        }
+        if self.current_step % self.flow_rollout_every == 0:
+            lpips, dists = self._optical_visual_perceptual(
+                visual, target, valid, residual_weights
+            )
+            total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
+                lpips + dists
+            )
+            metrics["lpips"] = lpips.detach()
+            metrics["dists"] = dists.detach()
+        return total, metrics
+
     def forward(self, batch: dict[str, object], stage: str) -> tuple[Tensor, dict[str, Tensor]]:
         stage = "flow" if stage == "visual" else stage
         device = batch["s2"].device  # type: ignore[union-attr]
         batch_size = batch["s2"].shape[0]  # type: ignore[union-attr]
         if stage in {"risk", "bridge"}:
             tasks = torch.zeros(batch_size, device=device, dtype=torch.long)
+        elif stage == "id_utility":
+            tasks = self._id_utility_assignments(batch_size, device)
+        elif stage == "phase_transport":
+            tasks = self._phase_transport_assignments(batch_size, device)
         elif stage == "id_bridge":
             tasks = self._id_bridge_assignments(batch_size, device)
         else:
@@ -1167,7 +1601,16 @@ class JointObjective(nn.Module):
             ):
                 continue
             indices = torch.nonzero(tasks == task_index, as_tuple=False).flatten()
-            if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge"}:
+            if stage in {
+                "detail",
+                "codec",
+                "flow",
+                "risk",
+                "bridge",
+                "id_bridge",
+                "id_utility",
+                "phase_transport",
+            }:
                 indices = indices[high_frequency_weights[indices] > 0]
             if indices.numel() == 0:
                 continue
@@ -1236,6 +1679,26 @@ class JointObjective(nn.Module):
                 )
             elif stage == "id_bridge":
                 loss, direction_metrics = self._id_bridge_direction(
+                    batch,
+                    indices,
+                    source_key,
+                    target_key,
+                    source_spec,
+                    target_spec,
+                    high_frequency_weights,
+                )
+            elif stage == "id_utility":
+                loss, direction_metrics = self._id_utility_direction(
+                    batch,
+                    indices,
+                    source_key,
+                    target_key,
+                    source_spec,
+                    target_spec,
+                    high_frequency_weights,
+                )
+            elif stage == "phase_transport":
+                loss, direction_metrics = self._phase_transport_direction(
                     batch,
                     indices,
                     source_key,
@@ -1314,12 +1777,23 @@ class JointObjective(nn.Module):
                 {f"latent/{name}": value for name, value in alignment_metrics.items()}
             )
 
-        if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge"} and not bool(
-            high_frequency_weights.any()
-        ):
+        if stage in {
+            "detail",
+            "codec",
+            "flow",
+            "risk",
+            "bridge",
+            "id_bridge",
+            "id_utility",
+            "phase_transport",
+        } and not bool(high_frequency_weights.any()):
             if stage == "id_bridge":
                 total = total + _weighted_zero(self.model.id_bridge_origin, device)
                 total = total + _weighted_zero(self.model.residual_dit, device)
+            elif stage == "id_utility":
+                total = total + _weighted_zero(self.model.id_bridge_origin, device)
+            elif stage == "phase_transport":
+                total = total + _weighted_zero(self.model.phase_transport_head, device)
             else:
                 branch = {
                     "detail": self.model.detail_head,
@@ -1425,7 +1899,15 @@ def _stage_learning_rates(
 ) -> tuple[float, float, float]:
     base = float(train_config.get("learning_rate", 1e-4))
     encoder = float(train_config.get("encoder_learning_rate", 2e-5))
-    if stage in {"flow", "visual", "risk", "bridge", "id_bridge"}:
+    if stage in {
+        "flow",
+        "visual",
+        "risk",
+        "bridge",
+        "id_bridge",
+        "id_utility",
+        "phase_transport",
+    }:
         return 0.0, 0.0, base
     if stage == "balance":
         balance = train_config.get("balance_learning_rates", {})
@@ -1454,9 +1936,17 @@ def _replace_symlink(target: Path, link: Path) -> None:
 
 def _load_compatible_state(model: nn.Module, state: dict[str, Tensor]) -> tuple[int, int]:
     current = model.state_dict()
+    candidates = dict(state)
+    if isinstance(model, SentinelV3) and model.legacy_residual_dit is not None:
+        for name, value in state.items():
+            if not name.startswith("residual_dit."):
+                continue
+            legacy_name = f"legacy_residual_dit.{name.removeprefix('residual_dit.')}"
+            if legacy_name in current and legacy_name not in candidates:
+                candidates[legacy_name] = value
     compatible = {
         name: value
-        for name, value in state.items()
+        for name, value in candidates.items()
         if name in current
         and current[name].shape == value.shape
         and not (
@@ -1522,7 +2012,13 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
             model.residual_dit.blocks,
             model.residual_dit.output,
             model.residual_dit.origin_projection,
+            model.residual_dit.id_bridge_field_projection,
+            model.residual_dit.id_bridge_anchor_projection,
         )
+    elif stage == "id_utility":
+        modules = (model.id_bridge_origin,)
+    elif stage == "phase_transport":
+        modules = (model.phase_transport_head,)
     elif stage in {"balance", "overfit"}:
         modules = (model.encoder, model.decoder, model.detail_head, model.residual_dit)
     else:
@@ -1586,7 +2082,8 @@ def _optimizer(
         {
             "name": "dit",
             "params": list(model.residual_dit.parameters())
-            + list(model.id_bridge_origin.parameters()),
+            + list(model.id_bridge_origin.parameters())
+            + list(model.phase_transport_head.parameters()),
             "lr": residual_lr,
         },
     ]
@@ -1717,7 +2214,10 @@ def _checkpoint_payload(
         "rank_states": rank_states,
         "config": config,
         "codec_version": model.codec.version,
-        "residual_state": model.residual_state_metadata(),
+        "residual_state": {
+            **model.residual_state_metadata(),
+            "antithetic_weight": float(config.get("train", {}).get("id_bridge_antithetic_weight", 0.0)),
+        },
         "validation_protocol_hash": validation_protocol_hash,
         "best_metrics": best_metrics,
         "quality_gates": quality_gates,
@@ -1836,21 +2336,62 @@ def train(
         random_gsd=True,
         native_gsd_probability=(
             1.0
-            if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
+            if stage
+            in {
+                "detail",
+                "codec",
+                "flow",
+                "risk",
+                "bridge",
+                "id_bridge",
+                "id_utility",
+                "phase_transport",
+                "balance",
+            }
             else float(train_config.get("native_gsd_probability", 0.8))
         ),
         audit_high_frequency=stage
-        in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
+        in {
+            "detail",
+            "codec",
+            "flow",
+            "risk",
+            "bridge",
+            "id_bridge",
+            "id_utility",
+            "phase_transport",
+            "balance",
+        }
         and bool(train_config.get("registration_audit", True))
         and not bool(config["paths"].get("hf_eligibility")),
         temporal_prior_index=(
             config["paths"].get("temporal_prior_shards")
-            if stage in {"detail", "flow", "risk", "bridge", "id_bridge", "balance"}
+            if stage
+            in {
+                "detail",
+                "flow",
+                "risk",
+                "bridge",
+                "id_bridge",
+                "id_utility",
+                "phase_transport",
+                "balance",
+            }
             else None
         ),
     )
     if limit is not None:
-        if stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}:
+        if stage in {
+            "detail",
+            "codec",
+            "flow",
+            "risk",
+            "bridge",
+            "id_bridge",
+            "id_utility",
+            "phase_transport",
+            "balance",
+        }:
             eligible_indices: list[int] = []
             for index in range(len(dataset)):
                 if bool(dataset[index]["hf_eligible"]):
@@ -1872,6 +2413,8 @@ def train(
         "risk",
         "bridge",
         "id_bridge",
+        "id_utility",
+        "phase_transport",
         "balance",
     }
     eligibility_path = config["paths"].get("hf_eligibility")
@@ -1949,6 +2492,13 @@ def train(
         flow_rollout_samples=int(train_config.get("flow_rollout_samples", 2)),
         flow_rollout_pixel_weight=float(train_config.get("flow_rollout_pixel_weight", 0.1)),
         flow_rollout_hf_weight=float(train_config.get("flow_rollout_hf_weight", 0.1)),
+        id_bridge_antithetic_weight=float(
+            train_config.get("id_bridge_antithetic_weight", 0.0)
+        ),
+        phase_transport_hf_weight=float(train_config.get("phase_transport_hf_weight", 0.05)),
+        phase_transport_utility_weight=float(
+            train_config.get("phase_transport_utility_weight", 0.10)
+        ),
         risk_flow_steps=int(train_config.get("risk_flow_steps", 4)),
         bridge_flow_steps=int(train_config.get("bridge_flow_steps", 4)),
     ).to(device)
@@ -1988,7 +2538,18 @@ def train(
         if optical_detail_override is not None:
             model.set_detail_confidence_threshold("optical", float(optical_detail_override))
         if (
-            stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
+            stage
+            in {
+                "detail",
+                "codec",
+                "flow",
+                "risk",
+                "bridge",
+                "id_bridge",
+                "id_utility",
+                "phase_transport",
+                "balance",
+            }
             and bool(train_config.get("require_physical_gate", True))
             and not bool(initial.get("quality_gates", {}).get("physical", False))
         ):
@@ -2063,7 +2624,18 @@ def train(
             _match_optimizer_layout(optimizer)
 
     if (
-        stage in {"detail", "codec", "flow", "risk", "bridge", "id_bridge", "balance"}
+        stage
+        in {
+            "detail",
+            "codec",
+            "flow",
+            "risk",
+            "bridge",
+            "id_bridge",
+            "id_utility",
+            "phase_transport",
+            "balance",
+        }
         and bool(train_config.get("require_physical_gate", True))
         and not (resume or init_model)
     ):

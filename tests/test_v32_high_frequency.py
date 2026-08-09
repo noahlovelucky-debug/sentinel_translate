@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import pytest
 import torch
+import torch.nn.functional as F
 
-from sentinel_v3.calibration import calibrate_amplitude_scale, select_texture_release_candidate
+from sentinel_v3.calibration import (
+    _calibration_anchor_detail,
+    calibrate_amplitude_scale,
+    select_texture_release_candidate,
+)
 from sentinel_v3.data import StatefulIndexSampler, StatefulShardSampler, V2ShardDataset
 from sentinel_v3.evaluation import tail_quantile_error
 from sentinel_v3.losses import (
@@ -261,6 +266,62 @@ def test_optical_source_density_only_modulates_supported_anchor_regions(
     )
     gain = (adaptive - uniform).abs()
     assert gain[..., 8:24, 12:20].mean() > 5.0 * gain[..., :4, :4].mean()
+
+
+def test_source_aware_anchor_calibration_matches_runtime_highpass(
+    tiny_model: SentinelV3,
+) -> None:
+    fine_band = torch.ones(1, 3, 32, 32)
+    empty_band = torch.zeros_like(fine_band)
+    source_density = torch.ones(1, 1, 8, 8)
+    source_density[..., 2:6, 2:6] = 8.0
+    raw_anchor = SentinelV3.source_aware_optical_anchor(
+        (fine_band, empty_band, empty_band),
+        source_density,
+        torch.tensor((0.2, 0.0, 0.0)),
+        0.0,
+        1.0,
+        0.4,
+        1.0,
+    )
+    projected_anchor = highpass(raw_anchor)
+    assert raw_anchor.amax() > raw_anchor.amin()
+    assert not torch.allclose(raw_anchor, projected_anchor)
+
+    encoded = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    source = torch.zeros_like(encoded[0])
+    source[..., 8:24, 12:20] = 1.0
+    pyramid = (source, encoded[1], encoded[2], encoded[3])
+    base = torch.rand(1, 3, 32, 32)
+    valid = torch.ones(1, 1, 32, 32)
+    valid[..., :8, :8] = 0.0
+    tiny_model.eval()
+    tiny_model.set_detail_confidence_threshold("optical", 1.01)
+    tiny_model.set_optical_anchor_band_scales((0.2, 0.1, 0.05))
+    tiny_model.set_optical_anchor_density(0.2, 1.0)
+    tiny_model.set_optical_anchor_source_density(0.4, 1.0)
+    runtime_anchor = tiny_model.deterministic_detail(
+        pyramid, SENTINEL1, SENTINEL2, (32, 32), base
+    )
+    calibration_source_density = F.avg_pool2d(
+        highpass(pyramid[0]).abs().mean(dim=1, keepdim=True), 4, stride=4
+    )
+    calibration_anchor = _calibration_anchor_detail(
+        torch.stack(frequency_bands(base, levels=3), dim=1),
+        calibration_source_density,
+        valid,
+        {
+            "band_scales": tuple(float(value) for value in tiny_model.optical_anchor_band_scales),
+            "density_gain": float(tiny_model.optical_anchor_density_gain),
+            "density_threshold": float(tiny_model.optical_anchor_density_threshold),
+            "source_gain": float(tiny_model.optical_anchor_source_gain),
+            "source_threshold": float(tiny_model.optical_anchor_source_threshold),
+        },
+    )
+    assert int(torch.count_nonzero(calibration_anchor[..., :8, :8])) == 0
+    torch.testing.assert_close(calibration_anchor, runtime_anchor * valid)
 
 
 def test_high_frequency_sampler_excludes_long_gap_shards() -> None:

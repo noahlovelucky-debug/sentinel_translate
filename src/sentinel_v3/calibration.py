@@ -633,6 +633,26 @@ def calibrate_texture_release(
     return result
 
 
+def _calibration_anchor_detail(
+    stacked_bands: Tensor,
+    source_density: Tensor,
+    valid: Tensor,
+    candidate: dict[str, Any],
+) -> Tensor:
+    """Match deployed anchor projection and valid-pixel masking during calibration."""
+
+    raw_anchor = SentinelV3.source_aware_optical_anchor(
+        (stacked_bands[:, 0], stacked_bands[:, 1], stacked_bands[:, 2]),
+        source_density,
+        stacked_bands.new_tensor(candidate["band_scales"]),
+        float(candidate["density_gain"]),
+        float(candidate["density_threshold"]),
+        float(candidate["source_gain"]),
+        float(candidate["source_threshold"]),
+    )
+    return highpass(raw_anchor) * valid
+
+
 def calibrate_anchor_detail(
     checkpoint: str,
     manifest: str,
@@ -767,34 +787,12 @@ def calibrate_anchor_detail(
                     )
 
     def anchor_detail(item: dict[str, Tensor], candidate: dict[str, Any]) -> Tensor:
-        bands = item["bands"]
-        scales = bands.new_tensor(candidate["band_scales"]).view(1, 3, 1, 1, 1)
-        fine_scale: Tensor = scales[:, :1]
-        gain = float(candidate["density_gain"])
-        if gain > 0.0:
-            density = F.avg_pool2d(bands[:, 0].abs().mean(dim=1, keepdim=True), 4, stride=4)
-            normalized = density / density.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-            gate = (normalized >= float(candidate["density_threshold"])).to(bands.dtype)
-            gate = F.avg_pool2d(gate, 3, stride=1, padding=1)
-            gate = F.interpolate(
-                gate, size=bands.shape[-2:], mode="bilinear", align_corners=False
-            )
-            fine_scale = fine_scale + gain * gate[:, None]
-        source_gain = float(candidate["source_gain"])
-        if source_gain > 0.0:
-            source_density = item["source_density"]
-            normalized_source = source_density / source_density.mean(
-                dim=(-2, -1), keepdim=True
-            ).clamp_min(1e-6)
-            source_gate = (
-                normalized_source >= float(candidate["source_threshold"])
-            ).to(bands.dtype)
-            source_gate = F.avg_pool2d(source_gate, 3, stride=1, padding=1)
-            source_gate = F.interpolate(
-                source_gate, size=bands.shape[-2:], mode="bilinear", align_corners=False
-            )
-            fine_scale = fine_scale + source_gain * source_gate[:, None]
-        return fine_scale[:, 0] * bands[:, 0] + (bands[:, 1:] * scales[:, 1:]).sum(dim=1)
+        return _calibration_anchor_detail(
+            item["bands"],
+            item["source_density"],
+            item["valid"],
+            candidate,
+        )
 
     physical_rmse = sum(
         float(

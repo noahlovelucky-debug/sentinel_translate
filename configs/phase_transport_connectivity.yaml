@@ -1,0 +1,54 @@
+paths:
+  train_shards: /data/sentinel_translate/data/shards_v2/train/index.json
+  temporal_prior_shards: /data/sentinel_translate/data/shards_v32_temporal_prior/index.json
+  hf_eligibility: /data/sentinel_translate/data/shards_v32_hf_eligibility.json
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_phase_transport_connectivity_v3
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_phase_transport_connectivity_v3
+
+model:
+  flow_noise_scale: 0.35
+  optical_flow_noise_scale: 0.35
+  sar_flow_noise_scale: 0.35
+  id_bridge_enabled: true
+  id_bridge_state: haar_packet
+  id_bridge_state_channels: 48
+  id_bridge_optical_state_scale: 0.03
+  id_bridge_sar_state_scale: 4.0
+  id_bridge_anchor_origin: true
+  id_bridge_anchor_utility: false
+  id_bridge_phase_identifiability: true
+  id_bridge_optical_only: true
+  id_bridge_optical_innovation_scale: 0.0
+  id_bridge_sar_innovation_scale: 1.0
+  id_bridge_optical_innovation_band_scales: [0.0, 0.0, 0.0]
+  id_bridge_optical_correction_scale: 0.0
+  id_bridge_sar_correction_scale: 1.0
+  phase_transport_enabled: true
+  phase_transport_hidden: 128
+  phase_transport_gain_caps: [0.5, 0.25, 0.1]
+  phase_transport_offset_caps_px: [0.5, 0.5, 0.5]
+  phase_transport_initial_gate: 0.02
+
+train:
+  stage: phase_transport
+  max_steps: 100
+  batch_size: 1
+  gradient_accumulation: 2
+  num_workers: 0
+  learning_rate: 0.0001
+  init_use_ema: true
+  warmup_steps: 10
+  ema_decay: 0.99
+  log_every: 20
+  validate_every: 100
+  full_validate_every: 5000
+  save_every: 100
+  early_stop_patience: 5
+  find_unused_parameters: false
+  flow_rollout_every: 4
+  flow_visual_perceptual_weight: 0.10
+  phase_transport_hf_weight: 0.05
+  phase_transport_utility_weight: 0.10
+
+validation:
+  enabled: true

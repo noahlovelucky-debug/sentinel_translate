@@ -42,6 +42,8 @@ def _parser() -> argparse.ArgumentParser:
             "risk",
             "bridge",
             "id_bridge",
+            "id_utility",
+            "phase_transport",
             "balance",
         ),
     )

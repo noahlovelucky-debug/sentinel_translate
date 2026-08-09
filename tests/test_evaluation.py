@@ -107,7 +107,13 @@ def test_zero_radiometric_extensions_preserve_v4_loading(
 def test_id_bridge_extensions_are_optional_for_legacy_v4_checkpoints(
     tmp_path: Path, tiny_model: torch.nn.Module
 ) -> None:
-    prefixes = ("id_bridge_origin.", "residual_dit.origin_projection.")
+    prefixes = (
+        "id_bridge_origin.",
+        "residual_dit.origin_projection.",
+        "residual_dit.id_bridge_field_projection.",
+        "residual_dit.id_bridge_anchor_projection.",
+        "phase_transport_head.",
+    )
     legacy_state = {
         name: value for name, value in tiny_model.state_dict().items() if not name.startswith(prefixes)
     }
@@ -120,6 +126,11 @@ def test_id_bridge_extensions_are_optional_for_legacy_v4_checkpoints(
         "id_bridge_anchor_origin",
         "id_bridge_optical_innovation_scale",
         "id_bridge_sar_innovation_scale",
+        "phase_transport_enabled",
+        "phase_transport_hidden",
+        "phase_transport_gain_caps",
+        "phase_transport_offset_caps_px",
+        "phase_transport_initial_gate",
     ):
         legacy_config.pop(name)
     checkpoint = tmp_path / "legacy_v4_without_id_bridge.pt"

@@ -13,6 +13,7 @@ from torch import Tensor, nn
 from .api import Observation, TargetRequest, TranslationResult
 from .losses import (
     frequency_bands,
+    gradients,
     haar_dwt2,
     haar_packet_dwt2,
     haar_packet_idwt2,
@@ -718,9 +719,11 @@ class IdentifiabilityBridgeOrigin(nn.Module):
         pyramid_channels: Sequence[int],
         latent_channels: int = 16,
         hidden: int = 512,
+        optical_anchor_utility: bool = False,
     ) -> None:
         super().__init__()
         self.latent_channels = latent_channels
+        self.optical_anchor_utility = optical_anchor_utility
         self.pyramid_projections = nn.ModuleList(
             [nn.Conv2d(channels, hidden, 1) for channels in pyramid_channels]
         )
@@ -743,9 +746,25 @@ class IdentifiabilityBridgeOrigin(nn.Module):
                 for modality in ("optical", "sar")
             }
         )
+        self.anchor_utility_head = nn.Sequential(
+            nn.GroupNorm(_groups(hidden), hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 3, 1),
+        )
         for head in self.output_heads.values():
             nn.init.zeros_(head[-1].weight)
             nn.init.zeros_(head[-1].bias)
+        nn.init.zeros_(self.anchor_utility_head[-1].weight)
+        nn.init.zeros_(self.anchor_utility_head[-1].bias)
+        if optical_anchor_utility:
+            with torch.no_grad():
+                self.anchor_utility_head[-1].bias.copy_(
+                    torch.tensor(
+                        (0.0, -4.0, -4.0),
+                        device=self.anchor_utility_head[-1].bias.device,
+                        dtype=self.anchor_utility_head[-1].bias.dtype,
+                    )
+                )
 
     @staticmethod
     def _target_modality(target: str | SensorSpec) -> str:
@@ -793,11 +812,189 @@ class IdentifiabilityBridgeOrigin(nn.Module):
             )
             for level, projection in zip(pyramid, self.pyramid_projections, strict=True)
         )
-        output = self.output_heads[modality](self.trunk(scene + physical_features))
+        features = self.trunk(scene + physical_features)
+        output = self.output_heads[modality](features)
         mu, log_sigma, reliability_logits = output.split(
             (self.latent_channels, self.latent_channels, 3), dim=1
         )
+        if self.optical_anchor_utility and modality == "optical":
+            reliability_logits = self.anchor_utility_head(features)
         return mu, log_sigma, reliability_logits
+
+
+class ObservablePhaseTransportHead(nn.Module):
+    """Predict bounded Optical Laplacian transport from source and physical evidence."""
+
+    def __init__(
+        self,
+        pyramid_channels: Sequence[int],
+        hidden: int = 128,
+        gain_caps: Sequence[float] = (0.5, 0.25, 0.1),
+        offset_caps_px: Sequence[float] = (0.5, 0.5, 0.5),
+        initial_gate: float = 0.02,
+    ) -> None:
+        super().__init__()
+        if len(gain_caps) != 3 or len(offset_caps_px) != 3:
+            raise ValueError("phase transport requires three gain and offset caps")
+        if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
+            raise ValueError("phase transport initial_gate must be finite and in (0, 1)")
+        self.gain_caps = tuple(float(value) for value in gain_caps)
+        self.offset_caps_px = tuple(float(value) for value in offset_caps_px)
+        self.initial_gate = float(initial_gate)
+        self.pyramid_projections = nn.ModuleList(
+            [nn.Conv2d(channels, 32, 1) for channels in pyramid_channels]
+        )
+        self.physical_projection = nn.Conv2d(9, 32, 1)
+        self.source_phase_projection = nn.Conv2d(pyramid_channels[0], 3, 1)
+        self.fuse = nn.Conv2d(32 * (len(pyramid_channels) + 1), hidden, 1)
+        self.trunk = nn.Sequential(ResidualBlock(hidden), ResidualBlock(hidden))
+        self.output = nn.Sequential(
+            nn.GroupNorm(_groups(hidden), hidden),
+            nn.SiLU(),
+            nn.Conv2d(hidden, 9, 1),
+        )
+        nn.init.zeros_(self.output[-1].weight)
+        nn.init.zeros_(self.output[-1].bias)
+        with torch.no_grad():
+            self.output[-1].bias[:3].fill_(
+                math.log(self.initial_gate / (1.0 - self.initial_gate))
+            )
+
+    @staticmethod
+    def _full_gradients(values: Tensor) -> tuple[Tensor, Tensor]:
+        dy, dx = gradients(values)
+        return F.pad(dy, (0, 0, 0, 1)), F.pad(dx, (0, 1, 0, 0))
+
+    @staticmethod
+    def gain_gate(raw_gain: Tensor) -> Tensor:
+        """Return a smooth nonzero-gradient gain gate in (0, 1)."""
+
+        return torch.sigmoid(raw_gain)
+
+    @classmethod
+    def phase_coherence(cls, source_phase: Tensor, physical_bands: Tensor) -> Tensor:
+        """Return sign-invariant source/physical support on the latent grid."""
+
+        if (
+            source_phase.ndim != 4
+            or physical_bands.ndim != 5
+            or source_phase.shape[1] != 3
+            or physical_bands.shape[1] != 3
+            or source_phase.shape[0] != physical_bands.shape[0]
+            or source_phase.shape[-2:] != physical_bands.shape[-2:]
+        ):
+            raise ValueError("phase transport source and physical bands must share B3HW")
+        batch, _, height, width = source_phase.shape
+        if height % 4 or width % 4:
+            raise ValueError("phase transport inputs must be divisible by four")
+        physical_luminance = physical_bands.float().mean(dim=2)
+        source_dy, source_dx = cls._full_gradients(source_phase.float())
+        physical_dy, physical_dx = cls._full_gradients(physical_luminance)
+        source_energy = source_dx.square() + source_dy.square()
+        physical_energy = physical_dx.square() + physical_dy.square()
+        dot = source_dx * physical_dx + source_dy * physical_dy
+        epsilon = 1e-6
+        safe_source_energy = source_energy + epsilon
+        safe_physical_energy = physical_energy + epsilon
+        orientation = dot.square() / (safe_source_energy * safe_physical_energy)
+        balance = 2.0 * torch.sqrt(safe_source_energy * safe_physical_energy) / (
+            safe_source_energy + safe_physical_energy
+        )
+        support = (source_energy / safe_source_energy) * (
+            physical_energy / safe_physical_energy
+        )
+        coherence = F.avg_pool2d(
+            (orientation * balance * support).reshape(batch * 3, 1, height, width),
+            4,
+            stride=4,
+        ).reshape(batch, 3, height // 4, width // 4)
+        return torch.nan_to_num(coherence, nan=0.0, posinf=0.0, neginf=0.0).clamp(0.0, 1.0)
+
+    @staticmethod
+    def warp_bands(physical_bands: Tensor, offset_px: Tensor) -> Tensor:
+        """Apply bounded per-band subpixel offsets to Bx3xCxHxW Laplacian bands."""
+
+        if physical_bands.ndim != 5 or offset_px.ndim != 5:
+            raise ValueError("phase transport warp expects band and offset tensors")
+        batch, bands, channels, height, width = physical_bands.shape
+        if bands != 3 or offset_px.shape != (batch, 3, 2, height, width):
+            raise ValueError("phase transport offsets must be Bx3x2xHxW")
+        flat_bands = physical_bands.reshape(batch * bands, channels, height, width)
+        theta = torch.eye(
+            2,
+            3,
+            device=physical_bands.device,
+            dtype=physical_bands.dtype,
+        ).unsqueeze(0).expand(batch * bands, -1, -1)
+        grid = F.affine_grid(theta, flat_bands.shape, align_corners=False)
+        flat_offsets = offset_px.reshape(batch * bands, 2, height, width)
+        grid = grid + torch.stack(
+            (
+                flat_offsets[:, 0] * (2.0 / max(width, 1)),
+                flat_offsets[:, 1] * (2.0 / max(height, 1)),
+            ),
+            dim=-1,
+        )
+        warped = F.grid_sample(
+            flat_bands,
+            grid,
+            mode="bilinear",
+            padding_mode="border",
+            align_corners=False,
+        )
+        return warped.reshape(batch, bands, channels, height, width)
+
+    def forward(self, pyramid: Pyramid, physical: Tensor) -> tuple[Tensor, dict[str, Tensor]]:
+        if physical.ndim != 4 or physical.shape[1] != 3:
+            raise ValueError("phase transport requires Optical physical values in B3HW")
+        if len(pyramid) != len(self.pyramid_projections):
+            raise ValueError("phase transport requires the complete encoder pyramid")
+        height, width = physical.shape[-2:]
+        if height % 8 or width % 8:
+            raise ValueError("phase transport physical dimensions must be divisible by eight")
+        latent_size = (height // 4, width // 4)
+        physical_bands = torch.stack(frequency_bands(physical, levels=3), dim=1)
+        scene_features = [
+            projection(
+                F.interpolate(level, size=latent_size, mode="bilinear", align_corners=False)
+            )
+            for level, projection in zip(pyramid, self.pyramid_projections, strict=True)
+        ]
+        physical_features = self.physical_projection(
+            F.interpolate(
+                physical_bands.flatten(1, 2),
+                size=latent_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        )
+        features = self.trunk(self.fuse(torch.cat((*scene_features, physical_features), dim=1)))
+        output = self.output(features)
+        raw_gain, raw_offset = output[:, :3], output[:, 3:]
+        raw_offset = raw_offset.reshape(physical.shape[0], 3, 2, *latent_size)
+        source_phase = self.source_phase_projection(pyramid[0])
+        source_phase = F.interpolate(
+            source_phase, size=(height, width), mode="bilinear", align_corners=False
+        )
+        coherence = self.phase_coherence(source_phase, physical_bands)
+        gain_caps = raw_gain.new_tensor(self.gain_caps).view(1, 3, 1, 1)
+        offset_caps = raw_offset.new_tensor(self.offset_caps_px).view(1, 3, 1, 1, 1)
+        gate = self.gain_gate(raw_gain)
+        gains = gain_caps * gate * coherence
+        offsets = offset_caps * torch.tanh(raw_offset)
+        full_offsets = F.interpolate(
+            offsets.flatten(1, 2), size=(height, width), mode="bilinear", align_corners=False
+        ).reshape(physical.shape[0], 3, 2, height, width)
+        warped_bands = self.warp_bands(physical_bands, full_offsets)
+        full_gains = F.interpolate(gains, size=(height, width), mode="bilinear", align_corners=False)
+        delta = highpass((full_gains.unsqueeze(2) * warped_bands).sum(dim=1))
+        return delta, {
+            "gain": gains,
+            "gate": gate,
+            "offset_px": offsets,
+            "coherence": coherence,
+            "source_phase": source_phase,
+        }
 
 
 class ResidualDiT(nn.Module):
@@ -837,6 +1034,8 @@ class ResidualDiT(nn.Module):
             nn.Conv2d(hidden // 4, 1, 1),
         )
         self.origin_projection = nn.Conv2d(latent_channels, hidden, 1)
+        self.id_bridge_field_projection = nn.Conv2d(4, hidden, 1)
+        self.id_bridge_anchor_projection = nn.Conv2d(latent_channels, hidden, 1)
         self.optical_bridge_anchor = nn.Conv2d(latent_channels, hidden, 1)
         self.optical_bridge_adapters = nn.ModuleList(
             [LowRankResidualAdapter(hidden, min(64, hidden)) for _ in range(depth)]
@@ -852,6 +1051,10 @@ class ResidualDiT(nn.Module):
         nn.init.constant_(self.texture_risk_head[-1].bias, -2.2)
         nn.init.zeros_(self.origin_projection.weight)
         nn.init.zeros_(self.origin_projection.bias)
+        nn.init.zeros_(self.id_bridge_field_projection.weight)
+        nn.init.zeros_(self.id_bridge_field_projection.bias)
+        nn.init.zeros_(self.id_bridge_anchor_projection.weight)
+        nn.init.zeros_(self.id_bridge_anchor_projection.bias)
         if zero_output:
             nn.init.zeros_(self.output[-1].weight)
             nn.init.zeros_(self.output[-1].bias)
@@ -950,6 +1153,8 @@ class ResidualDiT(nn.Module):
         target_descriptors: Tensor,
         *,
         origin_latent: Tensor | None = None,
+        transport_field: Tensor | None = None,
+        id_bridge_anchor_state: Tensor | None = None,
         bridge_anchor: Tensor | None = None,
         use_optical_bridge: bool = False,
     ) -> Tensor:
@@ -962,6 +1167,16 @@ class ResidualDiT(nn.Module):
                 raise ValueError("origin latent must match flow latent")
             origin = self.origin_projection(origin_latent).flatten(2).transpose(1, 2)
             values = values + origin
+        if transport_field is not None:
+            if transport_field.shape != (batch, 4, height, width):
+                raise ValueError("id bridge transport field must be B4HW on the latent grid")
+            field = self.id_bridge_field_projection(transport_field).flatten(2).transpose(1, 2)
+            values = values + field
+        if id_bridge_anchor_state is not None:
+            if id_bridge_anchor_state.shape != latent.shape:
+                raise ValueError("id bridge anchor state must match flow latent")
+            anchor_state = self.id_bridge_anchor_projection(id_bridge_anchor_state)
+            values = values + anchor_state.flatten(2).transpose(1, 2)
         if use_optical_bridge:
             if bridge_anchor is None or bridge_anchor.shape != latent.shape:
                 raise ValueError("Optical bridge requires an anchor latent matching flow latent")
@@ -1014,8 +1229,21 @@ class ModelConfig:
     id_bridge_optical_state_scale: float = 0.03
     id_bridge_sar_state_scale: float = 4.0
     id_bridge_anchor_origin: bool = False
+    id_bridge_anchor_utility: bool = False
+    id_bridge_phase_identifiability: bool = False
+    id_bridge_optical_only: bool = False
     id_bridge_optical_innovation_scale: float = 1.0
     id_bridge_sar_innovation_scale: float = 1.0
+    id_bridge_optical_innovation_band_scales: tuple[float, float, float] = (1.0, 1.0, 1.0)
+    id_bridge_optical_mid_basis_scale: float = 0.15
+    id_bridge_optical_coarse_basis_scale: float = 0.05
+    id_bridge_optical_correction_scale: float = 1.0
+    id_bridge_sar_correction_scale: float = 1.0
+    phase_transport_enabled: bool = False
+    phase_transport_hidden: int = 128
+    phase_transport_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1)
+    phase_transport_offset_caps_px: tuple[float, float, float] = (0.5, 0.5, 0.5)
+    phase_transport_initial_gate: float = 0.02
     architecture: str = "v3.2"
 
     def __post_init__(self) -> None:
@@ -1031,6 +1259,48 @@ class ModelConfig:
             value = float(getattr(self, name))
             if not math.isfinite(value) or not 0.0 <= value <= 1.0:
                 raise ValueError(f"{name} must be finite and in [0, 1]")
+        band_scales = self.id_bridge_optical_innovation_band_scales
+        if not isinstance(band_scales, (tuple, list)) or len(band_scales) != 3:
+            raise ValueError("id_bridge_optical_innovation_band_scales must contain three values")
+        normalized_band_scales = tuple(float(value) for value in band_scales)
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in normalized_band_scales):
+            raise ValueError(
+                "id_bridge_optical_innovation_band_scales must be finite and in [0, 1]"
+            )
+        self.id_bridge_optical_innovation_band_scales = normalized_band_scales
+        for name in (
+            "id_bridge_optical_mid_basis_scale",
+            "id_bridge_optical_coarse_basis_scale",
+        ):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or value < 0.0:
+                raise ValueError(f"{name} must be finite and non-negative")
+        for name in ("id_bridge_optical_correction_scale", "id_bridge_sar_correction_scale"):
+            value = float(getattr(self, name))
+            if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+        if not isinstance(self.phase_transport_enabled, bool):
+            raise TypeError("phase_transport_enabled must be a bool")
+        if isinstance(self.phase_transport_hidden, bool) or not isinstance(
+            self.phase_transport_hidden, int
+        ):
+            raise TypeError("phase_transport_hidden must be a positive integer")
+        if self.phase_transport_hidden <= 0:
+            raise ValueError("phase_transport_hidden must be positive")
+        for name in ("phase_transport_gain_caps", "phase_transport_offset_caps_px"):
+            values = getattr(self, name)
+            if not isinstance(values, (tuple, list)) or len(values) != 3:
+                raise ValueError(f"{name} must contain three values")
+            if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+                raise TypeError(f"{name} must contain numeric values")
+            normalized = tuple(float(value) for value in values)
+            if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in normalized):
+                raise ValueError(f"{name} must be finite and in [0, 1]")
+            setattr(self, name, normalized)
+        initial_gate = float(self.phase_transport_initial_gate)
+        if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
+            raise ValueError("phase_transport_initial_gate must be finite and in (0, 1)")
+        self.phase_transport_initial_gate = initial_gate
 
 
 class SentinelV3(nn.Module):
@@ -1057,10 +1327,29 @@ class SentinelV3(nn.Module):
             cfg.dit_heads,
             zero_output=cfg.id_bridge_enabled and cfg.id_bridge_state == "haar_packet",
         )
+        # A phase Optical bridge has a 48-channel packet flow, while its SAR
+        # fallback must remain bitwise equivalent to the old 16-channel codec flow.
+        self.legacy_residual_dit: ResidualDiT | None = None
+        if cfg.id_bridge_enabled and cfg.id_bridge_optical_only:
+            self.legacy_residual_dit = ResidualDiT(
+                (cfg.width, cfg.width * 2, cfg.width * 4, cfg.hidden),
+                cfg.codec_latent_channels,
+                cfg.dit_hidden,
+                cfg.dit_depth,
+                cfg.dit_heads,
+            )
         self.id_bridge_origin = IdentifiabilityBridgeOrigin(
             (cfg.width, cfg.width * 2, cfg.width * 4, cfg.hidden),
             self.id_bridge_latent_channels,
             cfg.dit_hidden,
+            optical_anchor_utility=cfg.id_bridge_anchor_utility,
+        )
+        self.phase_transport_head = ObservablePhaseTransportHead(
+            (cfg.width, cfg.width * 2, cfg.width * 4, cfg.hidden),
+            cfg.phase_transport_hidden,
+            cfg.phase_transport_gain_caps,
+            cfg.phase_transport_offset_caps_px,
+            cfg.phase_transport_initial_gate,
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("optical_bridge_alpha_scale", torch.ones(()))
@@ -1222,6 +1511,69 @@ class SentinelV3(nn.Module):
         )
         return mean * valid, log_variance, pyramid
 
+    @staticmethod
+    def source_aware_optical_anchor(
+        physical_bands: tuple[Tensor, Tensor, Tensor],
+        source_density: Tensor,
+        band_scales: Tensor,
+        physical_density_gain: Tensor | float,
+        physical_density_threshold: Tensor | float,
+        source_gain: Tensor | float,
+        source_threshold: Tensor | float,
+    ) -> Tensor:
+        """Build a raw Optical anchor before the deployment high-pass projection."""
+
+        fine_band = physical_bands[0]
+        scales = band_scales.to(fine_band)
+        if scales.numel() != 3:
+            raise ValueError("Optical anchor requires three band scales")
+        scales = scales.reshape(3)
+        fine_scale: Tensor = scales[0]
+        if float(physical_density_gain) > 0.0:
+            density = F.avg_pool2d(
+                fine_band.abs().mean(dim=1, keepdim=True), 4, stride=4
+            )
+            normalized = density / density.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
+            threshold = (
+                physical_density_threshold.to(normalized)
+                if isinstance(physical_density_threshold, Tensor)
+                else physical_density_threshold
+            )
+            gate = (normalized >= threshold).to(fine_band.dtype)
+            gate = F.avg_pool2d(gate, 3, stride=1, padding=1)
+            gate = F.interpolate(
+                gate, size=fine_band.shape[-2:], mode="bilinear", align_corners=False
+            )
+            gain = (
+                physical_density_gain.to(fine_band)
+                if isinstance(physical_density_gain, Tensor)
+                else physical_density_gain
+            )
+            fine_scale = fine_scale + gain * gate
+        if float(source_gain) > 0.0:
+            normalized_source = source_density / source_density.mean(
+                dim=(-2, -1), keepdim=True
+            ).clamp_min(1e-6)
+            threshold = (
+                source_threshold.to(normalized_source)
+                if isinstance(source_threshold, Tensor)
+                else source_threshold
+            )
+            source_gate = (normalized_source >= threshold).to(fine_band.dtype)
+            source_gate = F.avg_pool2d(source_gate, 3, stride=1, padding=1)
+            source_gate = F.interpolate(
+                source_gate,
+                size=fine_band.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+            gain = source_gain.to(fine_band) if isinstance(source_gain, Tensor) else source_gain
+            fine_scale = fine_scale + gain * source_gate
+        anchor_detail = fine_scale * fine_band
+        return anchor_detail + sum(
+            scale * band for scale, band in zip(scales[1:], physical_bands[1:], strict=True)
+        )
+
     def deterministic_detail(
         self,
         pyramid: Pyramid,
@@ -1241,43 +1593,17 @@ class SentinelV3(nn.Module):
         )[0]
         if target.modality == "optical" and base is not None:
             anchor_bands = frequency_bands(base, levels=3)
-            scales = self.optical_anchor_band_scales.to(base)
-            fine_scale: Tensor = scales[0]
-            if float(self.optical_anchor_density_gain) > 0.0:
-                density = F.avg_pool2d(
-                    anchor_bands[0].abs().mean(dim=1, keepdim=True), 4, stride=4
-                )
-                normalized = density / density.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-                gate = (normalized >= self.optical_anchor_density_threshold.to(normalized)).to(
-                    base.dtype
-                )
-                gate = F.avg_pool2d(gate, 3, stride=1, padding=1)
-                gate = F.interpolate(
-                    gate, size=base.shape[-2:], mode="bilinear", align_corners=False
-                )
-                fine_scale = fine_scale + self.optical_anchor_density_gain.to(base) * gate
-            if float(self.optical_anchor_source_gain) > 0.0:
-                source_density = F.avg_pool2d(
-                    highpass(pyramid[0]).abs().mean(dim=1, keepdim=True), 4, stride=4
-                )
-                normalized_source = source_density / source_density.mean(
-                    dim=(-2, -1), keepdim=True
-                ).clamp_min(1e-6)
-                source_gate = (
-                    normalized_source
-                    >= self.optical_anchor_source_threshold.to(normalized_source)
-                ).to(base.dtype)
-                source_gate = F.avg_pool2d(source_gate, 3, stride=1, padding=1)
-                source_gate = F.interpolate(
-                    source_gate,
-                    size=base.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-                fine_scale = fine_scale + self.optical_anchor_source_gain.to(base) * source_gate
-            anchor_detail = fine_scale * anchor_bands[0]
-            anchor_detail = anchor_detail + sum(
-                scale * band for scale, band in zip(scales[1:], anchor_bands[1:], strict=True)
+            source_density = F.avg_pool2d(
+                highpass(pyramid[0]).abs().mean(dim=1, keepdim=True), 4, stride=4
+            )
+            anchor_detail = self.source_aware_optical_anchor(
+                anchor_bands,
+                source_density,
+                self.optical_anchor_band_scales.to(base),
+                self.optical_anchor_density_gain,
+                self.optical_anchor_density_threshold,
+                self.optical_anchor_source_gain,
+                self.optical_anchor_source_threshold,
             )
             detail = detail + anchor_detail
         return highpass(detail)
@@ -1290,11 +1616,48 @@ class SentinelV3(nn.Module):
         output_size: tuple[int, int],
         base: Tensor,
     ) -> Tensor:
-        if self.config.id_bridge_enabled:
+        if self.config.phase_transport_enabled and target.modality == "optical":
+            return self.phase_transport_detail(pyramid, base, target)
+        if self.config.id_bridge_anchor_utility and target.modality == "optical":
+            _, _, reliability_logits = self.id_bridge_origin(pyramid, base, target)
+            return self.id_bridge_anchor_detail(
+                pyramid, base, target, reliability_logits=reliability_logits
+            )
+        if self.id_bridge_enabled_for(target):
             if self.id_bridge_uses_observable_anchor:
                 return self.id_bridge_anchor_detail(pyramid, base, target)
             return torch.zeros_like(base)
         return self.deterministic_detail(pyramid, source, target, output_size, base=base)
+
+    def phase_transport_delta(
+        self, pyramid: Pyramid, physical: Tensor, target: SensorSpec
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Return the Optical observable transport correction and diagnostics."""
+
+        if target.modality != "optical":
+            raise ValueError("phase transport is defined for Optical targets only")
+        if not self.config.phase_transport_enabled:
+            return torch.zeros_like(physical), {}
+        return self.phase_transport_head(pyramid, physical)
+
+    def phase_transport_detail(
+        self,
+        pyramid: Pyramid,
+        physical: Tensor,
+        target: SensorSpec,
+        *,
+        return_diagnostics: bool = False,
+    ) -> Tensor | tuple[Tensor, Tensor, Tensor, dict[str, Tensor]]:
+        """Compose the frozen source-aware anchor with its observable phase delta."""
+
+        if target.modality != "optical":
+            raise ValueError("phase transport is defined for Optical targets only")
+        anchor = self.id_bridge_anchor_detail(pyramid, physical, target)
+        delta, diagnostics = self.phase_transport_delta(pyramid, physical, target)
+        detail = anchor + delta
+        if return_diagnostics:
+            return detail, anchor, delta, diagnostics
+        return detail
 
     def deterministic_detail_with_confidence(
         self,
@@ -1356,6 +1719,8 @@ class SentinelV3(nn.Module):
         visual_channels: int | None = None,
         *,
         origin_latent: Tensor | None = None,
+        transport_field: Tensor | None = None,
+        id_bridge_anchor_state: Tensor | None = None,
         bridge_anchor: Tensor | None = None,
         use_optical_bridge: bool | None = None,
     ) -> Tensor:
@@ -1366,15 +1731,29 @@ class SentinelV3(nn.Module):
             if use_optical_bridge is None
             else use_optical_bridge
         )
-        return self.residual_dit(
+        residual_dit = self._residual_dit_for(target)
+        return residual_dit(
             latent,
             time,
             pyramid,
             descriptors,
             origin_latent=origin_latent,
+            transport_field=transport_field,
+            id_bridge_anchor_state=id_bridge_anchor_state,
             bridge_anchor=bridge_anchor,
             use_optical_bridge=use_bridge,
         )
+
+    def _residual_dit_for(self, target: SensorSpec) -> ResidualDiT:
+        if (
+            target.modality == "sar"
+            and self.config.id_bridge_enabled
+            and self.config.id_bridge_optical_only
+        ):
+            if self.legacy_residual_dit is None:
+                raise RuntimeError("Optical-only id bridge is missing its legacy SAR flow")
+            return self.legacy_residual_dit
+        return self.residual_dit
 
     def predict_id_bridge_origin(
         self,
@@ -1398,12 +1777,23 @@ class SentinelV3(nn.Module):
         correction, log_sigma, reliability_logits = self.id_bridge_origin(
             pyramid, physical, target
         )
-        anchor_detail = self.id_bridge_anchor_detail(pyramid, physical, target)
+        anchor_detail = self.id_bridge_anchor_detail(
+            pyramid, physical, target, reliability_logits=reliability_logits
+        )
         if anchor_detail.shape != physical.shape:
             raise RuntimeError("id bridge anchor detail must match the physical visual shape")
-        if self.id_bridge_uses_observable_anchor:
+        if self.id_bridge_uses_phase_identifiability:
+            q_state = self.id_bridge_q_state(reliability_logits, target).detach()
+            correction_scale = float(
+                getattr(self.config, f"id_bridge_{target.modality}_correction_scale")
+            )
+            mu = correction_scale * q_state * correction
+        elif self.id_bridge_uses_observable_anchor:
             correction_gate = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True).detach()
-            mu = correction_gate * correction
+            correction_scale = float(
+                getattr(self.config, f"id_bridge_{target.modality}_correction_scale")
+            )
+            mu = correction_scale * correction_gate * correction
         else:
             mu = correction
         return mu, correction, anchor_detail, log_sigma, reliability_logits
@@ -1411,6 +1801,17 @@ class SentinelV3(nn.Module):
     @property
     def id_bridge_uses_haar_packet(self) -> bool:
         return self.config.id_bridge_enabled and self.config.id_bridge_state == "haar_packet"
+
+    @property
+    def id_bridge_uses_phase_identifiability(self) -> bool:
+        return self.id_bridge_uses_haar_packet and self.config.id_bridge_phase_identifiability
+
+    def id_bridge_enabled_for(self, target: SensorSpec) -> bool:
+        """Whether this target modality uses the new bridge at inference."""
+
+        return self.config.id_bridge_enabled and (
+            not self.config.id_bridge_optical_only or target.modality == "optical"
+        )
 
     @property
     def id_bridge_uses_observable_anchor(self) -> bool:
@@ -1424,12 +1825,173 @@ class SentinelV3(nn.Module):
             return 2
         raise ValueError("id bridge target modality must be optical or sar")
 
+    def id_bridge_band_fields_to_state(self, band_fields: Tensor, target: SensorSpec) -> Tensor:
+        """Map fine/mid/coarse fields onto their exact two-level Haar packet slots."""
+
+        if not self.id_bridge_uses_haar_packet:
+            raise ValueError("band-to-state mapping requires a Haar packet id bridge")
+        if (
+            band_fields.ndim != 4
+            or band_fields.shape[1] != 3
+            or band_fields.shape[-2] <= 0
+            or band_fields.shape[-1] <= 0
+        ):
+            raise ValueError("id bridge band fields must be B3HW on the latent grid")
+        visual_channels = self._id_bridge_visual_channels(target)
+        state = band_fields.new_zeros(
+            band_fields.shape[0],
+            self.config.id_bridge_state_channels,
+            *band_fields.shape[-2:],
+        )
+        for channel in range(visual_channels):
+            offset = channel * 16
+            for first_band in range(4):
+                for second_band in range(4):
+                    if first_band == 0 and second_band == 0:
+                        continue
+                    band_index = 2 if first_band == 0 else 1 if second_band == 0 else 0
+                    state[:, offset + first_band * 4 + second_band] = band_fields[:, band_index]
+        return self._project_haar_packet_state(state, target)
+
+    def id_bridge_q_state(self, reliability_logits: Tensor, target: SensorSpec) -> Tensor:
+        """Expand three reliability probabilities to valid Haar packet coefficients."""
+
+        return self.id_bridge_band_fields_to_state(torch.sigmoid(reliability_logits), target)
+
+    def id_bridge_innovation_release_bands(
+        self, reliability_logits: Tensor, target: SensorSpec
+    ) -> Tensor:
+        """Return configured fine/mid/coarse innovation release scales on the latent grid."""
+
+        if (
+            reliability_logits.ndim != 4
+            or reliability_logits.shape[1] != 3
+            or reliability_logits.shape[-2] <= 0
+            or reliability_logits.shape[-1] <= 0
+        ):
+            raise ValueError("id bridge reliability logits must be B3HW on the latent grid")
+        if target.modality == "optical":
+            values = self.config.id_bridge_optical_innovation_band_scales
+        elif target.modality == "sar":
+            values = (self.config.id_bridge_sar_innovation_scale,) * 3
+        else:
+            raise ValueError("id bridge target modality must be optical or sar")
+        return reliability_logits.new_tensor(values).view(1, 3, 1, 1).expand_as(
+            reliability_logits
+        )
+
+    def id_bridge_innovation_release_state(
+        self, reliability_logits: Tensor, target: SensorSpec
+    ) -> Tensor:
+        """Map configured three-band release scales to the exact Haar packet state."""
+
+        return self.id_bridge_band_fields_to_state(
+            self.id_bridge_innovation_release_bands(reliability_logits, target), target
+        )
+
+    @staticmethod
+    def id_bridge_transport_field(
+        reliability_logits: Tensor,
+        log_sigma: Tensor,
+        *,
+        detach: bool = False,
+    ) -> Tensor:
+        """Build the spatial phase-conditioning field consumed by the residual flow."""
+
+        if (
+            reliability_logits.ndim != 4
+            or reliability_logits.shape[1] != 3
+            or log_sigma.ndim != 4
+            or log_sigma.shape[0] != reliability_logits.shape[0]
+            or log_sigma.shape[-2:] != reliability_logits.shape[-2:]
+        ):
+            raise ValueError("id bridge transport inputs must share a B3HW latent grid")
+        field = torch.cat(
+            (
+                torch.sigmoid(reliability_logits),
+                torch.sigmoid(log_sigma).mean(dim=1, keepdim=True),
+            ),
+            dim=1,
+        )
+        return field.detach() if detach else field
+
+    def id_bridge_anchor_components(
+        self,
+        pyramid: Pyramid,
+        physical: Tensor,
+        target: SensorSpec,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Return the raw fine, mid, and coarse Optical anchor basis components."""
+
+        if not (self.config.id_bridge_anchor_utility and target.modality == "optical"):
+            return torch.zeros_like(physical), torch.zeros_like(physical), torch.zeros_like(physical)
+        if physical.ndim != 4 or physical.shape[1] != 3:
+            raise ValueError("Optical anchor components require B3HW physical values")
+        with torch.no_grad():
+            physical_bands = frequency_bands(physical, levels=3)
+            source_density = F.avg_pool2d(
+                highpass(pyramid[0]).abs().mean(dim=1, keepdim=True), 4, stride=4
+            )
+            scales = self.optical_anchor_band_scales.to(physical)
+            fine_scales = torch.stack(
+                (scales[0], torch.zeros_like(scales[1]), torch.zeros_like(scales[2]))
+            )
+            fine = self.source_aware_optical_anchor(
+                physical_bands,
+                source_density,
+                fine_scales,
+                self.optical_anchor_density_gain,
+                self.optical_anchor_density_threshold,
+                self.optical_anchor_source_gain,
+                self.optical_anchor_source_threshold,
+            )
+            mid = self.config.id_bridge_optical_mid_basis_scale * physical_bands[1]
+            coarse = self.config.id_bridge_optical_coarse_basis_scale * physical_bands[2]
+        return fine.detach(), mid.detach(), coarse.detach()
+
+    @staticmethod
+    def id_bridge_anchor_gains(reliability_logits: Tensor) -> Tensor:
+        """Map three latent-grid reliability logits to bounded positive anchor gains."""
+
+        if (
+            reliability_logits.ndim != 4
+            or reliability_logits.shape[1] != 3
+            or reliability_logits.shape[-2] <= 0
+            or reliability_logits.shape[-1] <= 0
+        ):
+            raise ValueError("id bridge anchor logits must be B3HW on the latent grid")
+        if not torch.is_floating_point(reliability_logits):
+            raise ValueError("id bridge anchor logits must have a floating point dtype")
+        return torch.exp(reliability_logits.float()).clamp(max=3.0).to(reliability_logits.dtype)
+
     def id_bridge_anchor_detail(
         self,
         pyramid: Pyramid,
         physical: Tensor,
         target: SensorSpec,
+        reliability_logits: Tensor | None = None,
     ) -> Tensor:
+        if self.config.id_bridge_anchor_utility and target.modality == "optical":
+            if reliability_logits is None:
+                raise ValueError("utility Optical anchor detail requires reliability logits")
+            if physical.ndim != 4 or physical.shape[1] != 3:
+                raise ValueError("utility Optical anchor detail requires B3HW physical values")
+            gains = self.id_bridge_anchor_gains(reliability_logits)
+            latent_size = (physical.shape[-2] // 4, physical.shape[-1] // 4)
+            if gains.shape[0] != physical.shape[0] or gains.shape[-2:] != latent_size:
+                raise ValueError("utility Optical anchor logits must match the latent grid")
+            components = self.id_bridge_anchor_components(pyramid, physical, target)
+            anchor_detail = sum(
+                F.interpolate(
+                    gains[:, index : index + 1],
+                    size=physical.shape[-2:],
+                    mode="bilinear",
+                    align_corners=False,
+                )
+                * component
+                for index, component in enumerate(components)
+            )
+            return highpass(anchor_detail)
         if not (self.id_bridge_uses_observable_anchor and target.modality == "optical"):
             return torch.zeros_like(physical)
         with torch.no_grad():
@@ -1500,17 +2062,32 @@ class SentinelV3(nn.Module):
         scale = float(getattr(self.config, f"id_bridge_{target.modality}_state_scale"))
         return haar_packet_idwt2(projected[:, : visual_channels * 16] * scale)
 
+    def id_bridge_anchor_state(self, anchor_detail: Tensor, target: SensorSpec) -> Tensor:
+        """Encode a frozen protected pixel anchor as a legal Haar flow condition."""
+
+        return self.encode_id_bridge_residual(
+            self.project_id_bridge_residual(anchor_detail, target), target
+        )
+
     def gate_id_bridge_innovation(
         self,
         latent: Tensor,
         mu: Tensor,
         reliability_logits: Tensor,
         target: SensorSpec,
+        *,
+        q_state: Tensor | None = None,
     ) -> Tensor:
         if latent.ndim != 4 or mu.shape != latent.shape:
             raise ValueError("id bridge latent and origin must have matching BCHW shapes")
         if reliability_logits.shape != (latent.shape[0], 3, *latent.shape[-2:]):
             raise ValueError("id bridge reliability logits must be B3HW on the latent grid")
+        if self.id_bridge_uses_phase_identifiability:
+            phase_q = self.id_bridge_q_state(reliability_logits, target) if q_state is None else q_state
+            if phase_q.shape != latent.shape:
+                raise ValueError("id bridge phase reliability state must match the latent")
+            release = self.id_bridge_innovation_release_state(reliability_logits, target)
+            return mu + release * (1.0 - phase_q) * (latent - mu)
         q = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
         scale = float(getattr(self.config, f"id_bridge_{target.modality}_innovation_scale"))
         # Legacy codec and unanchored Haar checkpoints retain their prior transport behavior.
@@ -1529,8 +2106,23 @@ class SentinelV3(nn.Module):
             "optical_scale": self.config.id_bridge_optical_state_scale,
             "sar_scale": self.config.id_bridge_sar_state_scale,
             "anchor_origin": self.config.id_bridge_anchor_origin,
+            "anchor_utility": self.config.id_bridge_anchor_utility,
+            "phase_identifiability": self.config.id_bridge_phase_identifiability,
+            "optical_only": self.config.id_bridge_optical_only,
+            "optical_mid_basis_scale": self.config.id_bridge_optical_mid_basis_scale,
+            "optical_coarse_basis_scale": self.config.id_bridge_optical_coarse_basis_scale,
             "optical_innovation_scale": self.config.id_bridge_optical_innovation_scale,
             "sar_innovation_scale": self.config.id_bridge_sar_innovation_scale,
+            "optical_innovation_band_scales": tuple(
+                self.config.id_bridge_optical_innovation_band_scales
+            ),
+            "optical_correction_scale": self.config.id_bridge_optical_correction_scale,
+            "sar_correction_scale": self.config.id_bridge_sar_correction_scale,
+            "phase_transport_enabled": self.config.phase_transport_enabled,
+            "phase_transport_hidden": self.config.phase_transport_hidden,
+            "phase_transport_gain_caps": tuple(self.config.phase_transport_gain_caps),
+            "phase_transport_offset_caps_px": tuple(self.config.phase_transport_offset_caps_px),
+            "phase_transport_initial_gate": self.config.phase_transport_initial_gate,
         }
 
     def sample_id_bridge_residual(
@@ -1548,7 +2140,14 @@ class SentinelV3(nn.Module):
         mu, _, anchor_detail, log_sigma, reliability_logits = (
             self.predict_id_bridge_origin_components(pyramid, physical, target)
         )
-        q = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
+        if self.id_bridge_uses_phase_identifiability:
+            q = self.id_bridge_q_state(reliability_logits, target)
+            transport_field = self.id_bridge_transport_field(reliability_logits, log_sigma)
+            anchor_state = self.id_bridge_anchor_state(anchor_detail.detach(), target)
+        else:
+            q = torch.sigmoid(reliability_logits).mean(dim=1, keepdim=True)
+            transport_field = None
+            anchor_state = None
         sigma = self.flow_noise_scale(target) * torch.sigmoid(log_sigma) * (1.0 - q)
         generator = torch.Generator(device=mu.device).manual_seed(seed)
         epsilon = torch.randn(
@@ -1565,9 +2164,16 @@ class SentinelV3(nn.Module):
             physical.shape[1],
             steps=steps or self.config.flow_steps,
             origin_latent=mu,
+            transport_field=transport_field,
+            id_bridge_anchor_state=anchor_state,
             use_optical_bridge=False,
         )
-        if self.id_bridge_uses_observable_anchor:
+        if self.id_bridge_uses_phase_identifiability:
+            innovation_gate = self.id_bridge_innovation_release_state(
+                reliability_logits, target
+            ) * (1.0 - q)
+            correction_gate = q.detach()
+        elif self.id_bridge_uses_observable_anchor:
             innovation_gate = float(
                 getattr(self.config, f"id_bridge_{target.modality}_innovation_scale")
             ) * (1.0 - q)
@@ -1575,7 +2181,9 @@ class SentinelV3(nn.Module):
         else:
             innovation_gate = torch.ones_like(q)
             correction_gate = torch.ones_like(q)
-        latent = self.gate_id_bridge_innovation(latent, mu, reliability_logits, target)
+        latent = self.gate_id_bridge_innovation(
+            latent, mu, reliability_logits, target, q_state=q if transport_field is not None else None
+        )
         residual = self.decode_id_bridge_residual(latent, target)
         if return_origin:
             return residual, {
@@ -1598,7 +2206,7 @@ class SentinelV3(nn.Module):
         seed: int,
         steps: int | None = None,
     ) -> Tensor:
-        if self.config.id_bridge_enabled:
+        if self.id_bridge_enabled_for(target):
             residual = self.sample_id_bridge_residual(
                 pyramid, base, target, seed=seed, steps=steps
             )
@@ -1623,7 +2231,7 @@ class SentinelV3(nn.Module):
         descriptors = self.descriptors(
             target.channels[:visual_channels], next(self.parameters()).device
         )
-        normalized = self.residual_dit.predict_amplitude(
+        normalized = self._residual_dit_for(target).predict_amplitude(
             pyramid,
             descriptors,
             visual_channels,
@@ -1849,6 +2457,8 @@ class SentinelV3(nn.Module):
         *,
         steps: int,
         origin_latent: Tensor | None = None,
+        transport_field: Tensor | None = None,
+        id_bridge_anchor_state: Tensor | None = None,
         bridge_anchor: Tensor | None = None,
         use_optical_bridge: bool | None = None,
     ) -> Tensor:
@@ -1866,6 +2476,8 @@ class SentinelV3(nn.Module):
                 target,
                 channels,
                 origin_latent=origin_latent,
+                transport_field=transport_field,
+                id_bridge_anchor_state=id_bridge_anchor_state,
                 bridge_anchor=bridge_anchor,
                 use_optical_bridge=use_optical_bridge,
             )
@@ -1880,6 +2492,8 @@ class SentinelV3(nn.Module):
                 target,
                 channels,
                 origin_latent=origin_latent,
+                transport_field=transport_field,
+                id_bridge_anchor_state=id_bridge_anchor_state,
                 bridge_anchor=bridge_anchor,
                 use_optical_bridge=use_optical_bridge,
             )
@@ -2007,7 +2621,7 @@ class SentinelV3(nn.Module):
             violations.append(violation)
             if sample_index == 0:
                 result.stochastic_residual = texture
-        if not self.config.id_bridge_enabled:
+        if not self.id_bridge_enabled_for(target.spec):
             result.residual_amplitude = self.residual_amplitude(
                 pyramid, target.spec, base.shape[1], tuple(base.shape[-2:])
             )

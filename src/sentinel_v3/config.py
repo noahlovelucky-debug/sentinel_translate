@@ -53,6 +53,9 @@ DEFAULT: dict[str, Any] = {
         "flow_rollout_samples": 2,
         "flow_rollout_pixel_weight": 0.1,
         "flow_rollout_hf_weight": 0.1,
+        "id_bridge_antithetic_weight": 0.0,
+        "phase_transport_hf_weight": 0.05,
+        "phase_transport_utility_weight": 0.10,
         "risk_flow_steps": 4,
         "bridge_flow_steps": 4,
         "codec_perceptual_every": 8,
@@ -123,6 +126,48 @@ def validate_config(config: dict[str, Any]) -> None:
         value = float(model[name])
         if not math.isfinite(value) or not 0.0 <= value <= 1.0:
             raise ValueError(f"model.{name} must be finite and in [0, 1]")
+    band_scales = model["id_bridge_optical_innovation_band_scales"]
+    if not isinstance(band_scales, (list, tuple)) or len(band_scales) != 3:
+        raise ValueError("model.id_bridge_optical_innovation_band_scales must contain three values")
+    if any(
+        not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+        for value in band_scales
+    ):
+        raise ValueError(
+            "model.id_bridge_optical_innovation_band_scales must be finite and in [0, 1]"
+        )
+    for name in (
+        "id_bridge_optical_mid_basis_scale",
+        "id_bridge_optical_coarse_basis_scale",
+    ):
+        value = float(model[name])
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"model.{name} must be finite and non-negative")
+    for name in ("id_bridge_optical_correction_scale", "id_bridge_sar_correction_scale"):
+        value = float(model[name])
+        if not math.isfinite(value) or not 0.0 <= value <= 1.0:
+            raise ValueError(f"model.{name} must be finite and in [0, 1]")
+    if not isinstance(model["phase_transport_enabled"], bool):
+        raise TypeError("model.phase_transport_enabled must be a bool")
+    hidden = model["phase_transport_hidden"]
+    if isinstance(hidden, bool) or not isinstance(hidden, int):
+        raise TypeError("model.phase_transport_hidden must be a positive integer")
+    if hidden <= 0:
+        raise ValueError("model.phase_transport_hidden must be positive")
+    for name in ("phase_transport_gain_caps", "phase_transport_offset_caps_px"):
+        values = model[name]
+        if not isinstance(values, (list, tuple)) or len(values) != 3:
+            raise ValueError(f"model.{name} must contain three values")
+        if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in values):
+            raise TypeError(f"model.{name} must contain numeric values")
+        normalized = [float(value) for value in values]
+        if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in normalized):
+            raise ValueError(f"model.{name} must be finite and in [0, 1]")
+        model[name] = normalized
+    initial_gate = float(model["phase_transport_initial_gate"])
+    if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
+        raise ValueError("model.phase_transport_initial_gate must be finite and in (0, 1)")
+    model["phase_transport_initial_gate"] = initial_gate
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:
             raise ValueError(f"model.{name} must be non-negative")
@@ -139,6 +184,8 @@ def validate_config(config: dict[str, Any]) -> None:
         "risk",
         "bridge",
         "id_bridge",
+        "id_utility",
+        "phase_transport",
         "visual",
         "balance",
     }:
@@ -158,8 +205,11 @@ def validate_config(config: dict[str, Any]) -> None:
         "flow_visual_perceptual_weight",
         "flow_rollout_pixel_weight",
         "flow_rollout_hf_weight",
+        "id_bridge_antithetic_weight",
+        "phase_transport_hf_weight",
+        "phase_transport_utility_weight",
     ):
-        if float(train[name]) < 0.0:
+        if not math.isfinite(float(train[name])) or float(train[name]) < 0.0:
             raise ValueError(f"train.{name} must be non-negative")
     for name in ("flow_rollout_every", "flow_rollout_steps", "flow_rollout_samples"):
         if int(train[name]) < 1:

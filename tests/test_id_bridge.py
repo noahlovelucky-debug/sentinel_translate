@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import datetime as dt
+import math
 from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
 
+import sentinel_v3.training as training_module
 from sentinel_v3.api import Observation, TargetRequest, translate
-from sentinel_v3.config import load_config
+from sentinel_v3.config import load_config, validate_config
 from sentinel_v3.losses import (
+    anchor_gain_target,
     cross_modal_identifiability_target,
     haar_dwt2,
     haar_idwt2,
@@ -17,8 +20,11 @@ from sentinel_v3.losses import (
     haar_packet_idwt2,
     high_frequency_loss,
     highpass,
+    phase_alignment_loss,
+    phase_identifiability_target,
+    phase_transport_gain_target,
 )
-from sentinel_v3.model import ModelConfig, SentinelV3
+from sentinel_v3.model import ModelConfig, ObservablePhaseTransportHead, SentinelV3
 from sentinel_v3.sensors import SENTINEL1, SENTINEL2
 from sentinel_v3.training import (
     EMA,
@@ -51,8 +57,17 @@ def _batch(delta_days: int = 0) -> dict[str, object]:
 def _haar_model(
     *,
     anchor_origin: bool = False,
+    utility: bool = False,
+    phase: bool = False,
+    optical_only: bool = False,
     optical_innovation_scale: float = 1.0,
     sar_innovation_scale: float = 1.0,
+    optical_innovation_band_scales: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    optical_correction_scale: float = 1.0,
+    phase_transport: bool = False,
+    phase_transport_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1),
+    phase_transport_offset_caps_px: tuple[float, float, float] = (0.5, 0.5, 0.5),
+    phase_transport_initial_gate: float = 0.02,
 ) -> SentinelV3:
     return SentinelV3(
         ModelConfig(
@@ -73,8 +88,38 @@ def _haar_model(
             id_bridge_optical_state_scale=0.03,
             id_bridge_sar_state_scale=4.0,
             id_bridge_anchor_origin=anchor_origin,
+            id_bridge_anchor_utility=utility,
+            id_bridge_phase_identifiability=phase,
+            id_bridge_optical_only=optical_only,
             id_bridge_optical_innovation_scale=optical_innovation_scale,
             id_bridge_sar_innovation_scale=sar_innovation_scale,
+            id_bridge_optical_innovation_band_scales=optical_innovation_band_scales,
+            id_bridge_optical_correction_scale=optical_correction_scale,
+            phase_transport_enabled=phase_transport,
+            phase_transport_gain_caps=phase_transport_gain_caps,
+            phase_transport_offset_caps_px=phase_transport_offset_caps_px,
+            phase_transport_initial_gate=phase_transport_initial_gate,
+        )
+    )
+
+
+def _utility_codec_model() -> SentinelV3:
+    return SentinelV3(
+        ModelConfig(
+            width=8,
+            hidden=32,
+            encoder_depth=1,
+            heads=4,
+            adapter_rank=8,
+            dit_hidden=32,
+            dit_depth=1,
+            dit_heads=4,
+            codec_width=8,
+            codec_latent_channels=16,
+            flow_steps=2,
+            id_bridge_enabled=False,
+            id_bridge_state="codec",
+            id_bridge_anchor_utility=True,
         )
     )
 
@@ -113,6 +158,217 @@ def test_haar_id_bridge_config_validation() -> None:
         ModelConfig(id_bridge_optical_innovation_scale=-0.01)
     with pytest.raises(ValueError, match=r"\[0, 1\]"):
         ModelConfig(id_bridge_sar_innovation_scale=1.01)
+    with pytest.raises(ValueError, match="non-negative"):
+        ModelConfig(id_bridge_optical_mid_basis_scale=-0.01)
+    with pytest.raises(ValueError, match="non-negative"):
+        ModelConfig(id_bridge_optical_coarse_basis_scale=float("nan"))
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        ModelConfig(id_bridge_optical_correction_scale=1.01)
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        ModelConfig(id_bridge_sar_correction_scale=-0.01)
+
+
+def test_id_bridge_utility_config_ranges_are_validated() -> None:
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_id_bridge_haar.yaml")
+    config["model"]["id_bridge_optical_mid_basis_scale"] = -0.01
+    with pytest.raises(ValueError, match="non-negative"):
+        validate_config(config)
+    config["model"]["id_bridge_optical_mid_basis_scale"] = 0.15
+    config["model"]["id_bridge_sar_correction_scale"] = float("inf")
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        validate_config(config)
+
+
+def test_phase_bridge_config_ranges_and_configs() -> None:
+    with pytest.raises(ValueError, match="three values"):
+        ModelConfig(id_bridge_optical_innovation_band_scales=(1.0, 1.0))
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        ModelConfig(id_bridge_optical_innovation_band_scales=(1.0, -0.1, 1.0))
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_id_bridge_phase.yaml")
+    config["train"]["id_bridge_antithetic_weight"] = -0.1
+    with pytest.raises(ValueError, match="antithetic"):
+        validate_config(config)
+
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "smoke_id_bridge_phase.yaml",
+        "id_bridge_phase_connectivity.yaml",
+        "id_bridge_phase_pilot.yaml",
+    )
+    expected_steps = (2, 100, 1000)
+    for name, steps in zip(names, expected_steps, strict=True):
+        phase = load_config(root / name)
+        assert phase["train"]["stage"] == "id_bridge"
+        assert phase["train"]["max_steps"] == steps
+        assert phase["train"]["init_use_ema"] is True
+        assert phase["train"]["ema_decay"] == pytest.approx(0.99)
+        assert phase["train"]["id_bridge_antithetic_weight"] == pytest.approx(0.05)
+        assert phase["train"]["flow_rollout_steps"] == 1
+        assert phase["model"]["id_bridge_phase_identifiability"] is True
+        assert phase["model"]["id_bridge_optical_only"] is True
+        assert phase["model"]["id_bridge_anchor_origin"] is True
+        assert phase["model"]["id_bridge_anchor_utility"] is False
+        assert phase["model"]["id_bridge_optical_innovation_band_scales"] == [0.0, 0.0, 0.0]
+    assert load_config(root / names[0])["validation"]["enabled"] is False
+    pilot = load_config(root / names[2])
+    assert pilot["train"]["batch_size"] == 1
+    assert pilot["train"]["gradient_accumulation"] == 2
+
+
+def test_phase_transport_config_ranges_and_configs() -> None:
+    with pytest.raises(ValueError, match="three values"):
+        ModelConfig(phase_transport_gain_caps=(0.5, 0.25))
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        ModelConfig(phase_transport_gain_caps=(0.5, -0.25, 0.1))
+    with pytest.raises(ValueError, match=r"\[0, 1\]"):
+        ModelConfig(phase_transport_offset_caps_px=(0.5, 0.5, float("inf")))
+    with pytest.raises(ValueError, match="positive"):
+        ModelConfig(phase_transport_hidden=0)
+    with pytest.raises(ValueError, match=r"\(0, 1\)"):
+        ModelConfig(phase_transport_initial_gate=0.0)
+    with pytest.raises(ValueError, match=r"\(0, 1\)"):
+        ModelConfig(phase_transport_initial_gate=float("inf"))
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["train"]["phase_transport_hf_weight"] = -0.01
+    with pytest.raises(ValueError, match="phase_transport_hf_weight"):
+        validate_config(config)
+    config["train"]["phase_transport_hf_weight"] = float("inf")
+    with pytest.raises(ValueError, match="phase_transport_hf_weight"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["train"]["phase_transport_utility_weight"] = -0.01
+    with pytest.raises(ValueError, match="phase_transport_utility_weight"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_initial_gate"] = 1.0
+    with pytest.raises(ValueError, match="phase_transport_initial_gate"):
+        validate_config(config)
+
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "smoke_phase_transport.yaml",
+        "phase_transport_connectivity.yaml",
+        "phase_transport_pilot.yaml",
+    )
+    expected_steps = (2, 100, 1000)
+    for name, steps in zip(names, expected_steps, strict=True):
+        config = load_config(root / name)
+        model = config["model"]
+        train = config["train"]
+        assert train["stage"] == "phase_transport"
+        assert train["max_steps"] == steps
+        assert train["batch_size"] == 1
+        assert train["gradient_accumulation"] == 2
+        assert train["flow_rollout_every"] == 4
+        assert train["init_use_ema"] is True
+        assert train["phase_transport_hf_weight"] == pytest.approx(0.05)
+        assert train["phase_transport_utility_weight"] == pytest.approx(0.10)
+        assert train["flow_visual_perceptual_weight"] == pytest.approx(0.10)
+        assert model["phase_transport_enabled"] is True
+        assert model["phase_transport_gain_caps"] == [0.5, 0.25, 0.1]
+        assert model["phase_transport_offset_caps_px"] == [0.5, 0.5, 0.5]
+        assert model["phase_transport_initial_gate"] == pytest.approx(0.02)
+        assert model["id_bridge_phase_identifiability"] is True
+        assert model["id_bridge_optical_only"] is True
+        assert model["id_bridge_anchor_origin"] is True
+        assert model["id_bridge_anchor_utility"] is False
+        assert model["id_bridge_optical_correction_scale"] == 0.0
+        assert model["id_bridge_optical_innovation_band_scales"] == [0.0, 0.0, 0.0]
+        assert config["paths"]["output"].endswith("_v3")
+        assert config["paths"]["reports"].endswith("_v3")
+    assert load_config(root / names[0])["validation"]["enabled"] is False
+    pilot = load_config(root / names[-1])
+    assert pilot["train"]["validate_every"] == 250
+    assert pilot["train"]["save_every"] == 250
+    assert pilot["validation"]["full_steps"] == []
+
+
+def test_phase_identifiability_target_is_oriented_masked_and_scale_invariant() -> None:
+    height = width = 32
+    horizontal = torch.linspace(-1.0, 1.0, width).view(1, 1, 1, width).expand(
+        1, 1, height, width
+    )
+    vertical = torch.linspace(-1.0, 1.0, height).view(1, 1, height, 1).expand(
+        1, 1, height, width
+    )
+    source = torch.cat((horizontal, horizontal), dim=1)
+    parallel = horizontal.expand(1, 3, height, width)
+    perpendicular = vertical.expand(1, 3, height, width)
+    valid = torch.ones(1, 1, height, width)
+    aligned = phase_identifiability_target(source, (parallel, parallel, parallel), valid)
+    orthogonal = phase_identifiability_target(
+        source, (perpendicular, perpendicular, perpendicular), valid
+    )
+    inverted = phase_identifiability_target(
+        source * 100.0,
+        tuple(-0.01 * band for band in (parallel, parallel, parallel)),
+        valid,
+    )
+    assert aligned.shape == (1, 3, 8, 8)
+    assert bool(torch.isfinite(aligned).all())
+    assert float(aligned.min()) >= 0.0 and float(aligned.max()) <= 1.0
+    assert float(aligned.mean()) > float(orthogonal.mean()) + 0.5
+    torch.testing.assert_close(aligned, inverted, atol=1e-4, rtol=1e-4)
+
+    partial = valid.clone()
+    partial[..., :4, :4] = 0.0
+    masked = phase_identifiability_target(source, (parallel, parallel, parallel), partial)
+    assert int(torch.count_nonzero(masked[..., 0, 0])) == 0
+    constant = phase_identifiability_target(
+        torch.ones_like(source),
+        (torch.ones_like(parallel),) * 3,
+        valid,
+    )
+    assert bool(torch.isfinite(constant).all())
+    assert int(torch.count_nonzero(constant)) == 0
+
+
+def test_phase_band_fields_map_to_legal_haar_packet_slots() -> None:
+    model = _haar_model(
+        phase=True,
+        optical_innovation_band_scales=(0.25, 0.5, 0.75),
+    )
+    fields = torch.stack(
+        (
+            torch.full((1, 8, 8), 0.1),
+            torch.full((1, 8, 8), 0.2),
+            torch.full((1, 8, 8), 0.3),
+        ),
+        dim=1,
+    )
+    optical = model.id_bridge_band_fields_to_state(fields, SENTINEL2)
+    assert optical.shape == (1, 48, 8, 8)
+    fine_indices = [first * 4 + second for first in range(1, 4) for second in range(1, 4)]
+    mid_indices = [first * 4 for first in range(1, 4)]
+    coarse_indices = [second for second in range(1, 4)]
+    for channel in range(3):
+        offset = channel * 16
+        assert int(torch.count_nonzero(optical[:, offset])) == 0
+        torch.testing.assert_close(
+            optical[:, [offset + value for value in fine_indices]],
+            fields[:, :1].expand(-1, len(fine_indices), -1, -1),
+        )
+        torch.testing.assert_close(
+            optical[:, [offset + value for value in mid_indices]],
+            fields[:, 1:2].expand(-1, len(mid_indices), -1, -1),
+        )
+        torch.testing.assert_close(
+            optical[:, [offset + value for value in coarse_indices]],
+            fields[:, 2:3].expand(-1, len(coarse_indices), -1, -1),
+        )
+    sar = model.id_bridge_band_fields_to_state(fields, SENTINEL1)
+    assert int(torch.count_nonzero(sar[:, 32:])) == 0
+    assert int(torch.count_nonzero(sar[:, [0, 16]])) == 0
+    release = model.id_bridge_innovation_release_state(torch.zeros_like(fields), SENTINEL2)
+    torch.testing.assert_close(release[:, 1:4], torch.full_like(release[:, 1:4], 0.75))
+    torch.testing.assert_close(release[:, [4, 8, 12]], torch.full_like(release[:, [4, 8, 12]], 0.5))
+    torch.testing.assert_close(
+        release[:, fine_indices], torch.full_like(release[:, fine_indices], 0.25)
+    )
+    metadata = model.residual_state_metadata()
+    assert metadata["phase_identifiability"] is True
+    assert metadata["optical_only"] is False
+    assert metadata["optical_innovation_band_scales"] == (0.25, 0.5, 0.75)
 
 
 def test_haar_id_bridge_smoke_config_selects_packet_state() -> None:
@@ -128,6 +384,55 @@ def test_haar_anchor_config_selects_observable_optical_origin() -> None:
     assert config["model"]["id_bridge_anchor_origin"] is True
     assert config["model"]["id_bridge_optical_innovation_scale"] == 0.0
     assert config["model"]["id_bridge_sar_innovation_scale"] == 1.0
+
+
+def test_haar_utility_configs_enable_observable_anchor_gains() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "id_bridge_haar_utility.yaml",
+        "id_bridge_haar_utility_connectivity.yaml",
+        "smoke_id_bridge_haar_utility.yaml",
+    )
+    for name in names:
+        config = load_config(root / name)
+        model = config["model"]
+        assert model["id_bridge_anchor_origin"] is True
+        assert model["id_bridge_anchor_utility"] is True
+        assert model["id_bridge_optical_innovation_scale"] == 0.0
+        assert model["id_bridge_sar_innovation_scale"] == 1.0
+        assert model["id_bridge_optical_correction_scale"] == 0.0
+        assert model["id_bridge_sar_correction_scale"] == 1.0
+        assert model["id_bridge_optical_mid_basis_scale"] == pytest.approx(0.15)
+        assert model["id_bridge_optical_coarse_basis_scale"] == pytest.approx(0.05)
+    assert load_config(root / names[0])["train"]["max_steps"] == 5000
+    assert load_config(root / names[1])["train"]["max_steps"] == 100
+    smoke = load_config(root / names[2])
+    assert smoke["train"]["max_steps"] == 2
+    assert smoke["validation"]["enabled"] is False
+
+
+def test_id_utility_configs_pretrain_only_the_optical_anchor() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "smoke_id_utility.yaml",
+        "id_utility_connectivity.yaml",
+        "id_utility_pilot.yaml",
+    )
+    for name in names:
+        config = load_config(root / name)
+        assert config["train"]["stage"] == "id_utility"
+        assert config["train"]["init_use_ema"] is True
+        assert config["train"]["find_unused_parameters"] is True
+        assert config["model"]["id_bridge_enabled"] is False
+        assert config["model"]["id_bridge_anchor_utility"] is True
+        assert config["model"]["id_bridge_optical_mid_basis_scale"] == pytest.approx(0.15)
+        assert config["model"]["id_bridge_optical_coarse_basis_scale"] == pytest.approx(0.05)
+    assert load_config(root / names[0])["validation"]["enabled"] is False
+    assert load_config(root / names[1])["train"]["max_steps"] == 100
+    pilot = load_config(root / names[2])
+    assert pilot["train"]["max_steps"] == 1000
+    assert pilot["train"]["validate_every"] == 250
+    assert pilot["train"]["full_validate_every"] == 5000
 
 
 def test_haar_id_bridge_uses_exact_packet_state_without_codec(
@@ -235,6 +540,720 @@ def test_observable_anchor_origin_matches_frozen_detail_state(
         default_pyramid, physical, SENTINEL2
     )
     assert int(torch.count_nonzero(default_mu)) == 0
+
+
+def test_phase_origin_uses_state_q_for_mu_sigma_release_and_preserves_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+    )
+    correction = torch.ones(1, 48, 8, 8, requires_grad=True)
+    log_sigma = torch.zeros_like(correction, requires_grad=True)
+    logits = torch.zeros(1, 3, 8, 8, requires_grad=True)
+    protected_anchor = torch.randn(1, 3, 32, 32)
+    pyramid = model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    physical = torch.rand(1, 3, 32, 32)
+
+    monkeypatch.setattr(
+        model.id_bridge_origin,
+        "forward",
+        lambda *_args: (correction, log_sigma, logits),
+    )
+    monkeypatch.setattr(
+        model,
+        "id_bridge_anchor_detail",
+        lambda *_args, **_kwargs: protected_anchor,
+    )
+    mu, raw, anchor, returned_sigma, returned_logits = model.predict_id_bridge_origin_components(
+        pyramid, physical, SENTINEL2
+    )
+    q_state = model.id_bridge_q_state(logits, SENTINEL2)
+    torch.testing.assert_close(mu, q_state * correction)
+    torch.testing.assert_close(raw, correction)
+    torch.testing.assert_close(anchor, protected_anchor)
+    torch.testing.assert_close(returned_sigma, log_sigma)
+    torch.testing.assert_close(returned_logits, logits)
+    mu.square().mean().backward(retain_graph=True)
+    assert correction.grad is not None and int(torch.count_nonzero(correction.grad)) > 0
+    assert logits.grad is None
+
+    _z0, q, sigma = JointObjective._id_bridge_start(
+        mu.detach(),
+        log_sigma,
+        logits,
+        0.35,
+        torch.ones_like(mu),
+        q_state=q_state.detach(),
+    )
+    torch.testing.assert_close(q, q_state.detach())
+    torch.testing.assert_close(sigma, 0.175 * (1.0 - q_state.detach()))
+    gated = model.gate_id_bridge_innovation(
+        torch.randn_like(mu), mu.detach(), logits, SENTINEL2, q_state=q_state.detach()
+    )
+    torch.testing.assert_close(gated, mu.detach())
+    torch.testing.assert_close(
+        model.id_bridge_anchor_detail(pyramid, physical, SENTINEL2, reliability_logits=logits),
+        protected_anchor,
+    )
+    F.binary_cross_entropy_with_logits(logits, torch.zeros_like(logits)).backward()
+    assert logits.grad is not None and int(torch.count_nonzero(logits.grad)) > 0
+
+
+def test_phase_zero_release_keeps_mu_and_removes_seeded_innovation() -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+    ).eval()
+    with torch.no_grad():
+        model.id_bridge_origin.output_heads["optical"][-1].bias[:48].fill_(1.0)
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    first = model.sample_id_bridge_residual(pyramid, base, SENTINEL2, seed=11)
+    second = model.sample_id_bridge_residual(pyramid, base, SENTINEL2, seed=12)
+    assert isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor)
+    torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+    assert int(torch.count_nonzero(first)) > 0
+
+
+def test_phase_transport_and_anchor_conditions_are_zero_init_and_trainable() -> None:
+    model = _haar_model(anchor_origin=True, phase=True).eval()
+    assert int(torch.count_nonzero(model.residual_dit.id_bridge_field_projection.weight)) == 0
+    assert int(torch.count_nonzero(model.residual_dit.id_bridge_anchor_projection.weight)) == 0
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    latent = torch.randn(1, 48, 8, 8)
+    descriptors = model.descriptors(SENTINEL2.channels[:3], latent.device)
+    baseline = model.residual_dit(
+        latent, torch.zeros(1), pyramid, descriptors, origin_latent=torch.zeros_like(latent)
+    )
+    conditioned = model.residual_dit(
+        latent,
+        torch.zeros(1),
+        pyramid,
+        descriptors,
+        origin_latent=torch.zeros_like(latent),
+        transport_field=torch.randn(1, 4, 8, 8),
+        id_bridge_anchor_state=torch.randn_like(latent),
+    )
+    torch.testing.assert_close(conditioned, baseline, atol=0.0, rtol=0.0)
+
+    model.train()
+    _set_trainable(model, "id_bridge")
+    with torch.no_grad():
+        model.residual_dit.output[-1].weight.normal_(std=0.01)
+    velocity = model.flow_velocity(
+        latent,
+        torch.zeros(1),
+        pyramid,
+        SENTINEL2,
+        3,
+        origin_latent=torch.zeros_like(latent),
+        transport_field=torch.randn(1, 4, 8, 8),
+        id_bridge_anchor_state=torch.randn_like(latent),
+        use_optical_bridge=False,
+    )
+    velocity.square().mean().backward()
+    gradient = model.residual_dit.id_bridge_anchor_projection.weight.grad
+    assert gradient is not None and int(torch.count_nonzero(gradient)) > 0
+
+
+def test_observable_phase_transport_is_bounded_and_preserves_the_protected_anchor() -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_gain_caps=(0.5, 0.25, 0.1),
+        phase_transport_offset_caps_px=(0.5, 0.25, 0.125),
+    ).eval()
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    metadata = model.residual_state_metadata()
+    assert metadata["phase_transport_enabled"] is True
+    assert metadata["phase_transport_gain_caps"] == (0.5, 0.25, 0.1)
+    assert metadata["phase_transport_offset_caps_px"] == (0.5, 0.25, 0.125)
+    assert metadata["phase_transport_initial_gate"] == pytest.approx(0.02)
+    anchor = model.id_bridge_anchor_detail(pyramid, base, SENTINEL2)
+    delta, diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
+    assert delta.shape == base.shape
+    assert diagnostics["gain"].shape == (1, 3, 8, 8)
+    assert diagnostics["gate"].shape == (1, 3, 8, 8)
+    assert diagnostics["offset_px"].shape == (1, 3, 2, 8, 8)
+    assert diagnostics["coherence"].shape == (1, 3, 8, 8)
+    assert diagnostics["source_phase"].shape == (1, 3, 32, 32)
+    assert bool(torch.isfinite(delta).all())
+    assert float(delta.detach().abs().amax()) < 0.1
+    assert bool((diagnostics["gain"] >= 0.0).all())
+    torch.testing.assert_close(
+        diagnostics["gate"],
+        torch.full_like(diagnostics["gate"], 0.02),
+        atol=1e-7,
+        rtol=1e-7,
+    )
+    head = model.phase_transport_head
+    assert int(torch.count_nonzero(head.output[-1].weight)) == 0
+    torch.testing.assert_close(
+        head.output[-1].bias[:3],
+        torch.full_like(head.output[-1].bias[:3], math.log(0.02 / 0.98)),
+    )
+    torch.testing.assert_close(head.output[-1].bias[3:], torch.zeros_like(head.output[-1].bias[3:]))
+    detail = model.visual_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), base)
+    torch.testing.assert_close(detail - anchor, delta, atol=1e-7, rtol=1e-7)
+    first = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=11)
+    second = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=12)
+    torch.testing.assert_close(first, torch.zeros_like(first), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(first, second, atol=0.0, rtol=0.0)
+
+    with torch.no_grad():
+        head.output[-1].bias.fill_(12.0)
+    delta, diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
+    assert bool(torch.isfinite(delta).all())
+    assert bool(torch.isfinite(diagnostics["coherence"]).all())
+    gain_caps = torch.tensor((0.5, 0.25, 0.1)).view(1, 3, 1, 1)
+    offset_caps = torch.tensor((0.5, 0.25, 0.125)).view(1, 3, 1, 1, 1)
+    assert bool((diagnostics["gain"].abs() <= gain_caps + 1e-6).all())
+    assert bool((diagnostics["gain"] >= 0.0).all())
+    assert bool((diagnostics["gate"] > 0.0).all())
+    assert bool((diagnostics["gate"] < 1.0).all())
+    assert bool((diagnostics["offset_px"].abs() <= offset_caps + 1e-6).all())
+    leakage = F.avg_pool2d(delta.detach(), 8, stride=8).abs().mean()
+    assert float(leakage / delta.detach().abs().mean().clamp_min(1e-8)) < 0.1
+    bands = torch.randn(1, 3, 3, 32, 32)
+    torch.testing.assert_close(
+        head.warp_bands(bands, torch.zeros(1, 3, 2, 32, 32)), bands, atol=1e-6, rtol=1e-6
+    )
+
+    with torch.no_grad():
+        head.output[-1].bias[:3].fill_(-12.0)
+    _, negative_diagnostics = model.phase_transport_delta(pyramid, base, SENTINEL2)
+    assert bool((negative_diagnostics["gain"] >= 0.0).all())
+    assert float(negative_diagnostics["gate"].detach().amax()) < 1e-5
+
+
+def test_observable_phase_transport_sigmoid_gate_is_smooth_and_bounded() -> None:
+    raw_gain = torch.tensor(((-30.0, 0.0, 30.0),), requires_grad=True)
+    gate = ObservablePhaseTransportHead.gain_gate(raw_gain)
+    assert float(gate[0, 0].detach()) < 1e-10
+    assert float(gate[0, 1].detach()) == pytest.approx(0.5)
+    assert float(gate[0, 2].detach()) > 1.0 - 1e-6
+    gate.sum().backward()
+    assert raw_gain.grad is not None
+    assert bool(torch.isfinite(raw_gain.grad).all())
+
+
+def test_phase_transport_gain_target_matches_positive_constrained_blockwise_least_squares() -> None:
+    height = width = 16
+    coordinates = torch.arange(height).view(height, 1) + torch.arange(width).view(1, width)
+    component = (coordinates.remainder(2).mul(2).sub(1)).float().view(1, 1, height, width)
+    physical_bands = torch.zeros(1, 3, 1, height, width)
+    physical_bands[:, :1] = component
+    valid = torch.ones(1, 1, height, width)
+    caps = (0.5, 0.25, 0.1)
+
+    target = phase_transport_gain_target(physical_bands, 0.25 * component, valid, caps)
+    assert target.shape == (1, 3, height // 4, width // 4)
+    torch.testing.assert_close(target[:, :1], torch.full_like(target[:, :1], 0.5))
+    assert int(torch.count_nonzero(target[:, 1:])) == 0
+
+    capped = phase_transport_gain_target(physical_bands, 2.0 * component, valid, caps)
+    torch.testing.assert_close(capped[:, :1], torch.ones_like(capped[:, :1]))
+    negative = phase_transport_gain_target(physical_bands, -component, valid, caps)
+    assert int(torch.count_nonzero(negative)) == 0
+    empty = phase_transport_gain_target(
+        torch.zeros_like(physical_bands), torch.zeros_like(component), valid, caps
+    )
+    assert int(torch.count_nonzero(empty)) == 0
+
+    partial_valid = valid.clone()
+    partial_valid[..., :4, :4] = 0.0
+    partial = phase_transport_gain_target(
+        physical_bands, 0.25 * component, partial_valid, caps
+    )
+    assert int(torch.count_nonzero(partial[..., :1, :1])) == 0
+    torch.testing.assert_close(partial[:, :1, 1:, 1:], torch.full_like(partial[:, :1, 1:, 1:], 0.5))
+
+    with pytest.raises(ValueError, match="three"):
+        phase_transport_gain_target(physical_bands[:, :2], component, valid, caps)
+    with pytest.raises(ValueError, match="gain_caps"):
+        phase_transport_gain_target(physical_bands, component, valid, (0.5, -0.25, 0.1))
+    with pytest.raises(ValueError, match="block_size"):
+        phase_transport_gain_target(physical_bands, component, valid, caps, block_size=0)
+
+
+def test_observable_phase_transport_coherence_and_alignment_are_sign_invariant() -> None:
+    model = _haar_model(anchor_origin=True, phase=True, optical_only=True, phase_transport=True)
+    head = model.phase_transport_head
+    height = width = 32
+    horizontal = torch.linspace(-1.0, 1.0, width).view(1, 1, 1, width).expand(
+        1, 1, height, width
+    )
+    vertical = torch.linspace(-1.0, 1.0, height).view(1, 1, height, 1).expand(
+        1, 1, height, width
+    )
+    source = horizontal.expand(1, 3, height, width)
+    parallel = source.unsqueeze(2).expand(-1, -1, 3, -1, -1)
+    orthogonal = vertical.expand(1, 3, height, width).unsqueeze(2).expand(-1, -1, 3, -1, -1)
+    coherence = head.phase_coherence(source, parallel)
+    inverted = head.phase_coherence(-source, parallel)
+    perpendicular = head.phase_coherence(source, orthogonal)
+    assert float(coherence.mean()) > float(perpendicular.mean()) + 0.5
+    torch.testing.assert_close(coherence, inverted, atol=1e-6, rtol=1e-6)
+
+    valid = torch.ones(1, 1, height, width)
+    target_parallel = horizontal.expand(1, 3, height, width)
+    target_perpendicular = vertical.expand(1, 3, height, width)
+    aligned_loss = phase_alignment_loss(source, (target_parallel,) * 3, valid)
+    perpendicular_loss = phase_alignment_loss(source, (target_perpendicular,) * 3, valid)
+    inverted_loss = phase_alignment_loss(-source, (target_parallel,) * 3, valid)
+    assert bool(torch.isfinite(aligned_loss))
+    assert float(aligned_loss) + 0.5 < float(perpendicular_loss)
+    torch.testing.assert_close(aligned_loss, inverted_loss, atol=1e-6, rtol=1e-6)
+
+
+@pytest.mark.parametrize(
+    ("constant_source", "constant_physical"),
+    ((True, False), (False, True), (True, True)),
+)
+def test_observable_phase_transport_zero_energy_inputs_have_finite_gradients(
+    constant_source: bool,
+    constant_physical: bool,
+) -> None:
+    model = _haar_model(anchor_origin=True, phase=True, optical_only=True, phase_transport=True)
+    head = model.phase_transport_head
+    height = width = 32
+    source = (
+        torch.ones(1, 3, height, width)
+        if constant_source
+        else torch.randn(1, 3, height, width)
+    ).requires_grad_()
+    physical_bands = (
+        torch.ones(1, 3, 3, height, width)
+        if constant_physical
+        else torch.randn(1, 3, 3, height, width)
+    )
+    valid = torch.ones(1, 1, height, width)
+
+    coherence = head.phase_coherence(source, physical_bands)
+    alignment = phase_alignment_loss(
+        source,
+        tuple(physical_bands[:, index] for index in range(3)),
+        valid,
+    )
+    total = coherence.mean() + alignment
+    assert bool(torch.isfinite(coherence).all())
+    assert bool(torch.isfinite(alignment))
+    assert bool(torch.isfinite(total))
+    total.backward()
+    assert source.grad is not None
+    assert bool(torch.isfinite(source.grad).all())
+
+
+def test_phase_antithetic_starts_center_exactly_on_mu() -> None:
+    mu = torch.randn(2, 48, 8, 8)
+    log_sigma = torch.randn_like(mu)
+    q_state = torch.rand_like(mu)
+    epsilon = torch.randn_like(mu)
+    z_plus, _, sigma = JointObjective._id_bridge_start(
+        mu,
+        log_sigma,
+        torch.zeros(2, 3, 8, 8),
+        0.35,
+        epsilon,
+        q_state=q_state,
+    )
+    z_minus = mu - sigma.detach() * epsilon
+    torch.testing.assert_close(0.5 * (z_plus + z_minus), mu, atol=1e-6, rtol=1e-6)
+
+
+def test_phase_optical_only_keeps_sar_detail_amplitude_and_seeded_sampling_legacy() -> None:
+    phase = _haar_model(
+        anchor_origin=True, phase=True, optical_only=True, phase_transport=True
+    ).eval()
+    legacy = _utility_codec_model().eval()
+    assert phase.legacy_residual_dit is not None
+    phase.legacy_residual_dit.load_state_dict(legacy.residual_dit.state_dict())
+    legacy.detail_head.load_state_dict(phase.detail_head.state_dict())
+    legacy.codec.load_state_dict(phase.codec.state_dict())
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = phase.encode(torch.randn(1, 10, 32, 32), SENTINEL2, valid)
+    base = torch.randn(1, 2, 32, 32)
+    phase_detail = phase.visual_detail(pyramid, SENTINEL2, SENTINEL1, (32, 32), base)
+    legacy_detail = legacy.visual_detail(pyramid, SENTINEL2, SENTINEL1, (32, 32), base)
+    torch.testing.assert_close(phase_detail, legacy_detail, atol=0.0, rtol=0.0)
+    phase_amplitude = phase.residual_amplitude(pyramid, SENTINEL1, 2, (32, 32))
+    legacy_amplitude = legacy.residual_amplitude(pyramid, SENTINEL1, 2, (32, 32))
+    torch.testing.assert_close(phase_amplitude, legacy_amplitude, atol=0.0, rtol=0.0)
+    phase_sample = phase.sample_visual_residual(
+        pyramid, SENTINEL1, base, phase_detail, seed=23
+    )
+    legacy_sample = legacy.sample_visual_residual(
+        pyramid, SENTINEL1, base, legacy_detail, seed=23
+    )
+    torch.testing.assert_close(phase_sample, legacy_sample, atol=0.0, rtol=0.0)
+    assignments = JointObjective(phase)._id_bridge_assignments(3, torch.device("cpu"))
+    torch.testing.assert_close(assignments, torch.zeros_like(assignments))
+
+    initialized = _haar_model(anchor_origin=True, phase=True, optical_only=True)
+    assert initialized.legacy_residual_dit is not None
+    training_module._load_compatible_state(initialized, legacy.state_dict())
+    torch.testing.assert_close(
+        initialized.legacy_residual_dit.input.weight,
+        legacy.residual_dit.input.weight,
+    )
+
+
+def test_phase_id_bridge_training_uses_optical_oracle_and_antithetic_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+    )
+    _set_trainable(model, "id_bridge")
+    objective = JointObjective(
+        model,
+        flow_rollout_every=1,
+        flow_rollout_steps=1,
+        flow_visual_perceptual_weight=0.0,
+        id_bridge_antithetic_weight=0.05,
+    )
+    original_integrate = model.integrate_flow
+    rollout_steps: list[int] = []
+
+    def capture_integrate(*args: object, **kwargs: object) -> torch.Tensor:
+        rollout_steps.append(int(kwargs["steps"]))
+        return original_integrate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(model, "integrate_flow", capture_integrate)
+    loss, metrics = objective(_batch(), "id_bridge")
+    assert bool(torch.isfinite(loss))
+    for name in (
+        "sar2opt/q_fine",
+        "sar2opt/q_mid",
+        "sar2opt/q_coarse",
+        "sar2opt/oracle_q_fine",
+        "sar2opt/oracle_q_mid",
+        "sar2opt/oracle_q_coarse",
+        "sar2opt/q_mae",
+        "sar2opt/q_corr",
+        "sar2opt/q_corr_fine",
+        "sar2opt/q_corr_mid",
+        "sar2opt/q_corr_coarse",
+        "sar2opt/release_fine",
+        "sar2opt/release_mid",
+        "sar2opt/release_coarse",
+        "sar2opt/antithetic_center",
+    ):
+        assert name in metrics and bool(torch.isfinite(metrics[name]))
+    torch.testing.assert_close(
+        metrics["sar2opt/q_corr"],
+        torch.stack(
+            (
+                metrics["sar2opt/q_corr_fine"],
+                metrics["sar2opt/q_corr_mid"],
+                metrics["sar2opt/q_corr_coarse"],
+            )
+        ).mean(),
+    )
+    assert rollout_steps == [1, 1]
+    loss.backward()
+    q_bias = model.id_bridge_origin.output_heads["optical"][-1].bias
+    assert q_bias.grad is not None and int(torch.count_nonzero(q_bias.grad[-3:])) > 0
+    assert not any(parameter.grad is not None for parameter in model.decoder.parameters())
+    assert model.legacy_residual_dit is not None
+    assert not any(parameter.grad is not None for parameter in model.legacy_residual_dit.parameters())
+
+    model.zero_grad(set_to_none=True)
+    zero_loss, _ = objective(_batch(delta_days=2), "id_bridge")
+    zero_loss.backward()
+    assert float(zero_loss.detach()) == 0.0
+    assert all(
+        parameter.grad is not None and int(torch.count_nonzero(parameter.grad)) == 0
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_phase_zero_antithetic_weight_skips_minus_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(anchor_origin=True, phase=True, optical_only=True)
+    _set_trainable(model, "id_bridge")
+    objective = JointObjective(
+        model,
+        flow_rollout_every=1,
+        flow_rollout_steps=1,
+        flow_visual_perceptual_weight=0.0,
+        id_bridge_antithetic_weight=0.0,
+    )
+    original_integrate = model.integrate_flow
+    rollout_steps: list[int] = []
+
+    def capture_integrate(*args: object, **kwargs: object) -> torch.Tensor:
+        rollout_steps.append(int(kwargs["steps"]))
+        return original_integrate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(model, "integrate_flow", capture_integrate)
+    _, metrics = objective(_batch(), "id_bridge")
+    assert rollout_steps == [1]
+    assert "sar2opt/antithetic_center" not in metrics
+
+
+def test_nonphase_id_bridge_keeps_the_default_two_step_rollout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(anchor_origin=True)
+    _set_trainable(model, "id_bridge")
+    objective = JointObjective(
+        model,
+        flow_rollout_every=1,
+        flow_rollout_steps=2,
+        flow_visual_perceptual_weight=0.0,
+    )
+    original_integrate = model.integrate_flow
+    rollout_steps: list[int] = []
+
+    def capture_integrate(*args: object, **kwargs: object) -> torch.Tensor:
+        rollout_steps.append(int(kwargs["steps"]))
+        return original_integrate(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(model, "integrate_flow", capture_integrate)
+    _, metrics = objective(_batch(), "id_bridge")
+    assert rollout_steps == [2, 2]
+    assert "sar2opt/antithetic_center" not in metrics
+    for name in (
+        "sar2opt/oracle_q_fine",
+        "sar2opt/oracle_q_mid",
+        "sar2opt/oracle_q_coarse",
+        "sar2opt/q_mae",
+        "sar2opt/q_corr",
+        "sar2opt/q_corr_fine",
+        "sar2opt/q_corr_mid",
+        "sar2opt/q_corr_coarse",
+    ):
+        assert name not in metrics
+
+
+def test_utility_anchor_initialization_matches_source_anchor() -> None:
+    utility_model = _haar_model(anchor_origin=True, utility=True).eval()
+    optical_head = utility_model.id_bridge_origin.output_heads["optical"][-1]
+    sar_head = utility_model.id_bridge_origin.output_heads["sar"][-1]
+    utility_head = utility_model.id_bridge_origin.anchor_utility_head[-1]
+    assert int(torch.count_nonzero(optical_head.weight)) == 0
+    assert int(torch.count_nonzero(sar_head.weight)) == 0
+    torch.testing.assert_close(
+        utility_head.bias,
+        torch.tensor((0.0, -4.0, -4.0), dtype=utility_head.bias.dtype),
+    )
+    assert int(torch.count_nonzero(optical_head.bias)) == 0
+    assert int(torch.count_nonzero(sar_head.bias)) == 0
+    gains = utility_model.id_bridge_anchor_gains(utility_head.bias.view(1, 3, 1, 1))
+    torch.testing.assert_close(gains[:, :1], torch.ones_like(gains[:, :1]))
+    torch.testing.assert_close(
+        gains[:, 1:], torch.full_like(gains[:, 1:], math.exp(-4.0))
+    )
+
+    legacy_model = _haar_model(anchor_origin=True).eval()
+    legacy_model.load_state_dict(utility_model.state_dict())
+    for model in (utility_model, legacy_model):
+        model.set_detail_confidence_threshold("optical", 1.01)
+        model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+        model.set_optical_anchor_density(0.3, 1.0)
+        model.set_optical_anchor_source_density(0.4, 1.0)
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = utility_model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    physical = torch.rand(1, 3, 32, 32)
+    _, _, logits = utility_model.id_bridge_origin(pyramid, physical, SENTINEL2)
+    utility_anchor = utility_model.id_bridge_anchor_detail(
+        pyramid, physical, SENTINEL2, reliability_logits=logits
+    )
+    legacy_anchor = legacy_model.id_bridge_anchor_detail(pyramid, physical, SENTINEL2)
+    fine_component, _, _ = utility_model.id_bridge_anchor_components(
+        pyramid, physical, SENTINEL2
+    )
+    torch.testing.assert_close(highpass(fine_component), legacy_anchor, atol=1e-6, rtol=1e-6)
+    assert int(torch.count_nonzero(utility_anchor)) > 0
+    torch.testing.assert_close(
+        utility_model.visual_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), physical),
+        utility_anchor,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    metadata = utility_model.residual_state_metadata()
+    assert metadata["anchor_utility"] is True
+    assert metadata["optical_mid_basis_scale"] == pytest.approx(0.15)
+    assert metadata["optical_coarse_basis_scale"] == pytest.approx(0.05)
+    assert metadata["optical_correction_scale"] == pytest.approx(1.0)
+    assert metadata["sar_correction_scale"] == pytest.approx(1.0)
+
+
+def test_anchor_utility_head_is_independent_of_flow_state_channels() -> None:
+    codec_model = _utility_codec_model().eval()
+    haar_model = _haar_model(anchor_origin=True, utility=True).eval()
+    codec_head = codec_model.id_bridge_origin.anchor_utility_head
+    haar_head = haar_model.id_bridge_origin.anchor_utility_head
+    assert codec_model.id_bridge_origin.latent_channels == 16
+    assert haar_model.id_bridge_origin.latent_channels == 48
+    assert {
+        name: tuple(value.shape) for name, value in codec_head.state_dict().items()
+    } == {name: tuple(value.shape) for name, value in haar_head.state_dict().items()}
+    codec_head.load_state_dict(haar_head.state_dict())
+
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = codec_model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    _, _, logits = codec_model.id_bridge_origin(pyramid, torch.rand(1, 3, 32, 32), SENTINEL2)
+    expected_logits = torch.tensor((0.0, -4.0, -4.0), dtype=logits.dtype).view(1, 3, 1, 1)
+    torch.testing.assert_close(logits, expected_logits.expand_as(logits))
+    gains = codec_model.id_bridge_anchor_gains(logits)
+    expected = torch.tensor((1.0, math.exp(-4.0), math.exp(-4.0)), dtype=gains.dtype)
+    torch.testing.assert_close(gains, expected.view(1, 3, 1, 1).expand_as(gains))
+
+
+def test_disabled_bridge_utility_detail_keeps_legacy_residual_sampler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _utility_codec_model().eval()
+    model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+
+    def deterministic_detail(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("utility visual detail must bypass the legacy detail head")
+
+    monkeypatch.setattr(model, "deterministic_detail", deterministic_detail)
+    detail = model.visual_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), base)
+    _, _, logits = model.id_bridge_origin(pyramid, base, SENTINEL2)
+    expected_detail = model.id_bridge_anchor_detail(
+        pyramid, base, SENTINEL2, reliability_logits=logits
+    )
+    torch.testing.assert_close(detail, expected_detail)
+    assert int(torch.count_nonzero(detail)) > 0
+
+    calls: list[str] = []
+
+    def legacy_sample(
+        _pyramid: object,
+        _target: object,
+        shape: tuple[int, int, int, int],
+        *,
+        seed: int,
+        steps: int | None,
+        bridge_anchor: torch.Tensor | None,
+    ) -> torch.Tensor:
+        calls.append("legacy")
+        assert shape == tuple(base.shape)
+        assert seed == 17 and steps is None and bridge_anchor is detail
+        return torch.full_like(base, 0.1)
+
+    def id_bridge_sample(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("disabled id bridge must retain legacy residual sampling")
+
+    monkeypatch.setattr(model, "sample_residual", legacy_sample)
+    monkeypatch.setattr(model, "sample_id_bridge_residual", id_bridge_sample)
+    residual = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=17)
+    torch.testing.assert_close(residual, torch.full_like(base, 0.1))
+    assert calls == ["legacy"]
+
+
+def test_utility_anchor_requires_logits_and_samples_only_innovation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        utility=True,
+        optical_innovation_scale=0.0,
+        optical_correction_scale=0.0,
+    ).eval()
+    model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    with pytest.raises(ValueError, match="requires reliability logits"):
+        model.id_bridge_anchor_detail(pyramid, base, SENTINEL2)
+    with pytest.raises(ValueError, match="must be B3HW"):
+        model.id_bridge_anchor_gains(torch.zeros(1, 2, 8, 8))
+    with pytest.raises(ValueError, match="match the latent grid"):
+        model.id_bridge_anchor_detail(
+            pyramid, base, SENTINEL2, reliability_logits=torch.zeros(1, 3, 7, 8)
+        )
+
+    with torch.no_grad():
+        model.id_bridge_origin.output_heads["optical"][-1].bias[:48].fill_(2.0)
+    mu, correction, _, _, logits = model.predict_id_bridge_origin_components(
+        pyramid, base, SENTINEL2
+    )
+    assert int(torch.count_nonzero(correction)) > 0
+    torch.testing.assert_close(mu, torch.zeros_like(mu))
+    utility_anchor = model.id_bridge_anchor_detail(
+        pyramid, base, SENTINEL2, reliability_logits=logits
+    )
+    assert int(torch.count_nonzero(utility_anchor)) > 0
+    logits_for_gradient = logits.detach().requires_grad_()
+    model.id_bridge_anchor_detail(
+        pyramid, base, SENTINEL2, reliability_logits=logits_for_gradient
+    ).square().mean().backward()
+    assert logits_for_gradient.grad is not None
+    assert int(torch.count_nonzero(logits_for_gradient.grad)) > 0
+
+    first = model.sample_id_bridge_residual(pyramid, base, SENTINEL2, seed=17)
+    second = model.sample_id_bridge_residual(pyramid, base, SENTINEL2, seed=18)
+    assert isinstance(first, torch.Tensor) and isinstance(second, torch.Tensor)
+    torch.testing.assert_close(first, torch.zeros_like(first), atol=1e-7, rtol=0.0)
+    torch.testing.assert_close(second, torch.zeros_like(second), atol=1e-7, rtol=0.0)
+
+    sar_pyramid = model.encode(torch.rand(1, 10, 32, 32), SENTINEL2, valid)
+    sar_base = torch.randn(1, 2, 32, 32)
+    sar_first = model.sample_id_bridge_residual(sar_pyramid, sar_base, SENTINEL1, seed=17)
+    sar_second = model.sample_id_bridge_residual(sar_pyramid, sar_base, SENTINEL1, seed=18)
+    assert isinstance(sar_first, torch.Tensor) and isinstance(sar_second, torch.Tensor)
+    assert not torch.equal(sar_first, sar_second)
+
+    physical = torch.zeros(1, 10, 32, 32)
+    physical[:, [2, 1, 0]] = base
+    log_variance = torch.zeros_like(physical)
+
+    def physical_stub(*_args: object, **_kwargs: object) -> tuple[torch.Tensor, torch.Tensor, object]:
+        return physical, log_variance, pyramid
+
+    monkeypatch.setattr(model, "physical", physical_stub)
+    observation = Observation(
+        torch.randn(2, 32, 32), SENTINEL1, dt.date(2020, 1, 2), orbit="ascending"
+    )
+    result = translate(
+        model, [observation], TargetRequest(SENTINEL2), "visual", num_samples=2, seed=17
+    )
+    assert result.deterministic_detail is not None
+    assert result.stochastic_residual is not None
+    assert int(torch.count_nonzero(result.deterministic_detail)) > 0
+    torch.testing.assert_close(
+        result.stochastic_residual,
+        torch.zeros_like(result.stochastic_residual),
+        atol=1e-7,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(result.samples[0], result.samples[1])
+    expected = model.compose_visual(
+        physical[:, [2, 1, 0]],
+        result.deterministic_detail,
+        torch.zeros_like(result.stochastic_residual),
+        "optical",
+    )
+    assert isinstance(expected, torch.Tensor)
+    torch.testing.assert_close(result.samples[0], expected)
 
 
 def test_observable_anchor_reliability_gates_raw_correction_and_detaches_logits() -> None:
@@ -553,6 +1572,41 @@ def test_cross_modal_identifiability_rejects_shifted_structure() -> None:
     assert float(aligned.mean()) > float(shifted.mean()) + 0.05
 
 
+def test_anchor_gain_target_recovers_single_basis_gain_and_fallbacks() -> None:
+    height = width = 32
+    coordinates = torch.arange(height).view(height, 1) + torch.arange(width).view(1, width)
+    checkerboard = (coordinates.remainder(2).mul(2).sub(1)).float()
+    fine = checkerboard.view(1, 1, height, width).expand(1, 3, -1, -1).clone()
+    zeros = torch.zeros_like(fine)
+    valid = torch.ones(1, 1, height, width)
+    full_residual = 3.0 * highpass(fine)
+
+    target = anchor_gain_target((fine, zeros, zeros), full_residual, valid)
+    assert target.shape == (1, 3, height // 4, width // 4)
+    torch.testing.assert_close(
+        target[:, :1, 1:-1, 1:-1],
+        torch.full_like(target[:, :1, 1:-1, 1:-1], 0.75),
+        atol=2e-5,
+        rtol=2e-5,
+    )
+    assert int(torch.count_nonzero(target[:, 1:])) == 0
+
+    default = anchor_gain_target((zeros, zeros, zeros), zeros, valid)
+    torch.testing.assert_close(default[:, :1], torch.full_like(default[:, :1], 0.5))
+    assert int(torch.count_nonzero(default[:, 1:])) == 0
+
+    partial_valid = valid.clone()
+    partial_valid[..., :4, :4] = 0.0
+    partial = anchor_gain_target((fine, zeros, zeros), full_residual, partial_valid)
+    torch.testing.assert_close(partial[:, :1, :1, :1], torch.full_like(partial[:, :1, :1, :1], 0.5))
+    assert int(torch.count_nonzero(partial[:, 1:, :1, :1])) == 0
+
+    with pytest.raises(ValueError, match="maximum_gain"):
+        anchor_gain_target((fine, zeros, zeros), full_residual, valid, maximum_gain=0.0)
+    with pytest.raises(ValueError, match="exactly three"):
+        anchor_gain_target((fine, zeros), full_residual, valid)  # type: ignore[arg-type]
+
+
 def test_id_bridge_origin_shapes_and_reliability_are_finite(tiny_model: SentinelV3) -> None:
     pyramid = tiny_model.encode(
         torch.randn(2, 2, 32, 32), SENTINEL1, torch.ones(2, 1, 32, 32)
@@ -668,6 +1722,8 @@ def test_id_bridge_only_opens_origin_and_generic_flow_parameters(tiny_model: Sen
         "residual_dit.blocks.",
         "residual_dit.output.",
         "residual_dit.origin_projection.",
+        "residual_dit.id_bridge_field_projection.",
+        "residual_dit.id_bridge_anchor_projection.",
     )
     assert trainable
     assert all(name.startswith(allowed) for name in trainable)
@@ -785,8 +1841,22 @@ def test_id_bridge_optimizer_updates_origin_and_checkpoint_ema(tiny_model: Senti
         "optical_scale": 0.03,
         "sar_scale": 4.0,
         "anchor_origin": False,
+        "anchor_utility": False,
+        "phase_identifiability": False,
+        "optical_only": False,
+        "optical_mid_basis_scale": 0.15,
+        "optical_coarse_basis_scale": 0.05,
         "optical_innovation_scale": 1.0,
         "sar_innovation_scale": 1.0,
+        "optical_innovation_band_scales": (1.0, 1.0, 1.0),
+        "optical_correction_scale": 1.0,
+        "sar_correction_scale": 1.0,
+        "phase_transport_enabled": False,
+        "phase_transport_hidden": 128,
+        "phase_transport_gain_caps": (0.5, 0.25, 0.1),
+        "phase_transport_offset_caps_px": (0.5, 0.5, 0.5),
+        "phase_transport_initial_gate": 0.02,
+        "antithetic_weight": 0.0,
     }
 
 
@@ -824,8 +1894,22 @@ def test_haar_id_bridge_optimizer_and_checkpoint_metadata() -> None:
         "optical_scale": 0.03,
         "sar_scale": 4.0,
         "anchor_origin": True,
+        "anchor_utility": False,
+        "phase_identifiability": False,
+        "optical_only": False,
+        "optical_mid_basis_scale": 0.15,
+        "optical_coarse_basis_scale": 0.05,
         "optical_innovation_scale": 0.0,
         "sar_innovation_scale": 1.0,
+        "optical_innovation_band_scales": (1.0, 1.0, 1.0),
+        "optical_correction_scale": 1.0,
+        "sar_correction_scale": 1.0,
+        "phase_transport_enabled": False,
+        "phase_transport_hidden": 128,
+        "phase_transport_gain_caps": (0.5, 0.25, 0.1),
+        "phase_transport_offset_caps_px": (0.5, 0.5, 0.5),
+        "phase_transport_initial_gate": 0.02,
+        "antithetic_weight": 0.0,
     }
 
 
@@ -862,6 +1946,180 @@ def test_haar_id_bridge_long_gap_has_exact_zero_residual_gradient() -> None:
     gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
     assert gradients and all(gradient is not None for gradient in gradients)
     assert sum(float(gradient.abs().sum()) for gradient in gradients if gradient is not None) == 0.0
+
+
+def test_utility_id_bridge_long_gap_has_exact_zero_residual_gradient() -> None:
+    model = _haar_model(anchor_origin=True, utility=True)
+    _set_trainable(model, "id_bridge")
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=1,
+        flow_visual_perceptual_weight=0.0,
+    )
+    loss, _ = objective(_batch(delta_days=2), "id_bridge")
+    loss.backward()
+    assert float(loss.detach()) == 0.0
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
+    assert gradients and all(gradient is not None for gradient in gradients)
+    assert sum(float(gradient.abs().sum()) for gradient in gradients if gradient is not None) == 0.0
+
+
+def test_id_utility_trains_only_optical_origin_parameters() -> None:
+    model = _utility_codec_model()
+    model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    _set_trainable(model, "id_utility")
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable
+    assert all(name.startswith("id_bridge_origin.") for name in trainable)
+    optimizer = _optimizer(
+        model,
+        {"learning_rate": 1e-3, "encoder_learning_rate": 1e-3, "weight_decay": 0.0},
+        "id_utility",
+        torch.device("cpu"),
+    )
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    assert optimizer_ids == trainable_ids
+
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+    )
+    torch.testing.assert_close(
+        objective._id_utility_assignments(3, torch.device("cpu")), torch.zeros(3, dtype=torch.long)
+    )
+    loss, metrics = objective(_batch(), "id_utility")
+    assert torch.isfinite(loss)
+    assert "sar2opt/q" in metrics
+    assert "sar2opt/oracle_q" in metrics
+    assert "sar2opt/anchor_gain_fine" in metrics
+    assert not any(name.startswith("opt2sar/") for name in metrics)
+    assert float(metrics["sar2opt/anchor_gain_fine"]) == pytest.approx(1.0)
+    assert float(metrics["sar2opt/anchor_gain_mid"]) == pytest.approx(math.exp(-4.0))
+    assert float(metrics["sar2opt/anchor_gain_coarse"]) == pytest.approx(math.exp(-4.0))
+    loss.backward()
+    utility_head = model.id_bridge_origin.anchor_utility_head[-1]
+    assert utility_head.weight.grad is not None
+    assert utility_head.bias.grad is not None
+    assert int(torch.count_nonzero(utility_head.weight.grad)) > 0
+    assert int(torch.count_nonzero(utility_head.bias.grad)) > 0
+    assert all(parameter.grad is None for parameter in model.decoder.parameters())
+    assert all(parameter.grad is None for parameter in model.detail_head.parameters())
+    assert all(parameter.grad is None for parameter in model.residual_dit.parameters())
+
+
+def test_id_utility_long_gap_has_exact_zero_origin_gradient() -> None:
+    model = _utility_codec_model()
+    _set_trainable(model, "id_utility")
+    objective = JointObjective(model, [0.5, 0.5], flow_rollout_every=1)
+    loss, _ = objective(_batch(delta_days=2), "id_utility")
+    loss.backward()
+    assert float(loss.detach()) == 0.0
+    gradients = [parameter.grad for parameter in model.parameters() if parameter.requires_grad]
+    assert gradients and all(gradient is not None for gradient in gradients)
+    assert sum(float(gradient.abs().sum()) for gradient in gradients if gradient is not None) == 0.0
+
+
+def test_phase_transport_trains_only_the_observable_head_and_keeps_long_gaps_zero() -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+    )
+    _set_trainable(model, "phase_transport")
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable and all(name.startswith("phase_transport_head.") for name in trainable)
+    optimizer = _optimizer(
+        model,
+        {"learning_rate": 1e-3, "encoder_learning_rate": 1e-3, "weight_decay": 0.0},
+        "phase_transport",
+        torch.device("cpu"),
+    )
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    trainable_ids = {id(parameter) for parameter in model.parameters() if parameter.requires_grad}
+    assert optimizer_ids == trainable_ids
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+    )
+    torch.testing.assert_close(
+        objective._phase_transport_assignments(3, torch.device("cpu")),
+        torch.zeros(3, dtype=torch.long),
+    )
+    objective.set_progress(1, 100)
+    loss, metrics = objective(_batch(), "phase_transport")
+    assert bool(torch.isfinite(loss))
+    for name in (
+        "sar2opt/hf_reconstruction",
+        "sar2opt/hf_gradient",
+        "sar2opt/hf_spectrum",
+        "sar2opt/low_frequency",
+        "sar2opt/rmse_hinge",
+        "sar2opt/phase_alignment",
+        "sar2opt/gain_signed_mean",
+        "sar2opt/gain_utility",
+        "sar2opt/gain_fine",
+        "sar2opt/gain_mid",
+        "sar2opt/gain_coarse",
+        "sar2opt/gate_fine",
+        "sar2opt/gate_mid",
+        "sar2opt/gate_coarse",
+        "sar2opt/oracle_gate_fine",
+        "sar2opt/oracle_gate_mid",
+        "sar2opt/oracle_gate_coarse",
+        "sar2opt/oracle_active_fraction",
+        "sar2opt/oracle_supported_fraction",
+        "sar2opt/offset_px_abs_mean",
+        "sar2opt/coherence_fine",
+        "sar2opt/coherence_mid",
+        "sar2opt/coherence_coarse",
+        "sar2opt/low_frequency_leakage",
+    ):
+        assert name in metrics and bool(torch.isfinite(metrics[name]))
+    assert float(metrics["sar2opt/gain_signed_mean"]) >= 0.0
+    assert float(metrics["sar2opt/gate_fine"]) == pytest.approx(0.02, abs=1e-7)
+    assert not any(name.startswith("opt2sar/") for name in metrics)
+    loss.backward()
+    output = model.phase_transport_head.output[-1]
+    assert output.weight.grad is not None and int(torch.count_nonzero(output.weight.grad)) > 0
+    assert output.bias.grad is not None and int(torch.count_nonzero(output.bias.grad)) > 0
+    source_projection = model.phase_transport_head.source_phase_projection
+    assert source_projection.weight.grad is not None
+    assert source_projection.bias.grad is not None
+    for parameter in model.phase_transport_head.parameters():
+        assert parameter.grad is not None
+        assert bool(torch.isfinite(parameter.grad).all())
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith("phase_transport_head.")
+    )
+
+    model.zero_grad(set_to_none=True)
+    zero_loss, _ = objective(_batch(delta_days=2), "phase_transport")
+    zero_loss.backward()
+    assert float(zero_loss.detach()) == 0.0
+    assert all(
+        parameter.grad is not None and int(torch.count_nonzero(parameter.grad)) == 0
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
 
 
 def test_id_bridge_objective_updates_origin_and_generic_flow(tiny_model: SentinelV3) -> None:
@@ -902,6 +2160,83 @@ def test_haar_id_bridge_objective_updates_both_origin_heads_and_flow() -> None:
         assert gradient is not None and int(torch.count_nonzero(gradient)) > 0
     assert model.residual_dit.output[-1].weight.grad is not None
     assert int(torch.count_nonzero(model.residual_dit.output[-1].weight.grad)) > 0
+
+
+def test_utility_optical_direction_trains_gain_logits_and_detaches_anchor_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        utility=True,
+        optical_innovation_scale=0.0,
+        optical_correction_scale=0.0,
+    )
+    model.set_optical_anchor_band_scales((0.2, 0.0, 0.0))
+    _set_trainable(model, "id_bridge")
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+    )
+    objective.set_progress(1, 10)
+    captured_projection_inputs: list[torch.Tensor] = []
+    project = model.project_id_bridge_residual
+
+    def record_project(values: torch.Tensor, target: object) -> torch.Tensor:
+        captured_projection_inputs.append(values)
+        assert target is SENTINEL2
+        return project(values, target)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(model, "project_id_bridge_residual", record_project)
+    loss, metrics = objective._id_bridge_direction(
+        _batch(),
+        torch.tensor([0]),
+        "sar_view",
+        "s2_target",
+        SENTINEL1,
+        SENTINEL2,
+        torch.ones(4),
+    )
+    assert len(captured_projection_inputs) == 1
+    assert not captured_projection_inputs[0].requires_grad
+    assert {"anchor_gain", "anchor_gain_fine", "anchor_gain_mid", "anchor_gain_coarse"} <= (
+        metrics.keys()
+    )
+    assert float(metrics["anchor_gain_fine"]) == pytest.approx(1.0)
+    assert float(metrics["anchor_gain_mid"]) == pytest.approx(math.exp(-4.0))
+    assert float(metrics["anchor_gain_coarse"]) == pytest.approx(math.exp(-4.0))
+    loss.backward()
+    head = model.id_bridge_origin.anchor_utility_head[-1]
+    for gradient in (head.weight.grad, head.bias.grad):
+        assert bool(torch.isfinite(gradient).all())
+        assert int(torch.count_nonzero(gradient)) > 0
+    assert all(parameter.grad is None for parameter in model.encoder.parameters())
+    assert all(parameter.grad is None for parameter in model.decoder.parameters())
+
+
+def test_utility_sar_direction_keeps_cross_modal_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(anchor_origin=True, utility=True)
+    _set_trainable(model, "id_bridge")
+    objective = JointObjective(model, [0.5, 0.5], flow_rollout_every=4)
+
+    def utility_oracle_called(*_args: object, **_kwargs: object) -> torch.Tensor:
+        raise AssertionError("SAR must retain the cross-modal identifiability oracle")
+
+    monkeypatch.setattr(training_module, "anchor_gain_target", utility_oracle_called)
+    loss, metrics = objective._id_bridge_direction(
+        _batch(),
+        torch.tensor([0]),
+        "s2_view",
+        "sar_target",
+        SENTINEL2,
+        SENTINEL1,
+        torch.ones(4),
+    )
+    assert torch.isfinite(loss)
+    assert "anchor_gain" not in metrics
 
 
 def test_visual_translation_routes_to_id_bridge_without_detail(tiny_model: SentinelV3) -> None:
