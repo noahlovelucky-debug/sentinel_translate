@@ -10,7 +10,7 @@ LOGS=$OUTPUT/logs
 BOOTSTRAP=$OUTPUT/bootstrap
 
 export PYTHONPATH=$ROOT/src
-export TMPDIR=$DATASET/.tmp_training
+export TMPDIR=${TRAIN_TMPDIR:-/dev/shm/sentinel_v32_existing_full_${UID}}
 export PYTHONUNBUFFERED=1
 mkdir -p "$OUTPUT" "$REPORTS" "$LOGS" "$BOOTSTRAP" "$TMPDIR"
 
