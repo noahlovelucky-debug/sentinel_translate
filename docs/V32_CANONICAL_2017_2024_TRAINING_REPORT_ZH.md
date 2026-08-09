@@ -4,10 +4,12 @@
 
 - 原始数据源：`/data/data_disk/data_dir`。
 - 规范化数据集目标目录：`/data/datasets/sentinel_translate_v32_2017_2024`。
-- 当前提交：`c0639ba Stabilize SAR codec training`。
+- codec 修复提交：`c0639ba Stabilize SAR codec training`。启动器与报告基线提交：`17d225d`，不表示当前 HEAD。
 - SAR codec 的常量局部方差数学奇点已经修复；全套测试为 `207 passed`。
 - 8 卡 smoke 已运行至 320 step，越过此前约 220 step 的故障点并以 exit code 0 结束。
-- temporal prior 仍在构建；正式 canonical 全量训练尚未实际启动。本轮将由 launcher 启动。本报告不表示最终模型效果已经产生，也不表示后续会持续监测训练。
+- 正式 canonical 链已于 `2026-08-09 23:15:30+08:00` 启动，tmux 会话为 `sentinel_v32_canonical_full`；launcher 初始 PID 为 `325000`，physical torchrun 初始 PID 为 `325517`。
+- `23:17:54+08:00` 已切入 physical，8 个 rank 已确认；兼容加载为 520 tensors / new 177，启动验收 GPU 活动为 37-47%，无 OOM。
+- external temporal prior PID `214730` 已恢复并与 physical/codec 并行。最终训练效果尚未产生；按用户要求，本报告不持续监测训练。
 
 `scripts/launch_canonical_2017_2024_8gpu.sh` 会先检查训练索引、manifest 和已完成 registration audit 的 HF sidecar。temporal prior 索引不存在时，launcher 会启动或接入已有的 prior 预计算，使其与 bootstrap、physical 和 codec 并行；进入 detail 前强制等待 prior 完成并严格检查索引存在。
 
@@ -109,6 +111,13 @@ flow 不是从纯噪声直接生成整幅图像。physical 基底先固定，cod
 
 launcher 支持同阶段 checkpoint resume。初始 physical 权重默认来自 `/data/code/sentinel_translat/v3.2/checkpoints_v32_temporal/best_physical.pt`，并使用 EMA 初始化。训练日志位于 checkpoint 根下的 `logs/`；不要把旧 protocol 的日志、报告或 checkpoint 放入这条选择链。
 
+按需人工查看即可：
+
+```bash
+tmux attach -t sentinel_v32_canonical_full
+tail -n 100 -F /data/code/sentinel_translat/v3.2/checkpoints_v32_canonical_2017_2024/logs/physical.log
+```
+
 ## 时间预算与后续动作
 
 | 工作 | 估计时长 |
@@ -121,4 +130,4 @@ launcher 支持同阶段 checkpoint resume。初始 physical 权重默认来自 
 | phase、校准与最终验证 | 约 3-6 小时 |
 | 总计 | 正式 GPU 链墙钟约 24-44 小时，保守预算 24-48 小时 |
 
-早停可能缩短实际时长。总预算指正式 GPU 链墙钟；temporal prior 的大部分时间由 physical/codec 覆盖，但若 prior 异常缓慢，detail 前的强制等待会增加墙钟时间。下一步由 launcher 启动本轮正式链；随后根据最终 protocol-bound validation 和封闭 test report 做一次性验收，不在本报告中预先声明任何最终指标或视觉效果。
+早停可能缩短实际时长。总预算指正式 GPU 链墙钟；temporal prior 的大部分时间由 physical/codec 覆盖，但若 prior 异常缓慢，detail 前的强制等待会增加墙钟时间。本轮正式链已经启动；完成后根据最终 protocol-bound validation 和封闭 test report 做一次性验收，不在本报告中预先声明任何最终指标或视觉效果。
