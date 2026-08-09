@@ -12,13 +12,18 @@ TRAIN_INDEX=$DATASET/shards/train/index.json
 MANIFEST=$DATASET/manifests/pairs.jsonl
 HF_ELIGIBILITY=$DATASET/hf_eligibility.json
 TEMPORAL_PRIOR_INDEX=$DATASET/temporal_prior/index.json
+TEMPORAL_PRIOR_LOG=$DATASET/logs/temporal_prior.stdout.log
+TEMPORAL_PRIOR_PID_FILE=$DATASET/logs/temporal_prior.pid
+TEMPORAL_PRIOR_PID=${TEMPORAL_PRIOR_PID:-}
+TEMPORAL_PRIOR_EXTERNAL=false
+TEMPORAL_PRIOR_CHILD=false
 
 export PYTHONPATH=$ROOT/src
 export TMPDIR=${TRAIN_TMPDIR:-/dev/shm/sentinel_v32_canonical_2017_2024_${UID}}
 export PYTHONUNBUFFERED=1
 mkdir -p "$OUTPUT" "$REPORTS" "$LOGS" "$BOOTSTRAP" "$TMPDIR"
 
-for required in "$TRAIN_INDEX" "$MANIFEST" "$HF_ELIGIBILITY" "$TEMPORAL_PRIOR_INDEX"; do
+for required in "$TRAIN_INDEX" "$MANIFEST" "$HF_ELIGIBILITY"; do
   if [[ ! -f "$required" ]]; then
     echo "[$(date -Is)] ERROR missing required canonical data artifact: $required" >&2
     exit 1
@@ -37,6 +42,53 @@ except (OSError, json.JSONDecodeError) as error:
 if eligibility.get("registration_audited") is not True:
     raise SystemExit(f"HF eligibility sidecar is not registration audited: {path}")
 PY
+
+if [[ -f "$TEMPORAL_PRIOR_INDEX" ]]; then
+  TEMPORAL_PRIOR_PID=
+  echo "[$(date -Is)] temporal prior index already exists: $TEMPORAL_PRIOR_INDEX"
+elif [[ -n "$TEMPORAL_PRIOR_PID" ]] && kill -0 "$TEMPORAL_PRIOR_PID" 2>/dev/null; then
+  TEMPORAL_PRIOR_EXTERNAL=true
+  mkdir -p "$(dirname "$TEMPORAL_PRIOR_LOG")"
+  printf 'external %s\n' "$TEMPORAL_PRIOR_PID" >"$TEMPORAL_PRIOR_PID_FILE"
+  echo "[$(date -Is)] temporal prior external PID=$TEMPORAL_PRIOR_PID saved=$TEMPORAL_PRIOR_PID_FILE"
+else
+  if [[ -n "$TEMPORAL_PRIOR_PID" ]]; then
+    echo "[$(date -Is)] temporal prior PID is not live; starting a local build: $TEMPORAL_PRIOR_PID"
+  fi
+  mkdir -p "$(dirname "$TEMPORAL_PRIOR_INDEX")" "$(dirname "$TEMPORAL_PRIOR_LOG")"
+  echo "[$(date -Is)] START temporal prior build workers=${TEMPORAL_PRIOR_WORKERS:-8} log=$TEMPORAL_PRIOR_LOG"
+  python "$ROOT/scripts/precompute_temporal_prior_shards.py" \
+    --shard-index "$TRAIN_INDEX" \
+    --manifest "$MANIFEST" \
+    --output "$(dirname "$TEMPORAL_PRIOR_INDEX")" \
+    --workers "${TEMPORAL_PRIOR_WORKERS:-8}" \
+    >"$TEMPORAL_PRIOR_LOG" 2>&1 &
+  TEMPORAL_PRIOR_PID=$!
+  TEMPORAL_PRIOR_CHILD=true
+  printf '%s\n' "$TEMPORAL_PRIOR_PID" >"$TEMPORAL_PRIOR_PID_FILE"
+  echo "[$(date -Is)] temporal prior PID=$TEMPORAL_PRIOR_PID saved=$TEMPORAL_PRIOR_PID_FILE"
+fi
+
+wait_for_temporal_prior() {
+  if [[ "$TEMPORAL_PRIOR_EXTERNAL" == true ]]; then
+    echo "[$(date -Is)] WAIT external temporal prior PID=$TEMPORAL_PRIOR_PID"
+    while kill -0 "$TEMPORAL_PRIOR_PID" 2>/dev/null; do
+      sleep 60
+      echo "[$(date -Is)] WAIT external temporal prior PID=$TEMPORAL_PRIOR_PID"
+    done
+  elif [[ "$TEMPORAL_PRIOR_CHILD" == true && -n "$TEMPORAL_PRIOR_PID" ]]; then
+    echo "[$(date -Is)] WAIT temporal prior PID=$TEMPORAL_PRIOR_PID"
+    if ! wait "$TEMPORAL_PRIOR_PID"; then
+      echo "[$(date -Is)] ERROR temporal prior build failed; see $TEMPORAL_PRIOR_LOG" >&2
+      exit 1
+    fi
+  fi
+  if [[ ! -f "$TEMPORAL_PRIOR_INDEX" ]]; then
+    echo "[$(date -Is)] ERROR missing temporal prior index: $TEMPORAL_PRIOR_INDEX" >&2
+    exit 1
+  fi
+  echo "[$(date -Is)] READY temporal prior index=$TEMPORAL_PRIOR_INDEX"
+}
 
 stage_config() {
   case "$1" in
@@ -82,6 +134,7 @@ run_stage physical 20000 "$BOOTSTRAP/physical_temporal_prior.pt"
 run_stage codec 20000 "$OUTPUT/best_physical.pt"
 [[ -e "$OUTPUT/best_codec.pt" ]]
 
+wait_for_temporal_prior
 run_stage detail 20000 "$OUTPUT/best_codec.pt"
 detail_checkpoint=$(latest_stage_checkpoint detail)
 [[ -n "$detail_checkpoint" ]]
