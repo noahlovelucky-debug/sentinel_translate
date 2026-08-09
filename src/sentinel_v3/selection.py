@@ -22,6 +22,7 @@ def select_checkpoint(
     hashes = {report.get("protocol_hash") for report in reports}
     if None in hashes or len(hashes) != 1:
         raise ValueError("all reports must use the same non-null V3.2 validation protocol hash")
+    protocol_hash = next(iter(hashes))
     physical_pass = all(
         bool(report.get("quality_gates", {}).get("physical")) for report in reports
     )
@@ -37,6 +38,8 @@ def select_checkpoint(
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     if int(payload.get("format_version", 0)) != 4:
         raise RuntimeError("checkpoint selection requires V3.2 format-v4 input")
+    if payload.get("validation_protocol_hash") != protocol_hash:
+        raise RuntimeError("checkpoint validation_protocol_hash does not match selection reports")
     payload.setdefault("quality_gates", {}).update(
         {"physical": physical_pass, "visual": visual_pass, "joint": joint_pass}
     )
@@ -53,7 +56,7 @@ def select_checkpoint(
         "physical_pass": physical_pass,
         "visual_pass": visual_pass,
         "joint_pass": joint_pass,
-        "protocol_hash": hashes.pop(),
+        "protocol_hash": protocol_hash,
         "selected": selected,
     }
     (destination / "selection.json").write_text(

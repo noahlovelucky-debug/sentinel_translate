@@ -23,21 +23,16 @@ from .losses import (
     spectral_angle,
 )
 from .model import ModelConfig, SentinelV3
+from .schema import S2_CHANNEL_ORDER, SAR_CHANNEL_ORDER
 from .sensors import SENTINEL1, SENTINEL2
-from .validation import ValidationProtocol, protocol_records, validation_protocol_hash
-
-S2_KEYS = (
-    "blue",
-    "green",
-    "red",
-    "rededge1",
-    "rededge2",
-    "rededge3",
-    "nir",
-    "nir08",
-    "swir16",
-    "swir22",
+from .validation import (
+    ValidationProtocol,
+    protocol_records,
+    validation_protocol_for_manifest,
+    validation_protocol_hash,
 )
+
+S2_KEYS = S2_CHANNEL_ORDER
 
 
 def aggregate_scene_bias(signed_biases: list[float]) -> tuple[float, float]:
@@ -54,13 +49,15 @@ class ManifestCropDataset(Dataset[dict[str, object]]):
         self,
         manifest: str | Path,
         split: str,
-        crop_size: int = 256,
+        crop_size: int | None = None,
         limit: int | None = None,
     ) -> None:
         if split == "validation_temporal":
-            protocol = ValidationProtocol(crop_size=crop_size)
+            protocol = validation_protocol_for_manifest(manifest, crop_size=crop_size)
+            self.protocol = protocol
             self.records = protocol_records(manifest, protocol)
         else:
+            self.protocol = ValidationProtocol()
             self.records = []
             with Path(manifest).open("r", encoding="utf-8") as handle:
                 for line in handle:
@@ -76,7 +73,7 @@ class ManifestCropDataset(Dataset[dict[str, object]]):
                 self.records = self.records[:limit]
         if not self.records:
             raise ValueError(f"no records for split {split}")
-        self.crop_size = crop_size
+        self.crop_size = self.protocol.crop_size if crop_size is None else crop_size
 
     def __len__(self) -> int:
         return len(self.records)
@@ -95,7 +92,7 @@ class ManifestCropDataset(Dataset[dict[str, object]]):
             with rasterio.open(record["s2"][key]) as source:
                 s2_raw.append(source.read(1, window=window))
         sar_raw = []
-        for key in ("vv", "vh"):
+        for key in SAR_CHANNEL_ORDER:
             with rasterio.open(record["sar"][key]) as source:
                 sar_raw.append(source.read(1, window=window))
         with rasterio.open(record["scl"]) as source:
@@ -104,7 +101,7 @@ class ManifestCropDataset(Dataset[dict[str, object]]):
         sar_encoded = np.stack(sar_raw).astype(np.float32)
         sar_db = sar_encoded / 200.0 - 50.0
         valid = (
-            np.isin(scl, ValidationProtocol().mask_scl_codes)
+            np.isin(scl, self.protocol.mask_scl_codes)
             & np.all(np.stack(s2_raw) > 0, axis=0)
             & np.all(sar_encoded > 0, axis=0)
         )

@@ -59,6 +59,7 @@ def physical_resample(
     source_gsd_m: float,
     target_gsd_m: float,
     restore_grid: bool = True,
+    valid: Tensor | None = None,
 ) -> Tensor:
     if source_gsd_m <= 0 or target_gsd_m <= 0:
         raise ValueError("GSD values must be positive")
@@ -75,14 +76,45 @@ def physical_resample(
     physical = db_to_intensity(values) if modality == "sar" else values
     # Area interpolation is the exact box/MTF integration for integer Sentinel views.
     # A Gaussian prefilter is only needed for non-integer scale ratios.
-    filtered = physical if float(ratio).is_integer() else _blur(physical, sigma)
-    reduced = F.interpolate(filtered.float(), size=output_size, mode="area")
+    if valid is None:
+        filtered = physical if float(ratio).is_integer() else _blur(physical, sigma)
+        reduced = F.interpolate(filtered.float(), size=output_size, mode="area")
+        if restore_grid:
+            reduced = F.interpolate(
+                reduced, size=values.shape[-2:], mode="bilinear", align_corners=False
+            )
+        if modality == "sar":
+            reduced = intensity_to_db(reduced)
+        return reduced.to(values.dtype)
+    if (
+        valid.ndim != 4
+        or valid.shape[0] != values.shape[0]
+        or valid.shape[1] != 1
+        or valid.shape[-2:] != values.shape[-2:]
+    ):
+        raise ValueError("valid must have shape Bx1xHxW matching values")
+    coverage = valid.to(device=values.device, dtype=physical.dtype).clamp(0.0, 1.0)
+    numerator = physical * coverage
+    if not float(ratio).is_integer():
+        numerator = _blur(numerator, sigma)
+        coverage = _blur(coverage, sigma)
+    reduced_numerator = F.interpolate(numerator.float(), size=output_size, mode="area")
+    reduced_coverage = F.interpolate(coverage.float(), size=output_size, mode="area")
+    reduced = torch.where(
+        reduced_coverage > 0,
+        reduced_numerator / reduced_coverage.clamp_min(1e-8),
+        torch.zeros_like(reduced_numerator),
+    )
     if restore_grid:
         reduced = F.interpolate(
             reduced, size=values.shape[-2:], mode="bilinear", align_corners=False
         )
+        reduced_coverage = F.interpolate(
+            reduced_coverage, size=values.shape[-2:], mode="bilinear", align_corners=False
+        )
     if modality == "sar":
         reduced = intensity_to_db(reduced)
+        reduced = torch.where(reduced_coverage > 0, reduced, torch.zeros_like(reduced))
     return reduced.to(values.dtype)
 
 

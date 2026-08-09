@@ -3,6 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+from collections.abc import Iterable, Sequence
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from datetime import date
 from functools import lru_cache
@@ -13,18 +15,9 @@ import numpy as np
 import torch
 from torch import Tensor
 
-S2_ASSET_KEYS = (
-    "blue",
-    "green",
-    "red",
-    "rededge1",
-    "rededge2",
-    "rededge3",
-    "nir",
-    "nir08",
-    "swir16",
-    "swir22",
-)
+from .schema import CLEAR_SCL_CODES, S2_CHANNEL_ORDER, SAR_CHANNEL_ORDER
+
+S2_ASSET_KEYS = S2_CHANNEL_ORDER
 
 
 @dataclass(frozen=True)
@@ -46,7 +39,8 @@ class TemporalPriorConfig:
     @classmethod
     def from_dict(cls, values: dict[str, Any]) -> TemporalPriorConfig:
         values = dict(values)
-        values["train_years"] = tuple(int(year) for year in values["train_years"])
+        if "train_years" in values:
+            values["train_years"] = tuple(int(year) for year in values["train_years"])
         return cls(**values)
 
 
@@ -63,14 +57,56 @@ def temporal_prior_config(
     *,
     optical_amplitude_weight: float = 0.75,
     sar_weight: float = 0.80,
+    train_years: Iterable[int] | None = None,
+    shard_index: str | Path | None = None,
 ) -> TemporalPriorConfig:
     path = Path(manifest).resolve()
+    resolved_years = _resolve_train_years(path, train_years=train_years, shard_index=shard_index)
     return TemporalPriorConfig(
         manifest=str(path),
         manifest_sha256=file_sha256(path),
+        version="train-seasonal-v3" if resolved_years != (2017, 2018) else "train-seasonal-v2",
+        train_years=resolved_years,
         optical_amplitude_weight=optical_amplitude_weight,
         sar_weight=sar_weight,
     )
+
+
+def _resolve_train_years(
+    manifest: Path,
+    *,
+    train_years: Iterable[int] | None,
+    shard_index: str | Path | None,
+) -> tuple[int, ...]:
+    if train_years is not None:
+        resolved = tuple(sorted({int(year) for year in train_years}))
+        if not resolved:
+            raise ValueError("train_years cannot be empty")
+        return resolved
+    if shard_index is not None:
+        values = json.loads(Path(shard_index).read_text(encoding="utf-8"))
+        indexed = tuple(sorted({int(year) for year in values.get("train_years", ())}))
+        if indexed:
+            return indexed
+    years: set[int] = set()
+    with manifest.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            if not line.strip():
+                continue
+            record = json.loads(line)
+            if record.get("split") == "train":
+                years.add(int(record["year"]))
+    if not years:
+        return (2017, 2018)
+    sidecar = manifest.parent / "validation_protocol.json"
+    if sidecar.is_file():
+        values = json.loads(sidecar.read_text(encoding="utf-8"))
+        if values.get("dataset") == "sentinel_translate_v32_2017_2024":
+            return tuple(sorted(years))
+    # Legacy manifests cover 2017--2020 and intentionally retain their fixed
+    # 2017/18 prior.  The reproducible 2017--2024 corpus always includes a
+    # 2021+ train year, even when callers omit its sidecar in a small test.
+    return tuple(sorted(years)) if max(years) >= 2021 else (2017, 2018)
 
 
 def _day_distance(left: date, right: date) -> int:
@@ -79,7 +115,7 @@ def _day_distance(left: date, right: date) -> int:
 
 
 class TemporalPriorStore:
-    """Train-only seasonal memory for locations observed during 2017-2018."""
+    """Train-only seasonal memory for locations in ``config.train_years``."""
 
     def __init__(self, config: TemporalPriorConfig) -> None:
         self.config = config
@@ -194,6 +230,52 @@ class TemporalPriorStore:
             torch.as_tensor(covered, device=device, dtype=dtype).unsqueeze(0),
         )
 
+    def windows_prior(
+        self,
+        *,
+        location_id: str,
+        acquired: date | str,
+        modality: Literal["optical", "sar"],
+        orbit: str,
+        windows: Sequence[tuple[int, int, int, int]],
+        exclude_pair_id: str,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Build all same-sized shard windows without reading complete neighbor scenes."""
+
+        normalized_windows = tuple(
+            tuple(int(value) for value in window) for window in windows
+        )
+        if not normalized_windows:
+            raise ValueError("windows_prior requires at least one window")
+        _, _, width, height = normalized_windows[0]
+        if width <= 0 or height <= 0 or any(
+            window[2:] != (width, height) for window in normalized_windows
+        ):
+            raise ValueError("windows_prior requires positive, same-sized windows")
+        target_date = date.fromisoformat(acquired) if isinstance(acquired, str) else acquired
+        nearest = self._nearest(
+            location_id,
+            target_date,
+            modality,
+            orbit,
+            exclude_pair_id=exclude_pair_id,
+        )
+        if not nearest:
+            raise RuntimeError("no leave-one-out temporal neighbors are available")
+        channels = len(S2_ASSET_KEYS) if modality == "optical" else len(SAR_CHANNEL_ORDER)
+        count = len(normalized_windows)
+        weighted = np.zeros((count, channels, height, width), dtype=np.float32)
+        weights = np.zeros((count, 1, height, width), dtype=np.float32)
+        for temporal_weight, record in nearest:
+            values, valid = self._read_record_windows(
+                str(record["pair_id"]), modality, normalized_windows
+            )
+            sample_weight = np.float32(temporal_weight) * valid[:, None]
+            weighted += values * sample_weight
+            weights += sample_weight
+        covered = weights > 0
+        return weighted / np.maximum(weights, 1e-12), covered
+
     @lru_cache(maxsize=16)  # noqa: B019 - store lifetime owns this bounded raster cache.
     def _read_record(
         self,
@@ -222,16 +304,55 @@ class TemporalPriorStore:
             with rasterio.open(record["scl"]) as source:
                 scl = source.read(1, window=window)
             encoded = np.stack(raw)
-            valid = np.isin(scl, (4, 5, 6, 7)) & np.all(encoded > 0, axis=0)
+            valid = np.isin(scl, CLEAR_SCL_CODES) & np.all(encoded > 0, axis=0)
             values = (encoded.astype(np.float32) / 10000.0).clip(0.0, 1.0)
         else:
             raw = []
-            for key in ("vv", "vh"):
+            for key in SAR_CHANNEL_ORDER:
                 with rasterio.open(record["sar"][key]) as source:
                     raw.append(source.read(1, window=window))
             encoded = np.stack(raw)
             valid = np.all(encoded > 0, axis=0)
             values = encoded.astype(np.float32) / 200.0 - 50.0
+        return values, valid
+
+    def _read_record_windows(
+        self,
+        pair_id: str,
+        modality: Literal["optical", "sar"],
+        windows: Sequence[tuple[int, int, int, int]],
+    ) -> tuple[np.ndarray, np.ndarray]:
+        import rasterio
+        from rasterio.windows import Window
+
+        record = self._records_by_id[pair_id]
+        raster_windows = tuple(Window(*window) for window in windows)
+
+        def read_all(source: object) -> np.ndarray:
+            return np.stack([source.read(1, window=window) for window in raster_windows])  # type: ignore[union-attr]
+
+        with ExitStack() as stack:
+            if modality == "optical":
+                encoded = np.stack(
+                    [
+                        read_all(stack.enter_context(rasterio.open(record["s2"][key])))
+                        for key in S2_ASSET_KEYS
+                    ],
+                    axis=1,
+                )
+                scl = read_all(stack.enter_context(rasterio.open(record["scl"])))
+                valid = np.isin(scl, CLEAR_SCL_CODES) & np.all(encoded > 0, axis=1)
+                values = (encoded.astype(np.float32) / 10000.0).clip(0.0, 1.0)
+            else:
+                encoded = np.stack(
+                    [
+                        read_all(stack.enter_context(rasterio.open(record["sar"][key])))
+                        for key in SAR_CHANNEL_ORDER
+                    ],
+                    axis=1,
+                )
+                valid = np.all(encoded > 0, axis=1)
+                values = encoded.astype(np.float32) / 200.0 - 50.0
         return values, valid
 
     def full_scene_prior(

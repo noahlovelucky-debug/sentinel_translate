@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
 import torch
 
 from sentinel_v3.losses import latent_alignment, physical_loss
@@ -44,7 +45,14 @@ def test_physical_loss_balances_acceptance_scale_errors() -> None:
 
 def test_hard_gate_checkpoint_selection(tmp_path: Path) -> None:
     checkpoint = tmp_path / "candidate.pt"
-    torch.save({"format_version": 4, "quality_gates": {}}, checkpoint)
+    torch.save(
+        {
+            "format_version": 4,
+            "quality_gates": {},
+            "validation_protocol_hash": "fixed-protocol",
+        },
+        checkpoint,
+    )
     report = tmp_path / "report.json"
     report.write_text(
         json.dumps(
@@ -88,3 +96,22 @@ def test_selection_rejects_mixed_protocols(tmp_path: Path) -> None:
         assert "protocol hash" in str(error)
     else:
         raise AssertionError("mixed protocols must be rejected")
+
+
+def test_selection_rejects_checkpoint_protocol_mismatch(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "candidate.pt"
+    torch.save(
+        {
+            "format_version": 4,
+            "quality_gates": {},
+            "validation_protocol_hash": "checkpoint-protocol",
+        },
+        checkpoint,
+    )
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps({"protocol_hash": "report-protocol", "quality_gates": {}}),
+        encoding="utf-8",
+    )
+    with pytest.raises(RuntimeError, match="validation_protocol_hash"):
+        select_checkpoint(checkpoint, [report], tmp_path / "selected")

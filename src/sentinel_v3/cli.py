@@ -20,7 +20,7 @@ from .model import ModelConfig, SentinelV3
 from .selection import select_checkpoint
 from .temporal_prior import configure_checkpoint_temporal_prior
 from .training import train
-from .validation import ValidationProtocol, validation_protocol_hash
+from .validation import validation_protocol_for_manifest, validation_protocol_hash
 
 
 def _parser() -> argparse.ArgumentParser:
@@ -158,7 +158,7 @@ def main() -> None:
             )
         )
     elif args.command == "validation-protocol":
-        protocol = ValidationProtocol()
+        protocol = validation_protocol_for_manifest(config["paths"]["manifest"])
         print(
             json.dumps(
                 {

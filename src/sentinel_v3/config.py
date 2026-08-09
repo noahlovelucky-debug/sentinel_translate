@@ -25,6 +25,9 @@ DEFAULT: dict[str, Any] = {
         "batch_size": 16,
         "gradient_accumulation": 1,
         "num_workers": 0,
+        "persistent_workers": True,
+        "prefetch_factor": 2,
+        "activation_checkpointing": False,
         "learning_rate": 0.00001,
         "adapter_learning_rate": 0.0001,
         "encoder_learning_rate": 0.000002,
@@ -43,6 +46,7 @@ DEFAULT: dict[str, Any] = {
         "task_probabilities": [0.5, 0.5],
         "physical_alignment_samples": 4,
         "physical_alignment_weight": 0.02,
+        "physical_alignment_every": 1,
         "optical_dists_weight": 0.1,
         "flow_perceptual_every": 8,
         "flow_visual_pixel_weight": 0.05,
@@ -205,8 +209,22 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("two direction probabilities must sum to one")
     if int(train["num_workers"]) < 0 or int(train["batch_size"]) <= 0:
         raise ValueError("invalid data loader settings")
+    if not isinstance(train["persistent_workers"], bool):
+        raise TypeError("train.persistent_workers must be a bool")
+    prefetch_factor = train["prefetch_factor"]
+    if isinstance(prefetch_factor, bool) or not isinstance(prefetch_factor, int):
+        raise TypeError("train.prefetch_factor must be a positive integer")
+    if prefetch_factor < 1:
+        raise ValueError("train.prefetch_factor must be positive")
+    if not isinstance(train["activation_checkpointing"], bool):
+        raise TypeError("train.activation_checkpointing must be a bool")
     if int(train["physical_alignment_samples"]) < 2:
         raise ValueError("train.physical_alignment_samples must be at least two")
+    alignment_every = train["physical_alignment_every"]
+    if isinstance(alignment_every, bool) or not isinstance(alignment_every, int):
+        raise TypeError("train.physical_alignment_every must be a positive integer")
+    if alignment_every < 1:
+        raise ValueError("train.physical_alignment_every must be positive")
     if not 0.0 <= float(train["physical_alignment_weight"]):
         raise ValueError("train.physical_alignment_weight must be non-negative")
     for name in (

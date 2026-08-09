@@ -2,18 +2,30 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+from collections.abc import Iterable
 from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 
 import torch
 
-from sentinel_v3.data import estimate_registration_shift, high_frequency_eligible
+from sentinel_v3.data import (
+    REGISTRATION_AUDIT_METHOD,
+    REGISTRATION_AUDIT_VERSION,
+    REGISTRATION_MIN_IMPROVEMENT,
+    REGISTRATION_MIN_NCC,
+    REGISTRATION_SEARCH_RADIUS_PX,
+    estimate_registration_shift,
+    high_frequency_eligible,
+)
 
 
-def audit_shard(task: tuple[int, int, dict[str, object], str]) -> tuple[int, list[int]]:
+def audit_shard(
+    task: tuple[int, int, dict[str, object], str, tuple[int, ...]]
+) -> tuple[int, list[int]]:
     torch.set_num_threads(1)
-    shard_index, start, descriptor, split = task
+    shard_index, start, descriptor, split, hf_years = task
     shard = torch.load(str(descriptor["path"]), map_location="cpu", weights_only=False)
     eligible = []
     for local in range(int(descriptor["count"])):
@@ -28,7 +40,9 @@ def audit_shard(task: tuple[int, int, dict[str, object], str]) -> tuple[int, lis
         s2_valid = shard.get("s2_valid", shard["joint_valid"])[local].float()
         shift = (
             estimate_registration_shift(
-                shard["s2"][local].float(), shard["sar"][local].float()
+                shard["s2"][local].float(),
+                shard["sar"][local].float(),
+                valid=joint_valid,
             )
             if delta_days <= 1
             else torch.tensor(float("inf"))
@@ -40,6 +54,7 @@ def audit_shard(task: tuple[int, int, dict[str, object], str]) -> tuple[int, lis
             registration_shift_px=shift,
             valid_fraction=float(joint_valid.mean()),
             cloud_shadow_fraction=float(1.0 - s2_valid.mean()),
+            train_years=hf_years,
         ):
             eligible.append(start + local)
     return shard_index, eligible
@@ -50,13 +65,32 @@ def main() -> None:
     parser.add_argument("--index", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--workers", type=int, default=8)
+    parser.add_argument(
+        "--hf-years",
+        help="comma-separated override; otherwise use hf_years/train_years from the index",
+    )
     args = parser.parse_args()
     index_path = Path(args.index).resolve()
     index = json.loads(index_path.read_text(encoding="utf-8"))
+    if args.hf_years:
+        hf_years: Iterable[str] = args.hf_years.split(",")
+    else:
+        hf_years = index.get("hf_years", index.get("train_years", (2017, 2018)))
+    normalized_hf_years = tuple(sorted({int(year) for year in hf_years}))
+    if not normalized_hf_years:
+        raise ValueError("hf years cannot be empty")
     tasks = []
     start = 0
     for shard_index, descriptor in enumerate(index["shards"]):
-        tasks.append((shard_index, start, descriptor, str(index.get("split", "unknown"))))
+        tasks.append(
+            (
+                shard_index,
+                start,
+                descriptor,
+                str(index.get("split", "unknown")),
+                normalized_hf_years,
+            )
+        )
         start += int(descriptor["count"])
     eligible_indices: list[int] = []
     with ProcessPoolExecutor(max_workers=args.workers) as executor:
@@ -74,8 +108,19 @@ def main() -> None:
                     flush=True,
                 )
     payload = {
-        "format_version": 1,
+        "format_version": 2,
         "source_index": str(index_path),
+        "source_index_sha256": hashlib.sha256(index_path.read_bytes()).hexdigest(),
+        "train_years": [int(year) for year in index.get("train_years", normalized_hf_years)],
+        "hf_years": list(normalized_hf_years),
+        "registration_audited": True,
+        "registration_audit": {
+            "method": REGISTRATION_AUDIT_METHOD,
+            "version": REGISTRATION_AUDIT_VERSION,
+            "search_radius_px": REGISTRATION_SEARCH_RADIUS_PX,
+            "minimum_ncc": REGISTRATION_MIN_NCC,
+            "minimum_improvement": REGISTRATION_MIN_IMPROVEMENT,
+        },
         "samples": start,
         "eligible_samples": len(eligible_indices),
         "maximum_shift_px": 0.5,

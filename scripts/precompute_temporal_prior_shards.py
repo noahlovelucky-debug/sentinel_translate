@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -11,23 +12,16 @@ from typing import Any
 import numpy as np
 import torch
 
+from sentinel_v3.schema import S2_CHANNEL_ORDER, SAR_CHANNEL_ORDER
 from sentinel_v3.temporal_prior import TemporalPriorStore, temporal_prior_config
 
 _STORE: TemporalPriorStore | None = None
 
 
-def _initialize(manifest: str) -> None:
+def _initialize(manifest: str, shard_index: str) -> None:
     global _STORE
     torch.set_num_threads(1)
-    _STORE = TemporalPriorStore(temporal_prior_config(manifest))
-
-
-def _crop(values: np.ndarray, windows: np.ndarray) -> torch.Tensor:
-    crops = [
-        values[:, row : row + height, col : col + width]
-        for col, row, width, height in windows.tolist()
-    ]
-    return torch.from_numpy(np.stack(crops).astype(np.float16))
+    _STORE = TemporalPriorStore(temporal_prior_config(manifest, shard_index=shard_index))
 
 
 def _build_one(task: tuple[int, str, str]) -> dict[str, object]:
@@ -55,28 +49,30 @@ def _build_one(task: tuple[int, str, str]) -> dict[str, object]:
             }
     _, location_id, s1_date, orbit, s2_date = pair_id.split(":")
     windows = source["window"].cpu().numpy().astype(np.int64)
-    optical, optical_coverage = _STORE.full_scene_prior(
+    optical, optical_coverage = _STORE.windows_prior(
         location_id=location_id,
         acquired=s2_date,
         modality="optical",
         orbit=orbit,
+        windows=windows.tolist(),
         exclude_pair_id=pair_id,
     )
-    sar, sar_coverage = _STORE.full_scene_prior(
+    sar, sar_coverage = _STORE.windows_prior(
         location_id=location_id,
         acquired=s1_date,
         modality="sar",
         orbit=orbit,
+        windows=windows.tolist(),
         exclude_pair_id=pair_id,
     )
     payload = {
         "format_version": 1,
         "pair_id": pair_ids,
         "window": source["window"],
-        "optical": _crop(optical, windows),
-        "optical_coverage": _crop(optical_coverage, windows).bool(),
-        "sar": _crop(sar, windows),
-        "sar_coverage": _crop(sar_coverage, windows).bool(),
+        "optical": torch.from_numpy(optical.astype(np.float16)),
+        "optical_coverage": torch.from_numpy(optical_coverage).bool(),
+        "sar": torch.from_numpy(sar.astype(np.float16)),
+        "sar_coverage": torch.from_numpy(sar_coverage).bool(),
     }
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(destination.suffix + f".{os.getpid()}.tmp")
@@ -116,7 +112,7 @@ def main() -> None:
     with ProcessPoolExecutor(
         max_workers=args.workers,
         initializer=_initialize,
-        initargs=(args.manifest,),
+        initargs=(args.manifest, args.shard_index),
     ) as executor:
         futures = {executor.submit(_build_one, task): task[0] for task in tasks}
         for completed_count, future in enumerate(as_completed(futures), 1):
@@ -134,13 +130,23 @@ def main() -> None:
                 flush=True,
             )
     completed.sort(key=lambda item: int(item["index"]))
+    prior_config = temporal_prior_config(args.manifest, shard_index=args.shard_index)
     index_payload = {
-        "format_version": 1,
+        "format_version": 2,
         "source_index": str(Path(args.shard_index).resolve()),
+        "source_index_sha256": hashlib.sha256(Path(args.shard_index).read_bytes()).hexdigest(),
         "manifest": str(Path(args.manifest).resolve()),
+        "manifest_sha256": prior_config.manifest_sha256,
+        "temporal_prior_version": prior_config.version,
+        "train_years": list(prior_config.train_years),
+        "s2_channel_order": list(S2_CHANNEL_ORDER),
+        "sar_channel_order": list(SAR_CHANNEL_ORDER),
         "shards": completed,
     }
-    (output / "index.json").write_text(json.dumps(index_payload, indent=2) + "\n")
+    destination = output / "index.json"
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    temporary.write_text(json.dumps(index_payload, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(destination)
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
@@ -52,6 +53,54 @@ def _weighted_zero(module: nn.Module, device: torch.device) -> Tensor:
         parameter.sum() * 0.0 for parameter in module.parameters() if parameter.requires_grad
     ]
     return sum(terms, torch.zeros((), device=device))
+
+
+def _file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _load_high_frequency_eligibility(
+    eligibility_path: str | Path, train_index: str | Path
+) -> list[int]:
+    """Load an explicit registration audit bound to exactly one shard index."""
+
+    sidecar_path = Path(eligibility_path).resolve()
+    index_path = Path(train_index).resolve()
+    values = json.loads(sidecar_path.read_text(encoding="utf-8"))
+    format_version = int(values.get("format_version", 1))
+    source_value = values.get("source_index")
+    if source_value is None:
+        raise RuntimeError("eligibility sidecar must declare source_index")
+    source_path = Path(str(source_value))
+    if not source_path.is_absolute():
+        source_path = (sidecar_path.parent / source_path).resolve()
+    else:
+        source_path = source_path.resolve()
+    if source_path != index_path:
+        raise RuntimeError("eligibility sidecar belongs to a different training index")
+    if values.get("registration_audited") is False or (
+        format_version >= 2 and values.get("registration_audited") is not True
+    ):
+        raise RuntimeError("high-frequency eligibility sidecar has not completed registration audit")
+    if format_version >= 2 and values.get("source_index_sha256") != _file_sha256(index_path):
+        raise RuntimeError("eligibility sidecar source_index_sha256 does not match")
+    eligible = values.get("eligible_indices")
+    if not isinstance(eligible, list):
+        raise TypeError("eligibility sidecar eligible_indices must be a list")
+    return [int(value) for value in eligible]
+
+
+def _data_loader_worker_options(train_config: dict[str, Any]) -> dict[str, object]:
+    workers = int(train_config["num_workers"])
+    options: dict[str, object] = {"num_workers": workers}
+    if workers > 0:
+        options["persistent_workers"] = bool(train_config["persistent_workers"])
+        options["prefetch_factor"] = int(train_config["prefetch_factor"])
+    return options
 
 
 @torch.no_grad()
@@ -113,6 +162,7 @@ class JointObjective(nn.Module):
         task_probabilities: list[float] | None = None,
         physical_alignment_samples: int = 4,
         physical_alignment_weight: float = 0.02,
+        physical_alignment_every: int = 1,
         optical_dists_weight: float = 0.1,
         flow_perceptual_every: int = 8,
         codec_train_modality: str | None = None,
@@ -139,6 +189,9 @@ class JointObjective(nn.Module):
         )
         self.physical_alignment_samples = physical_alignment_samples
         self.physical_alignment_weight = physical_alignment_weight
+        if physical_alignment_every < 1:
+            raise ValueError("physical_alignment_every must be positive")
+        self.physical_alignment_every = physical_alignment_every
         self.optical_dists_weight = optical_dists_weight
         if codec_train_modality not in {None, "optical", "sar"}:
             raise ValueError("codec_train_modality must be optical, sar, or null")
@@ -1804,7 +1857,11 @@ class JointObjective(nn.Module):
             )
         total = total / max(active, 1)
 
-        if stage == "physical" and batch_size >= 2:
+        if (
+            stage == "physical"
+            and batch_size >= 2
+            and self.current_step % self.physical_alignment_every == 0
+        ):
             count = min(self.physical_alignment_samples, batch_size)
             indices = torch.arange(count, device=device)
             valid = batch["valid"][indices]  # type: ignore[index]
@@ -1825,7 +1882,7 @@ class JointObjective(nn.Module):
                 metadata=batch["metadata"][indices],  # type: ignore[index]
             )[-1]
             alignment, alignment_metrics = latent_alignment(sar_scene, optical_scene, valid)
-            total = total + self.physical_alignment_weight * alignment
+            total = total + self.physical_alignment_weight * self.physical_alignment_every * alignment
             metrics.update(
                 {f"latent/{name}": value for name, value in alignment_metrics.items()}
             )
@@ -2032,6 +2089,42 @@ def _stage_requires_codec_gate(model: SentinelV3, stage: str) -> bool:
     return stage == "id_bridge" and model.config.id_bridge_state == "codec"
 
 
+def _stage_requires_physical_gate(stage: str) -> bool:
+    return stage in {
+        "detail",
+        "codec",
+        "flow",
+        "risk",
+        "bridge",
+        "id_bridge",
+        "id_utility",
+        "phase_transport",
+        "balance",
+    }
+
+
+def _validate_protocol_binding(
+    checkpoint: dict[str, object],
+    protocol_hash: str,
+    *,
+    stage: str,
+    resume: bool,
+) -> bool:
+    """Bind resumed and high-frequency v4 work to the active validation protocol."""
+
+    checkpoint_hash = checkpoint.get("validation_protocol_hash")
+    matches = isinstance(checkpoint_hash, str) and checkpoint_hash == protocol_hash
+    requires_match = resume or (
+        _stage_requires_physical_gate(stage) and int(checkpoint.get("format_version", 0)) == 4
+    )
+    if requires_match and not matches:
+        action = "resume" if resume else "high-frequency initialization"
+        raise RuntimeError(
+            f"{action} requires validation_protocol_hash matching the active config"
+        )
+    return matches
+
+
 def _match_optimizer_layout(optimizer: AdamW) -> None:
     for parameter, state in optimizer.state.items():
         if parameter.ndim != 4 or not parameter.is_contiguous(
@@ -2231,6 +2324,27 @@ def _pcgrad_corrections(
             None if not raw else torch.stack(adjusted).mean(0) - torch.stack(raw).mean(0)
         )
     return corrections
+
+
+def _accumulate_pcgrad_corrections(
+    accumulated: list[Tensor | None] | None,
+    corrections: list[Tensor | None],
+) -> list[Tensor | None]:
+    """Sum microstep PCGrad deltas after each loss has been accumulation-scaled."""
+
+    if accumulated is None:
+        return [None if correction is None else correction.clone() for correction in corrections]
+    if len(accumulated) != len(corrections):
+        raise ValueError("PCGrad correction lengths must match")
+    combined: list[Tensor | None] = []
+    for previous, current in zip(accumulated, corrections, strict=True):
+        if previous is None:
+            combined.append(None if current is None else current.clone())
+        elif current is None:
+            combined.append(previous)
+        else:
+            combined.append(previous + current)
+    return combined
 
 
 def _apply_pcgrad_corrections(
@@ -2493,11 +2607,8 @@ def train(
             raise RuntimeError(
                 f"high-frequency eligibility sidecar is missing: {eligibility_file}"
             )
-        eligibility = json.loads(eligibility_file.read_text(encoding="utf-8"))
-        if str(eligibility.get("source_index")) != str(config["paths"]["train_shards"]):
-            raise RuntimeError("eligibility sidecar belongs to a different training index")
         sampler = StatefulIndexSampler(
-            [int(value) for value in eligibility["eligible_indices"]],
+            _load_high_frequency_eligibility(eligibility_file, config["paths"]["train_shards"]),
             replicas=world_size,
             rank=rank,
             seed=seed,
@@ -2515,11 +2626,14 @@ def train(
         batch_size=int(train_config["batch_size"]),
         sampler=sampler,
         shuffle=isinstance(dataset, Subset),
-        num_workers=int(train_config["num_workers"]),
         pin_memory=torch.cuda.is_available(),
         drop_last=True,
+        **_data_loader_worker_options(train_config),
     )
     model = SentinelV3(ModelConfig(**config["model"])).to(device)
+    model.encoder.set_activation_checkpointing(
+        bool(train_config.get("activation_checkpointing", False))
+    )
     if channels_last:
         model = model.to(memory_format=torch.channels_last)
     _set_trainable(model, stage)
@@ -2545,6 +2659,7 @@ def train(
         task_probabilities=list(train_config.get("task_probabilities", [0.5, 0.5])),
         physical_alignment_samples=int(train_config.get("physical_alignment_samples", 4)),
         physical_alignment_weight=float(train_config.get("physical_alignment_weight", 0.02)),
+        physical_alignment_every=int(train_config.get("physical_alignment_every", 1)),
         optical_dists_weight=float(train_config.get("optical_dists_weight", 0.1)),
         flow_perceptual_every=int(train_config.get("flow_perceptual_every", 8)),
         codec_train_modality=train_config.get("codec_train_modality"),
@@ -2589,6 +2704,9 @@ def train(
 
     if init_model:
         initial = torch.load(init_model, map_location="cpu", weights_only=False)
+        initial_protocol_matches = _validate_protocol_binding(
+            initial, protocol_hash, stage=stage, resume=False
+        )
         initial_state = dict(initial["model"])
         temporal_config = initial.get("temporal_prior") or initial.get("config", {}).get(
             "temporal_prior"
@@ -2605,18 +2723,7 @@ def train(
         if optical_detail_override is not None:
             model.set_detail_confidence_threshold("optical", float(optical_detail_override))
         if (
-            stage
-            in {
-                "detail",
-                "codec",
-                "flow",
-                "risk",
-                "bridge",
-                "id_bridge",
-                "id_utility",
-                "phase_transport",
-                "balance",
-            }
+            _stage_requires_physical_gate(stage)
             and bool(train_config.get("require_physical_gate", True))
             and not bool(initial.get("quality_gates", {}).get("physical", False))
         ):
@@ -2639,12 +2746,13 @@ def train(
             raise RuntimeError(
                 "flow training requires a deterministic-detail checkpoint that passed its gate"
             )
-        if int(initial.get("format_version", 0)) == 4:
+        if int(initial.get("format_version", 0)) == 4 and (
+            stage != "physical" or initial_protocol_matches
+        ):
             optimizer_states.update(initial.get("optimizer_states", {}))
             scheduler_states.update(initial.get("scheduler_states", {}))
             best_metrics.update(initial.get("best_metrics", {}))
             quality_gates.update(initial.get("quality_gates", {}))
-            protocol_hash = str(initial.get("validation_protocol_hash", protocol_hash))
         if rank == 0:
             print(
                 json.dumps(
@@ -2666,6 +2774,7 @@ def train(
             )
         if checkpoint["stage"] != stage:
             raise RuntimeError("a checkpoint may only resume the same V3.2 training stage")
+        _validate_protocol_binding(checkpoint, protocol_hash, stage=stage, resume=True)
         model.load_state_dict(checkpoint["model"])
         temporal_config = checkpoint.get("temporal_prior") or checkpoint.get("config", {}).get(
             "temporal_prior"
@@ -2681,7 +2790,6 @@ def train(
         quality_gates.update(checkpoint.get("quality_gates", {}))
         optimizer_states.update(checkpoint.get("optimizer_states", {}))
         scheduler_states.update(checkpoint.get("scheduler_states", {}))
-        protocol_hash = str(checkpoint.get("validation_protocol_hash", protocol_hash))
         states = checkpoint["rank_states"]
         state = states[rank] if rank < len(states) else states[0]
         _set_rng_state(state["rng"])
@@ -2743,7 +2851,12 @@ def train(
     while step < int(train_config["max_steps"]):
         objective.set_progress(step, int(train_config["max_steps"]))
         aggregate: dict[str, float] = {}
-        pcgrad_corrections: tuple[list[nn.Parameter], list[Tensor | None]] | None = None
+        pcgrad_parameters = (
+            _shared_physical_parameters(model)
+            if stage == "physical" and bool(train_config.get("pcgrad", True))
+            else None
+        )
+        pcgrad_corrections: list[Tensor | None] | None = None
         for micro_step in range(accumulation):
             try:
                 batch = next(iterator)
@@ -2778,20 +2891,20 @@ def train(
                     f"finite metrics={finite_metrics}"
                 )
             if (
-                stage == "physical"
-                and bool(train_config.get("pcgrad", True))
-                and micro_step + 1 == accumulation
+                pcgrad_parameters is not None
             ):
-                shared = _shared_physical_parameters(model)
                 corrections = _pcgrad_corrections(
-                    [value / accumulation for value in objective.last_direction_losses], shared
+                    [value / accumulation for value in objective.last_direction_losses],
+                    pcgrad_parameters,
                 )
-                pcgrad_corrections = (shared, corrections)
+                pcgrad_corrections = _accumulate_pcgrad_corrections(
+                    pcgrad_corrections, corrections
+                )
             loss.backward()
             for name, value in metrics.items():
                 aggregate[name] = aggregate.get(name, 0.0) + float(value) / accumulation
-        if pcgrad_corrections is not None:
-            _apply_pcgrad_corrections(*pcgrad_corrections, distributed)
+        if pcgrad_parameters is not None and pcgrad_corrections is not None:
+            _apply_pcgrad_corrections(pcgrad_parameters, pcgrad_corrections, distributed)
         nonfinite_gradients = [
             name
             for name, parameter in model.named_parameters()

@@ -60,6 +60,48 @@ The fixed protocol contains exactly 463 sorted `validation_temporal` pairs. Its 
 pair IDs, center crop, SCL mask, channel order, and reflectance/dB units. Reports with different
 hashes cannot be combined for checkpoint selection.
 
+## 2017-2024 Dataset Build
+
+The repository-owned builder creates a reproducible manifest and normalized patch shards from
+`/data/data_disk/data_dir` without copying the source TIFF tree. It uses the canonical S2 order
+`blue,green,red,rededge1,rededge2,rededge3,nir,nir08,swir16,swir22` and SAR `vv,vh`.
+All temporary and atomic-write files are created next to their destination under the output root.
+
+```bash
+cd /data/code/sentinel_translat/v3.2
+PYTHONPATH=src python scripts/build_dataset_2017_2024.py \
+  --raw-root /data/data_disk/data_dir \
+  --output-root /data/datasets/sentinel_translate_v32_2017_2024 \
+  --workers 8 --audit-only
+
+PYTHONPATH=src python scripts/build_dataset_2017_2024.py \
+  --raw-root /data/data_disk/data_dir \
+  --output-root /data/datasets/sentinel_translate_v32_2017_2024 \
+  --workers 8 --patches-per-pair 16 --build --resume
+```
+
+The build writes `manifests/pairs.jsonl`, a dataset-owned validation protocol sidecar,
+`audit/audit.json`, one homogeneous V2 shard per training pair, a candidate
+`hf_eligibility.json`, and logs. The builder-side eligibility file is explicitly marked
+`registration_audited: false` and must not be used for high-frequency training. The formal
+order is build, registration audit (which atomically replaces that sidecar), then temporal-prior
+precomputation:
+
+```bash
+PYTHONPATH=src python scripts/audit_high_frequency.py \
+  --index /data/datasets/sentinel_translate_v32_2017_2024/shards/train/index.json \
+  --output /data/datasets/sentinel_translate_v32_2017_2024/hf_eligibility.json \
+  --workers 8
+
+PYTHONPATH=src python scripts/precompute_temporal_prior_shards.py \
+  --shard-index /data/datasets/sentinel_translate_v32_2017_2024/shards/train/index.json \
+  --manifest /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl \
+  --output /data/datasets/sentinel_translate_v32_2017_2024/temporal_prior \
+  --workers 8
+```
+
+The canonical output is expected to contain normalized patch shards, not duplicated source rasters.
+
 ## Physical foundation
 
 Re-evaluate V1 Mean, V2 Refiner, and V3.1 physical steps 4k/6k/8k/10k/12k with one protocol:

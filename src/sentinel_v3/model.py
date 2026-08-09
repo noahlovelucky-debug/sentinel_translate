@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .api import Observation, TargetRequest, TranslationResult
 from .losses import (
@@ -183,6 +184,8 @@ class SceneEncoder(nn.Module):
             norm_first=True,
         )
         self.transformer = nn.TransformerEncoder(layer, depth, enable_nested_tensor=False)
+        # Training-only runtime control; it intentionally does not enter model state.
+        self.activation_checkpointing = False
         self.condition = ConditionMoE(11, hidden)
         self.adapters = nn.ModuleDict()
         for layer_number in self.adapter_layers:
@@ -221,6 +224,11 @@ class SceneEncoder(nn.Module):
         )
         return position.reshape(1, height * width, hidden)
 
+    def set_activation_checkpointing(self, enabled: bool) -> None:
+        if not isinstance(enabled, bool):
+            raise TypeError("activation_checkpointing must be a bool")
+        self.activation_checkpointing = enabled
+
     def forward(
         self,
         values: Tensor,
@@ -240,7 +248,10 @@ class SceneEncoder(nn.Module):
         )
         tokens = tokens + self.condition(condition).unsqueeze(1)
         for layer_number, layer in enumerate(self.transformer.layers, start=1):
-            tokens = layer(tokens)
+            if self.training and torch.is_grad_enabled() and self.activation_checkpointing:
+                tokens = checkpoint(layer, tokens, use_reentrant=False)
+            else:
+                tokens = layer(tokens)
             if str(layer_number) in self.adapters:
                 tokens = self.adapters[str(layer_number)][modality](tokens)
         if self.transformer.norm is not None:

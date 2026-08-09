@@ -139,6 +139,8 @@ def calibrate_checkpoint(
                 target_gsd=gsd,
                 metadata=metadata,
             )
+            optical = apply_manifest_temporal_prior(model, optical, item, SENTINEL2)[0]
+            radar = apply_manifest_temporal_prior(model, radar, item, SENTINEL1)[0]
             optical_base = optical[:, [2, 1, 0]]
             target_rgb = s2[:, [2, 1, 0]]
             optical_detail = (
