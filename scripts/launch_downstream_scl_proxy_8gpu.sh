@@ -25,7 +25,7 @@ DEV_TILES=(
   Beijing_r0004_c0000_y001024_x000000_h256_w256
   Beijing_r0004_c0004_y001024_x001024_h256_w256
 )
-GROUPS=(
+PROBE_GROUPS=(
   sar_only
   optical_only
   sar_real_optical
@@ -160,8 +160,8 @@ run_group() {
 }
 
 pids=()
-for gpu in "${!GROUPS[@]}"; do
-  run_group "${GROUPS[$gpu]}" "$gpu" &
+for gpu in "${!PROBE_GROUPS[@]}"; do
+  run_group "${PROBE_GROUPS[$gpu]}" "$gpu" &
   pids+=("$!")
 done
 
@@ -182,7 +182,7 @@ summary_args=(
   --materialized-root "$MATERIALIZED_ROOT"
   --output "$FINAL_REPORT"
 )
-for group in "${GROUPS[@]}"; do
+for group in "${PROBE_GROUPS[@]}"; do
   summary_args+=(--report "$REPORTS/${group}.json")
 done
 echo "[$(date -Is)] START downstream final summary"
