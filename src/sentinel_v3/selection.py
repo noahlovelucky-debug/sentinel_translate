@@ -2,9 +2,26 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from typing import Any
 
 import torch
+
+
+def _atomic_torch_save(payload: Any, destination: Path) -> None:
+    """Replace a destination entry without following an existing symlink."""
+    with NamedTemporaryFile(
+        dir=destination.parent,
+        prefix=f".{destination.name}.",
+        suffix=".tmp",
+        delete=False,
+    ) as file:
+        temporary = Path(file.name)
+    try:
+        torch.save(payload, temporary)
+        temporary.replace(destination)
+    finally:
+        temporary.unlink(missing_ok=True)
 
 
 def select_checkpoint(
@@ -50,7 +67,7 @@ def select_checkpoint(
         (joint_pass, "best_joint.pt"),
     ):
         if passed:
-            torch.save(payload, destination / name)
+            _atomic_torch_save(payload, destination / name)
             selected.append(name)
     result = {
         "physical_pass": physical_pass,

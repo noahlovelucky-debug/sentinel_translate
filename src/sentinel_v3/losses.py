@@ -621,6 +621,57 @@ def phase_alignment_loss(
     return values.sum() / active.sum().clamp_min(1.0)
 
 
+def signed_phase_alignment_loss(
+    source_phase: Tensor,
+    target_bands: tuple[Tensor, ...],
+    mask: Tensor,
+    sample_weight: Tensor | None = None,
+) -> Tensor:
+    """Preserve the learnable source carrier's signed correlation with target bands."""
+
+    if source_phase.ndim != 4 or source_phase.shape[1] != 3:
+        raise ValueError("signed phase alignment source maps must be B3HW")
+    if len(target_bands) != 3:
+        raise ValueError("signed phase alignment requires three target bands")
+    if mask.ndim != 4 or mask.shape[1] != 1:
+        raise ValueError("signed phase alignment mask must be B1HW")
+    batch, _, height, width = source_phase.shape
+    if mask.shape != (batch, 1, height, width):
+        raise ValueError("signed phase alignment mask must match source phase dimensions")
+    for band in target_bands:
+        if not isinstance(band, Tensor) or band.ndim != 4:
+            raise ValueError("signed phase alignment target bands must be BCHW tensors")
+        if band.shape[0] != batch or band.shape[-2:] != (height, width):
+            raise ValueError("signed phase alignment target bands must match source maps")
+    if sample_weight is not None and sample_weight.shape not in {(batch,), (batch, 1)}:
+        raise ValueError("signed phase alignment sample weights must be B or B1")
+
+    source = torch.nan_to_num(source_phase.float(), nan=0.0, posinf=0.0, neginf=0.0)
+    target = torch.nan_to_num(
+        torch.cat(tuple(band.float().mean(dim=1, keepdim=True) for band in target_bands), dim=1),
+        nan=0.0,
+        posinf=0.0,
+        neginf=0.0,
+    )
+    weight = torch.nan_to_num(mask.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    if sample_weight is not None:
+        weight = weight * sample_weight.to(weight).reshape(batch, 1, 1, 1)
+    count = weight.sum(dim=(-2, -1), keepdim=True).clamp_min(1e-8)
+    source_centered = source - (source * weight).sum(dim=(-2, -1), keepdim=True) / count
+    target_centered = target - (target * weight).sum(dim=(-2, -1), keepdim=True) / count
+    numerator = (source_centered * target_centered * weight).sum(dim=(-2, -1))
+    source_energy = (source_centered.square() * weight).sum(dim=(-2, -1))
+    target_energy = (target_centered.square() * weight).sum(dim=(-2, -1))
+    correlation = numerator / torch.sqrt(source_energy * target_energy + 1e-8)
+    active = (
+        (weight.sum(dim=(-2, -1)) > 1e-8)
+        & (source_energy > 1e-8)
+        & (target_energy > 1e-8)
+    ).to(correlation)
+    values = (1.0 - correlation.clamp(-1.0, 1.0)) * active
+    return values.sum() / active.sum().clamp_min(1.0)
+
+
 def phase_transport_gain_target(
     physical_bands: Tensor,
     residual_after_anchor: Tensor,
@@ -682,6 +733,68 @@ def phase_transport_gain_target(
     gate = beta / cap_values.clamp_min(1e-8)
     supported = (energy > 1e-7) & (coverage >= 0.999) & (cap_values > 0.0)
     return torch.where(supported, gate, torch.zeros_like(gate)).clamp(0.0, 1.0)
+
+
+def phase_transport_signed_coefficient_target(
+    carrier_components: Tensor,
+    residual_after_protected: Tensor,
+    valid: Tensor,
+    gain_caps: Sequence[float],
+    block_size: int = 4,
+) -> Tensor:
+    """Return strict-valid signed normalized carrier coefficients in [-1, 1]."""
+
+    if not isinstance(carrier_components, Tensor) or carrier_components.ndim != 5:
+        raise ValueError("carrier components must be B3CHW")
+    if carrier_components.shape[1] != 3 or carrier_components.shape[2] < 1:
+        raise ValueError("carrier components must contain three nonempty frequency bands")
+    if not isinstance(residual_after_protected, Tensor) or residual_after_protected.ndim != 4:
+        raise ValueError("carrier residual must be BCHW")
+    if not isinstance(valid, Tensor) or valid.ndim != 4 or valid.shape[1] != 1:
+        raise ValueError("carrier valid mask must be B1HW")
+    batch, _, channels, height, width = carrier_components.shape
+    if (
+        residual_after_protected.shape != (batch, channels, height, width)
+        or valid.shape != (batch, 1, height, width)
+    ):
+        raise ValueError("carrier inputs must share B, C, H, and W")
+    if (
+        carrier_components.device != residual_after_protected.device
+        or carrier_components.device != valid.device
+    ):
+        raise ValueError("carrier inputs must share a device")
+    if not carrier_components.is_floating_point() or not residual_after_protected.is_floating_point():
+        raise TypeError("carrier components and residual must be floating point")
+    if not (valid.is_floating_point() or valid.dtype == torch.bool):
+        raise TypeError("carrier valid mask must be floating point or bool")
+    if isinstance(block_size, bool) or not isinstance(block_size, int) or block_size < 1:
+        raise ValueError("carrier block_size must be a positive integer")
+    if height % block_size or width % block_size:
+        raise ValueError("carrier dimensions must be divisible by block_size")
+    if not isinstance(gain_caps, (tuple, list)) or len(gain_caps) != 3:
+        raise ValueError("carrier gain_caps must contain three values")
+    if any(isinstance(value, bool) or not isinstance(value, (int, float)) for value in gain_caps):
+        raise TypeError("carrier gain_caps must contain numeric values")
+    caps = tuple(float(value) for value in gain_caps)
+    if any(not math.isfinite(value) or value < 0.0 for value in caps):
+        raise ValueError("carrier gain_caps must be finite and non-negative")
+    mask = torch.nan_to_num(valid.float(), nan=0.0, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
+    components = torch.nan_to_num(
+        carrier_components.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ) * mask.unsqueeze(1)
+    residual = torch.nan_to_num(
+        residual_after_protected.float(), nan=0.0, posinf=0.0, neginf=0.0
+    ) * mask
+    numerator = F.avg_pool2d(
+        (components * residual.unsqueeze(1)).sum(dim=2), block_size, stride=block_size
+    )
+    energy = F.avg_pool2d(components.square().sum(dim=2), block_size, stride=block_size)
+    coverage = F.avg_pool2d(mask, block_size, stride=block_size)
+    cap_values = numerator.new_tensor(caps).view(1, 3, 1, 1)
+    beta = (numerator / energy.clamp_min(1e-8)).clamp(-cap_values, cap_values)
+    coefficient = beta / cap_values.clamp_min(1e-8)
+    supported = (energy > 1e-7) & (coverage >= 0.999) & (cap_values > 0.0)
+    return torch.where(supported, coefficient, torch.zeros_like(coefficient)).clamp(-1.0, 1.0)
 
 
 def anchor_gain_target(

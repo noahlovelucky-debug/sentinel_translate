@@ -846,6 +846,7 @@ class ObservablePhaseTransportHead(nn.Module):
         null_calibrated: bool = False,
         null_quantile: float = 0.75,
         support_epsilon: float = 0.01,
+        carrier_mode: str = "physical_gain",
     ) -> None:
         super().__init__()
         if len(gain_caps) != 3 or len(offset_caps_px) != 3:
@@ -858,12 +859,17 @@ class ObservablePhaseTransportHead(nn.Module):
             raise ValueError("phase transport null_quantile must be finite and in (0, 1)")
         if not math.isfinite(support_epsilon) or support_epsilon <= 0.0:
             raise ValueError("phase transport support_epsilon must be finite and positive")
+        if carrier_mode not in {"physical_gain", "orthogonal_source"}:
+            raise ValueError(
+                "phase transport carrier_mode must be physical_gain or orthogonal_source"
+            )
         self.gain_caps = tuple(float(value) for value in gain_caps)
         self.offset_caps_px = tuple(float(value) for value in offset_caps_px)
         self.initial_gate = float(initial_gate)
         self.null_calibrated = null_calibrated
         self.null_quantile = float(null_quantile)
         self.support_epsilon = float(support_epsilon)
+        self.carrier_mode = carrier_mode
         self.pyramid_projections = nn.ModuleList(
             [nn.Conv2d(channels, 32, 1) for channels in pyramid_channels]
         )
@@ -882,6 +888,16 @@ class ObservablePhaseTransportHead(nn.Module):
             self.output[-1].bias[:3].fill_(
                 math.log(self.initial_gate / (1.0 - self.initial_gate))
             )
+        if carrier_mode == "orthogonal_source":
+            carrier_hidden = max(16, hidden // 4)
+            self.carrier_source_phase_projection = nn.Conv2d(pyramid_channels[0], 3, 1)
+            self.carrier_adapter = nn.Sequential(
+                nn.Conv2d(hidden, carrier_hidden, 1),
+                nn.SiLU(),
+            )
+            self.carrier_head = nn.Conv2d(carrier_hidden, 3, 1)
+            nn.init.zeros_(self.carrier_head.weight)
+            nn.init.zeros_(self.carrier_head.bias)
 
     @staticmethod
     def _full_gradients(values: Tensor) -> tuple[Tensor, Tensor]:
@@ -964,6 +980,156 @@ class ObservablePhaseTransportHead(nn.Module):
         gain_support = excess / (excess + null_level + self.support_epsilon)
         return null_level, gain_support, null_coherence
 
+    def _carrier_null_calibrated_support(
+        self,
+        source_phase: Tensor,
+        physical_bands: Tensor,
+        coherence: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Calibrate carrier support against cyclic source-phase nulls."""
+
+        expected = (*coherence.shape[:2], source_phase.shape[-2] // 4, source_phase.shape[-1] // 4)
+        if coherence.shape != expected:
+            raise ValueError("carrier coherence must match the source latent grid")
+        height, width = source_phase.shape[-2:]
+        with torch.no_grad():
+            null_height = self.phase_coherence(
+                source_phase.roll(height // 2, dims=-2), physical_bands
+            )
+            null_width = self.phase_coherence(
+                source_phase.roll(width // 2, dims=-1), physical_bands
+            )
+            null_values = torch.stack((null_height, null_width), dim=2).flatten(2)
+            null_level = torch.quantile(
+                null_values.float(), self.null_quantile, dim=2, keepdim=True
+            ).reshape(*coherence.shape[:2], 1, 1)
+            null_coherence = 0.5 * (null_height + null_width)
+        null_level = null_level.to(coherence).detach()
+        excess = F.relu(coherence - null_level)
+        support = excess / (excess + null_level + self.support_epsilon)
+        return null_level, support, null_coherence
+
+    @staticmethod
+    def _carrier_local_mean(values: Tensor) -> Tensor:
+        """Use a fixed odd support for local carrier statistics."""
+
+        return F.avg_pool2d(values, 9, stride=1, padding=4, count_include_pad=False)
+
+    @classmethod
+    def orthogonal_source_carriers(
+        cls,
+        source_phase: Tensor,
+        physical_bands: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Build source-signed luminance carriers orthogonal to physical band luma."""
+
+        if (
+            source_phase.ndim != 4
+            or source_phase.shape[1] != 3
+            or physical_bands.ndim != 5
+            or physical_bands.shape[1:3] != (3, 3)
+            or source_phase.shape[0] != physical_bands.shape[0]
+            or source_phase.shape[-2:] != physical_bands.shape[-2:]
+        ):
+            raise ValueError("orthogonal source carriers require source B3HW and physical B33HW")
+        epsilon = 1e-6
+        source_bands = frequency_bands(source_phase.float(), levels=3)
+        physical_luminance = physical_bands.float().mean(dim=2)
+        carriers: list[Tensor] = []
+        carrier_rms: list[Tensor] = []
+        carrier_orthogonality: list[Tensor] = []
+        for level, source_band in enumerate(source_bands):
+            source_carrier = source_band[:, level : level + 1]
+            physical_carrier = physical_luminance[:, level : level + 1]
+            physical_energy = cls._carrier_local_mean(physical_carrier.square())
+            orthogonal = source_carrier
+            # Re-project twice so a spatially varying local coefficient remains close
+            # to orthogonal under the same smoothed neighborhood statistic.
+            for _ in range(2):
+                projection = cls._carrier_local_mean(orthogonal * physical_carrier) / (
+                    physical_energy + epsilon
+                )
+                orthogonal = orthogonal - projection * physical_carrier
+            orthogonal_energy = cls._carrier_local_mean(orthogonal.square())
+            normalized = orthogonal / torch.sqrt(orthogonal_energy + epsilon)
+            # This stable RMS envelope is exactly zero for a zero physical band and
+            # avoids the singular derivative of sqrt at zero energy.
+            envelope = physical_energy / torch.sqrt(physical_energy + epsilon)
+            carrier = normalized * envelope
+            local_dot = cls._carrier_local_mean(orthogonal * physical_carrier)
+            local_norm = torch.sqrt(orthogonal_energy * physical_energy + epsilon)
+            carriers.append(carrier.repeat(1, 3, 1, 1))
+            carrier_rms.append(envelope)
+            carrier_orthogonality.append(local_dot / local_norm)
+        return (
+            torch.stack(carriers, dim=1).to(physical_bands),
+            torch.cat(carrier_rms, dim=1).to(physical_bands),
+            torch.cat(carrier_orthogonality, dim=1).to(physical_bands),
+        )
+
+    def _orthogonal_source_delta(
+        self,
+        source_phase: Tensor,
+        physical_bands: Tensor,
+        full_gains: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        carriers, carrier_rms, carrier_orthogonality = self.orthogonal_source_carriers(
+            source_phase, physical_bands
+        )
+        delta = highpass((full_gains.unsqueeze(2) * carriers).sum(dim=1))
+        return delta, {
+            "carrier_components": carriers,
+            "carrier_rms": carrier_rms,
+            "carrier_orthogonality": carrier_orthogonality,
+        }
+
+    def _carrier_delta(
+        self,
+        features: Tensor,
+        pyramid: Pyramid,
+        physical_bands: Tensor,
+        output_size: tuple[int, int],
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Return the zero-initialized source carrier contribution and diagnostics."""
+
+        if self.carrier_mode != "orthogonal_source":
+            raise ValueError("carrier delta requires orthogonal_source mode")
+        carrier_source_phase = self.carrier_source_phase_projection(pyramid[0])
+        carrier_source_phase = F.interpolate(
+            carrier_source_phase, size=output_size, mode="bilinear", align_corners=False
+        )
+        carrier_raw = self.carrier_head(self.carrier_adapter(features))
+        carrier_signed_gate = torch.tanh(carrier_raw)
+        carrier_coherence = self.phase_coherence(carrier_source_phase, physical_bands)
+        carrier_null_level, carrier_support, carrier_null_coherence = (
+            self._carrier_null_calibrated_support(
+                carrier_source_phase, physical_bands, carrier_coherence
+            )
+        )
+        carrier_effective_signed_coeff = carrier_signed_gate * carrier_support
+        gain_caps = carrier_raw.new_tensor(self.gain_caps).view(1, 3, 1, 1)
+        carrier_coefficients = gain_caps * carrier_effective_signed_coeff
+        full_carrier_coefficients = F.interpolate(
+            carrier_coefficients,
+            size=output_size,
+            mode="bilinear",
+            align_corners=False,
+        )
+        carrier_delta, diagnostics = self._orthogonal_source_delta(
+            carrier_source_phase, physical_bands, full_carrier_coefficients
+        )
+        return carrier_delta, {
+            "carrier_source_phase": carrier_source_phase,
+            "carrier_signed_gate": carrier_signed_gate,
+            "carrier_effective_signed_coeff": carrier_effective_signed_coeff,
+            "carrier_support": carrier_support,
+            "carrier_coherence": carrier_coherence,
+            "carrier_null_level": carrier_null_level,
+            "carrier_null_coherence": carrier_null_coherence,
+            "carrier_delta": carrier_delta,
+            **diagnostics,
+        }
+
     @staticmethod
     def warp_bands(physical_bands: Tensor, offset_px: Tensor) -> Tensor:
         """Apply bounded per-band subpixel offsets to Bx3xCxHxW Laplacian bands."""
@@ -1041,8 +1207,8 @@ class ObservablePhaseTransportHead(nn.Module):
             full_gains = F.interpolate(
                 gains, size=(height, width), mode="bilinear", align_corners=False
             )
-            delta = highpass((full_gains.unsqueeze(2) * physical_bands).sum(dim=1))
-            return delta, {
+            parallel_delta = highpass((full_gains.unsqueeze(2) * physical_bands).sum(dim=1))
+            diagnostics = {
                 "gain": gains,
                 "gate": gate,
                 "effective_gate": effective_gate,
@@ -1051,6 +1217,16 @@ class ObservablePhaseTransportHead(nn.Module):
                 "null_level": null_level,
                 "null_coherence": null_coherence,
                 "source_phase": source_phase,
+            }
+            if self.carrier_mode != "orthogonal_source":
+                return parallel_delta, diagnostics
+            carrier_delta, carrier_diagnostics = self._carrier_delta(
+                features, pyramid, physical_bands, (height, width)
+            )
+            return parallel_delta + carrier_delta, {
+                **diagnostics,
+                "parallel_delta": parallel_delta,
+                **carrier_diagnostics,
             }
 
         raw_offset = output[:, 3:].reshape(physical.shape[0], 3, 2, *latent_size)
@@ -1061,14 +1237,26 @@ class ObservablePhaseTransportHead(nn.Module):
             offsets.flatten(1, 2), size=(height, width), mode="bilinear", align_corners=False
         ).reshape(physical.shape[0], 3, 2, height, width)
         warped_bands = self.warp_bands(physical_bands, full_offsets)
-        full_gains = F.interpolate(gains, size=(height, width), mode="bilinear", align_corners=False)
-        delta = highpass((full_gains.unsqueeze(2) * warped_bands).sum(dim=1))
-        return delta, {
+        full_gains = F.interpolate(
+            gains, size=(height, width), mode="bilinear", align_corners=False
+        )
+        parallel_delta = highpass((full_gains.unsqueeze(2) * warped_bands).sum(dim=1))
+        diagnostics = {
             "gain": gains,
             "gate": gate,
             "offset_px": offsets,
             "coherence": coherence,
             "source_phase": source_phase,
+        }
+        if self.carrier_mode != "orthogonal_source":
+            return parallel_delta, diagnostics
+        carrier_delta, carrier_diagnostics = self._carrier_delta(
+            features, pyramid, physical_bands, (height, width)
+        )
+        return parallel_delta + carrier_delta, {
+            **diagnostics,
+            "parallel_delta": parallel_delta,
+            **carrier_diagnostics,
         }
 
 
@@ -1322,6 +1510,7 @@ class ModelConfig:
     phase_transport_null_calibrated: bool = False
     phase_transport_null_quantile: float = 0.75
     phase_transport_support_epsilon: float = 0.01
+    phase_transport_carrier_mode: str = "physical_gain"
     architecture: str = "v3.2"
 
     def __post_init__(self) -> None:
@@ -1389,6 +1578,10 @@ class ModelConfig:
         if not math.isfinite(support_epsilon) or support_epsilon <= 0.0:
             raise ValueError("phase_transport_support_epsilon must be finite and positive")
         self.phase_transport_support_epsilon = support_epsilon
+        if self.phase_transport_carrier_mode not in {"physical_gain", "orthogonal_source"}:
+            raise ValueError(
+                "phase_transport_carrier_mode must be physical_gain or orthogonal_source"
+            )
 
 
 class SentinelV3(nn.Module):
@@ -1441,6 +1634,7 @@ class SentinelV3(nn.Module):
             cfg.phase_transport_null_calibrated,
             cfg.phase_transport_null_quantile,
             cfg.phase_transport_support_epsilon,
+            cfg.phase_transport_carrier_mode,
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("optical_bridge_alpha_scale", torch.ones(()))
@@ -2217,6 +2411,7 @@ class SentinelV3(nn.Module):
             "phase_transport_null_calibrated": self.config.phase_transport_null_calibrated,
             "phase_transport_null_quantile": self.config.phase_transport_null_quantile,
             "phase_transport_support_epsilon": self.config.phase_transport_support_epsilon,
+            "phase_transport_carrier_mode": self.config.phase_transport_carrier_mode,
         }
 
     def sample_id_bridge_residual(
@@ -2301,11 +2496,13 @@ class SentinelV3(nn.Module):
         steps: int | None = None,
     ) -> Tensor:
         if self.id_bridge_enabled_for(target):
+            if self._phase_optical_visual_residual_is_zero(target):
+                return torch.zeros_like(base)
             residual = self.sample_id_bridge_residual(
                 pyramid, base, target, seed=seed, steps=steps
             )
             assert isinstance(residual, Tensor)
-            return residual
+            return residual * getattr(self, self.amplitude_scale_name(target.modality))
         return self.sample_residual(
             pyramid,
             target,
@@ -2313,6 +2510,16 @@ class SentinelV3(nn.Module):
             seed=seed,
             steps=steps,
             bridge_anchor=detail,
+        )
+
+    def _phase_optical_visual_residual_is_zero(self, target: SensorSpec) -> bool:
+        """Skip a provably zero phase Optical residual during visual inference."""
+
+        return (
+            target.modality == "optical"
+            and self.id_bridge_uses_phase_identifiability
+            and self.config.id_bridge_optical_correction_scale == 0.0
+            and all(scale == 0.0 for scale in self.config.id_bridge_optical_innovation_band_scales)
         )
 
     def residual_amplitude(

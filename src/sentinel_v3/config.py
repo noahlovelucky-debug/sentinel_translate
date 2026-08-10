@@ -60,6 +60,7 @@ DEFAULT: dict[str, Any] = {
         "id_bridge_antithetic_weight": 0.0,
         "phase_transport_hf_weight": 0.05,
         "phase_transport_utility_weight": 0.10,
+        "phase_transport_signed_alignment_weight": 0.0,
         "risk_flow_steps": 4,
         "bridge_flow_steps": 4,
         "codec_perceptual_every": 8,
@@ -182,6 +183,10 @@ def validate_config(config: dict[str, Any]) -> None:
     if not math.isfinite(support_epsilon) or support_epsilon <= 0.0:
         raise ValueError("model.phase_transport_support_epsilon must be finite and positive")
     model["phase_transport_support_epsilon"] = support_epsilon
+    if model["phase_transport_carrier_mode"] not in {"physical_gain", "orthogonal_source"}:
+        raise ValueError(
+            "model.phase_transport_carrier_mode must be physical_gain or orthogonal_source"
+        )
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:
             raise ValueError(f"model.{name} must be non-negative")
@@ -236,6 +241,7 @@ def validate_config(config: dict[str, Any]) -> None:
         "id_bridge_antithetic_weight",
         "phase_transport_hf_weight",
         "phase_transport_utility_weight",
+        "phase_transport_signed_alignment_weight",
     ):
         if not math.isfinite(float(train[name])) or float(train[name]) < 0.0:
             raise ValueError(f"train.{name} must be non-negative")

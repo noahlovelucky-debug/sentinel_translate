@@ -79,6 +79,58 @@ def test_hard_gate_checkpoint_selection(tmp_path: Path) -> None:
     }
 
 
+def test_selection_replaces_symlink_and_existing_destination_entries(tmp_path: Path) -> None:
+    checkpoint = tmp_path / "candidate.pt"
+    torch.save(
+        {
+            "format_version": 4,
+            "quality_gates": {},
+            "validation_protocol_hash": "fixed-protocol",
+            "selected_value": "candidate",
+        },
+        checkpoint,
+    )
+    report = tmp_path / "report.json"
+    report.write_text(
+        json.dumps(
+            {
+                "protocol_hash": "fixed-protocol",
+                "quality_gates": {"physical": True, "visual": True, "joint": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    selected_dir = tmp_path / "selected"
+    selected_dir.mkdir()
+    step_checkpoint = tmp_path / "physical" / "step_0004000.pt"
+    step_checkpoint.parent.mkdir()
+    torch.save({"sentinel": "must remain unchanged"}, step_checkpoint)
+    original_step_bytes = step_checkpoint.read_bytes()
+    best_physical = selected_dir / "best_physical.pt"
+    best_physical.symlink_to(step_checkpoint)
+    best_visual = selected_dir / "best_visual.pt"
+    best_visual.write_bytes(b"old regular destination")
+    best_joint = selected_dir / "best_joint.pt"
+
+    select_checkpoint(checkpoint, [report], selected_dir)
+
+    assert step_checkpoint.read_bytes() == original_step_bytes
+    assert torch.load(step_checkpoint, weights_only=False) == {
+        "sentinel": "must remain unchanged"
+    }
+    assert not best_physical.is_symlink()
+    assert not best_visual.is_symlink()
+    assert not best_joint.is_symlink()
+    for selected_path in (best_physical, best_visual, best_joint):
+        selected = torch.load(selected_path, weights_only=False)
+        assert selected["selected_value"] == "candidate"
+        assert selected["quality_gates"] == {
+            "physical": True,
+            "visual": True,
+            "joint": True,
+        }
+
+
 def test_selection_rejects_mixed_protocols(tmp_path: Path) -> None:
     checkpoint = tmp_path / "candidate.pt"
     checkpoint.write_bytes(b"checkpoint")

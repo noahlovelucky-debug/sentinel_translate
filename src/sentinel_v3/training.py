@@ -40,8 +40,10 @@ from .losses import (
     phase_alignment_loss,
     phase_identifiability_target,
     phase_transport_gain_target,
+    phase_transport_signed_coefficient_target,
     physical_loss,
     robust_rms,
+    signed_phase_alignment_loss,
     texture_reliability_gate,
 )
 from .model import ModelConfig, Pyramid, SentinelV3
@@ -180,6 +182,7 @@ class JointObjective(nn.Module):
         bridge_flow_steps: int = 4,
         phase_transport_hf_weight: float = 0.05,
         phase_transport_utility_weight: float = 0.10,
+        phase_transport_signed_alignment_weight: float = 0.0,
     ) -> None:
         super().__init__()
         self.model = model
@@ -217,6 +220,14 @@ class JointObjective(nn.Module):
         if not math.isfinite(phase_transport_utility_weight) or phase_transport_utility_weight < 0.0:
             raise ValueError("phase_transport_utility_weight must be finite and non-negative")
         self.phase_transport_utility_weight = phase_transport_utility_weight
+        if (
+            not math.isfinite(phase_transport_signed_alignment_weight)
+            or phase_transport_signed_alignment_weight < 0.0
+        ):
+            raise ValueError(
+                "phase_transport_signed_alignment_weight must be finite and non-negative"
+            )
+        self.phase_transport_signed_alignment_weight = phase_transport_signed_alignment_weight
         self.risk_flow_steps = max(1, risk_flow_steps)
         self.bridge_flow_steps = max(1, bridge_flow_steps)
         self.last_direction_losses: list[Tensor] = []
@@ -1464,6 +1475,190 @@ class JointObjective(nn.Module):
             metrics["dists"] = dists.detach()
         return total, metrics
 
+    def _carrier_phase_transport_direction(
+        self,
+        *,
+        full_residual: Tensor,
+        protected_anchor: Tensor,
+        phase_delta: Tensor,
+        diagnostics: dict[str, Tensor],
+        target: Tensor,
+        visual: Tensor,
+        valid: Tensor,
+        residual_weights: Tensor,
+        hf_loss: Tensor,
+        hf_metrics: dict[str, Tensor],
+        rmse_hinge: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Optimize only the signed carrier added to a frozen physical transport."""
+
+        parallel_delta = diagnostics["parallel_delta"]
+        carrier_delta = diagnostics["carrier_delta"]
+        carrier_components = diagnostics["carrier_components"].detach()
+        carrier_support = diagnostics["carrier_support"]
+        carrier_signed_gate = diagnostics["carrier_signed_gate"]
+        carrier_effective_signed_coeff = diagnostics["carrier_effective_signed_coeff"]
+        residual_after_protected = full_residual - protected_anchor - parallel_delta.detach()
+        latent_valid = F.interpolate(
+            valid, size=carrier_effective_signed_coeff.shape[-2:], mode="area"
+        )
+        strict_valid = (latent_valid >= 0.999).to(carrier_support)
+        support_active = (carrier_support.detach() > 0.0).to(carrier_support)
+        oracle_signed_coeff = phase_transport_signed_coefficient_target(
+            carrier_components,
+            residual_after_protected,
+            valid,
+            self.model.config.phase_transport_gain_caps,
+        ).detach()
+        oracle_energy = F.avg_pool2d(
+            carrier_components.float().square().sum(dim=2), 4, stride=4
+        )
+        cap_values = oracle_energy.new_tensor(self.model.config.phase_transport_gain_caps).view(
+            1, 3, 1, 1
+        )
+        oracle_supported = (
+            (oracle_energy > 1e-7)
+            & (latent_valid.expand_as(oracle_energy) >= 0.999)
+            & (cap_values > 0.0)
+        )
+        oracle_weight = residual_weights[:, None, None, None] * oracle_supported.float()
+        oracle_active_fraction = (
+            ((oracle_signed_coeff.abs() > 0.0).to(oracle_weight) * oracle_weight).sum()
+            / oracle_weight.sum().clamp_min(1e-8)
+        )
+        latent_block_weight = residual_weights[:, None, None, None] * latent_valid.expand_as(
+            oracle_energy
+        )
+        oracle_supported_fraction = (
+            (oracle_supported.to(latent_block_weight) * latent_block_weight).sum()
+            / latent_block_weight.sum().clamp_min(1e-8)
+        )
+        utility_weight = residual_weights[:, None, None, None] * strict_valid * support_active
+        carrier_utility = masked_mean(
+            F.smooth_l1_loss(
+                carrier_effective_signed_coeff.float(),
+                (oracle_signed_coeff * carrier_support.detach()).float(),
+                beta=0.1,
+                reduction="none",
+            ),
+            utility_weight.float(),
+        )
+        support_weight = residual_weights[:, None, None, None] * strict_valid
+        carrier_support_active_fraction = (
+            (support_active * support_weight).sum()
+            / support_weight.expand_as(support_active).sum().clamp_min(1e-8)
+        )
+        carrier_target_bands = frequency_bands(residual_after_protected, levels=3)
+        signed_phase_alignment = signed_phase_alignment_loss(
+            diagnostics["carrier_source_phase"],
+            carrier_target_bands,
+            valid,
+            residual_weights,
+        )
+        parallel_phase_alignment = phase_alignment_loss(
+            diagnostics["source_phase"], frequency_bands(target, levels=3), valid, residual_weights
+        )
+        gains = diagnostics["gain"]
+        gate = diagnostics["gate"]
+        coherence = diagnostics["coherence"]
+        latent_weight = residual_weights[:, None, None, None] * latent_valid
+        gain_l1 = masked_mean(gains.abs(), latent_weight)
+        low_frequency_leakage = low_frequency_loss(phase_delta, valid, residual_weights)
+        carrier_delta_rms = torch.sqrt(
+            masked_mean(
+                carrier_delta.float().square(),
+                (residual_weights[:, None, None, None] * valid).float(),
+            )
+        )
+        total = (
+            self.phase_transport_hf_weight * hf_loss
+            + 0.25 * rmse_hinge
+            + self.phase_transport_utility_weight * carrier_utility
+            + self.phase_transport_signed_alignment_weight * signed_phase_alignment
+        )
+        metrics = {
+            **hf_metrics,
+            "rmse_hinge": rmse_hinge.detach(),
+            "gain_l1": gain_l1.detach(),
+            "gain_utility": carrier_utility.detach(),
+            "carrier_utility": carrier_utility.detach(),
+            "phase_alignment": parallel_phase_alignment.detach(),
+            "signed_phase_alignment": signed_phase_alignment.detach(),
+            "gain_signed_mean": gains.mean().detach(),
+            "gain_fine": gains[:, 0].mean().detach(),
+            "gain_mid": gains[:, 1].mean().detach(),
+            "gain_coarse": gains[:, 2].mean().detach(),
+            "gate_fine": gate[:, 0].mean().detach(),
+            "gate_mid": gate[:, 1].mean().detach(),
+            "gate_coarse": gate[:, 2].mean().detach(),
+            "coherence_fine": coherence[:, 0].mean().detach(),
+            "coherence_mid": coherence[:, 1].mean().detach(),
+            "coherence_coarse": coherence[:, 2].mean().detach(),
+            "carrier_oracle_active": phase_delta.new_tensor(1.0),
+            "carrier_oracle_fine": oracle_signed_coeff[:, 0].mean().detach(),
+            "carrier_oracle_mid": oracle_signed_coeff[:, 1].mean().detach(),
+            "carrier_oracle_coarse": oracle_signed_coeff[:, 2].mean().detach(),
+            "carrier_oracle_active_fraction": oracle_active_fraction.detach(),
+            "carrier_oracle_supported_fraction": oracle_supported_fraction.detach(),
+            "carrier_gate_fine": carrier_signed_gate[:, 0].mean().detach(),
+            "carrier_gate_mid": carrier_signed_gate[:, 1].mean().detach(),
+            "carrier_gate_coarse": carrier_signed_gate[:, 2].mean().detach(),
+            "carrier_effective_fine": carrier_effective_signed_coeff[:, 0].mean().detach(),
+            "carrier_effective_mid": carrier_effective_signed_coeff[:, 1].mean().detach(),
+            "carrier_effective_coarse": carrier_effective_signed_coeff[:, 2].mean().detach(),
+            "carrier_support_fine": carrier_support[:, 0].mean().detach(),
+            "carrier_support_mid": carrier_support[:, 1].mean().detach(),
+            "carrier_support_coarse": carrier_support[:, 2].mean().detach(),
+            "carrier_support_active_fraction": carrier_support_active_fraction.detach(),
+            "carrier_delta_rms": carrier_delta_rms.detach(),
+            "carrier_rms": diagnostics["carrier_rms"].mean().detach(),
+            "carrier_orthogonality": diagnostics["carrier_orthogonality"].abs().mean().detach(),
+            "low_frequency_leakage": low_frequency_leakage.detach(),
+        }
+        if self.model.config.phase_transport_null_calibrated:
+            gain_support = diagnostics["gain_support"]
+            effective_gate = diagnostics["effective_gate"]
+            null_level = diagnostics["null_level"]
+            metrics.update(
+                {
+                    "null_level_fine": null_level[:, 0].mean().detach(),
+                    "null_level_mid": null_level[:, 1].mean().detach(),
+                    "null_level_coarse": null_level[:, 2].mean().detach(),
+                    "gain_support_fine": gain_support[:, 0].mean().detach(),
+                    "gain_support_mid": gain_support[:, 1].mean().detach(),
+                    "gain_support_coarse": gain_support[:, 2].mean().detach(),
+                    "effective_gate_fine": effective_gate[:, 0].mean().detach(),
+                    "effective_gate_mid": effective_gate[:, 1].mean().detach(),
+                    "effective_gate_coarse": effective_gate[:, 2].mean().detach(),
+                    "carrier_null_level_fine": diagnostics["carrier_null_level"][:, 0]
+                    .mean()
+                    .detach(),
+                    "carrier_null_level_mid": diagnostics["carrier_null_level"][:, 1]
+                    .mean()
+                    .detach(),
+                    "carrier_null_level_coarse": diagnostics["carrier_null_level"][:, 2]
+                    .mean()
+                    .detach(),
+                }
+            )
+        else:
+            offsets = diagnostics["offset_px"]
+            metrics.update(
+                {
+                    "offset_px_abs_mean": offsets.abs().mean().detach(),
+                }
+            )
+        if self.current_step % self.flow_rollout_every == 0:
+            lpips, dists = self._optical_visual_perceptual(
+                visual, target, valid, residual_weights
+            )
+            total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
+                lpips + dists
+            )
+            metrics["lpips"] = lpips.detach()
+            metrics["dists"] = dists.detach()
+        return total, metrics
+
     def _phase_transport_direction(
         self,
         batch: dict[str, object],
@@ -1518,6 +1713,20 @@ class JointObjective(nn.Module):
         rmse_hinge = (distortion * residual_weights).sum() / residual_weights.sum().clamp_min(
             1e-8
         )
+        if self.model.config.phase_transport_carrier_mode == "orthogonal_source":
+            return self._carrier_phase_transport_direction(
+                full_residual=full_residual,
+                protected_anchor=protected_anchor,
+                phase_delta=phase_delta,
+                diagnostics=diagnostics,
+                target=target,
+                visual=visual,
+                valid=valid,
+                residual_weights=residual_weights,
+                hf_loss=hf_loss,
+                hf_metrics=hf_metrics,
+                rmse_hinge=rmse_hinge,
+            )
         gains = diagnostics["gain"]
         gate = diagnostics["gate"]
         coherence = diagnostics["coherence"]
@@ -1583,9 +1792,10 @@ class JointObjective(nn.Module):
                 utility_weight.float(),
             )
         gain_l1 = masked_mean(gains.abs(), latent_weight)
+        target_bands = frequency_bands(target, levels=3)
         phase_alignment = phase_alignment_loss(
             diagnostics["source_phase"],
-            frequency_bands(target, levels=3),
+            target_bands,
             valid,
             residual_weights,
         )
@@ -2061,6 +2271,22 @@ def _load_compatible_state(model: nn.Module, state: dict[str, Tensor]) -> tuple[
                 and value.shape[1:] == target.shape[1:]
             ):
                 candidates[name] = value[:3].clone()
+    if (
+        isinstance(model, SentinelV3)
+        and model.config.phase_transport_carrier_mode == "orthogonal_source"
+    ):
+        for suffix in ("weight", "bias"):
+            source_name = f"phase_transport_head.source_phase_projection.{suffix}"
+            carrier_name = f"phase_transport_head.carrier_source_phase_projection.{suffix}"
+            source_value = candidates.get(source_name)
+            carrier_target = current.get(carrier_name)
+            if (
+                carrier_name not in candidates
+                and source_value is not None
+                and carrier_target is not None
+                and source_value.shape == carrier_target.shape
+            ):
+                candidates[carrier_name] = source_value.clone()
     if isinstance(model, SentinelV3) and model.legacy_residual_dit is not None:
         for name, value in state.items():
             if not name.startswith("residual_dit."):
@@ -2178,7 +2404,15 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
     elif stage == "id_utility":
         modules = (model.id_bridge_origin,)
     elif stage == "phase_transport":
-        modules = (model.phase_transport_head,)
+        if model.config.phase_transport_carrier_mode == "orthogonal_source":
+            head = model.phase_transport_head
+            modules = (
+                head.carrier_source_phase_projection,
+                head.carrier_adapter,
+                head.carrier_head,
+            )
+        else:
+            modules = (model.phase_transport_head,)
     elif stage in {"balance", "overfit"}:
         modules = (model.encoder, model.decoder, model.detail_head, model.residual_dit)
     else:
@@ -2680,6 +2914,9 @@ def train(
         phase_transport_hf_weight=float(train_config.get("phase_transport_hf_weight", 0.05)),
         phase_transport_utility_weight=float(
             train_config.get("phase_transport_utility_weight", 0.10)
+        ),
+        phase_transport_signed_alignment_weight=float(
+            train_config.get("phase_transport_signed_alignment_weight", 0.0)
         ),
         risk_flow_steps=int(train_config.get("risk_flow_steps", 4)),
         bridge_flow_steps=int(train_config.get("bridge_flow_steps", 4)),

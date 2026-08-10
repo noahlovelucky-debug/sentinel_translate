@@ -1,0 +1,63 @@
+paths:
+  train_shards: /data/datasets/sentinel_translate_v32_2017_2024/shards/train/index.json
+  manifest: /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl
+  temporal_prior_shards: /data/datasets/sentinel_translate_v32_2017_2024/temporal_prior/index.json
+  hf_eligibility: /data/datasets/sentinel_translate_v32_2017_2024/hf_eligibility.json
+  output: /data/code/sentinel_translat/v3.2/checkpoints_v32_canonical_2017_2024_ncopc_pilot
+  reports: /data/code/sentinel_translat/v3.2/reports_v32_canonical_2017_2024_ncopc_pilot
+
+model:
+  flow_noise_scale: 0.35
+  optical_flow_noise_scale: 0.35
+  sar_flow_noise_scale: 0.35
+  id_bridge_enabled: true
+  id_bridge_state: haar_packet
+  id_bridge_state_channels: 48
+  id_bridge_optical_state_scale: 0.03
+  id_bridge_sar_state_scale: 4.0
+  id_bridge_anchor_origin: true
+  id_bridge_anchor_utility: false
+  id_bridge_phase_identifiability: true
+  id_bridge_optical_only: true
+  id_bridge_optical_innovation_scale: 0.0
+  id_bridge_sar_innovation_scale: 1.0
+  id_bridge_optical_innovation_band_scales: [0.0, 0.0, 0.0]
+  id_bridge_optical_correction_scale: 0.0
+  id_bridge_sar_correction_scale: 1.0
+  phase_transport_enabled: true
+  phase_transport_hidden: 128
+  phase_transport_gain_caps: [0.5, 0.25, 0.1]
+  phase_transport_initial_gate: 0.02
+  phase_transport_null_calibrated: true
+  phase_transport_null_quantile: 0.75
+  phase_transport_support_epsilon: 0.01
+  phase_transport_carrier_mode: orthogonal_source
+
+train:
+  stage: phase_transport
+  max_steps: 1000
+  batch_size: 1
+  gradient_accumulation: 2
+  num_workers: 4
+  persistent_workers: true
+  prefetch_factor: 2
+  amp: bfloat16
+  init_use_ema: true
+  log_every: 20
+  validate_every: 250
+  save_every: 250
+  early_stop_patience: 10
+  find_unused_parameters: false
+  learning_rate: 0.0001
+  warmup_steps: 50
+  ema_decay: 0.99
+  flow_rollout_every: 4
+  flow_rollout_steps: 1
+  flow_visual_perceptual_weight: 0.10
+  phase_transport_hf_weight: 0.05
+  phase_transport_utility_weight: 0.25
+  phase_transport_signed_alignment_weight: 0.05
+  full_validate_every: 5000
+
+validation:
+  full_steps: []

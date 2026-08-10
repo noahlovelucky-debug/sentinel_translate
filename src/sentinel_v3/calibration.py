@@ -111,9 +111,10 @@ def calibrate_checkpoint(
     model.set_amplitude_scale("sar", 1.0)
     dataset = ManifestCropDataset(manifest, "validation_temporal", limit=limit)
     alphas = torch.linspace(0.0, 1.0, candidates, device=device)
-    optical_mse = torch.zeros(candidates, device=device)
-    sar_bias = torch.zeros(candidates, device=device)
-    physical_mse = torch.zeros((), device=device)
+    optical_rmse = torch.zeros(candidates, device=device)
+    sar_signed_bias = torch.zeros(candidates, device=device)
+    sar_scene_abs_bias = torch.zeros(candidates, device=device)
+    physical_rmse = torch.zeros((), device=device)
     for index, item in enumerate(dataset):
         s2 = item["s2"].unsqueeze(0).to(device)  # type: ignore[union-attr]
         sar = item["sar"].unsqueeze(0).to(device)  # type: ignore[union-attr]
@@ -144,42 +145,48 @@ def calibrate_checkpoint(
             optical_base = optical[:, [2, 1, 0]]
             target_rgb = s2[:, [2, 1, 0]]
             optical_detail = (
-                model.deterministic_detail(
+                model.visual_detail(
                     sar_pyramid,
                     SENTINEL1,
                     SENTINEL2,
                     tuple(s2.shape[-2:]),
-                    base=optical_base,
+                    optical_base,
                 )
                 * valid
             )
             radar_detail = (
-                model.deterministic_detail(
+                model.visual_detail(
                     optical_pyramid,
                     SENTINEL2,
                     SENTINEL1,
                     tuple(sar.shape[-2:]),
-                    base=radar,
+                    radar,
                 )
                 * valid
             )
             optical_texture = (
-                model.sample_residual(
+                model.sample_visual_residual(
                     sar_pyramid,
                     SENTINEL2,
-                    tuple(optical_base.shape),
+                    optical_base,
+                    optical_detail,
                     seed=seed + index,
-                    bridge_anchor=optical_detail,
                 )
                 * valid
             )
             radar_texture = (
-                model.sample_residual(
-                    optical_pyramid, SENTINEL1, tuple(radar.shape), seed=seed + index
+                model.sample_visual_residual(
+                    optical_pyramid,
+                    SENTINEL1,
+                    radar,
+                    radar_detail,
+                    seed=seed + index,
                 )
                 * valid
             )
-            physical_mse += masked_mean((optical_base - target_rgb).square(), valid)
+            physical_rmse += torch.sqrt(
+                masked_mean((optical_base - target_rgb).square(), valid)
+            )
             for alpha_index, alpha in enumerate(alphas):
                 optical_visual = SentinelV3.compose_visual(
                     optical_base, optical_detail, optical_texture * alpha, "optical"
@@ -188,28 +195,35 @@ def calibrate_checkpoint(
                     radar, radar_detail, radar_texture * alpha, "sar"
                 )
                 assert isinstance(optical_visual, Tensor) and isinstance(radar_visual, Tensor)
-                optical_mse[alpha_index] += masked_mean(
-                    (optical_visual - target_rgb).square(), valid
+                optical_rmse[alpha_index] += torch.sqrt(
+                    masked_mean((optical_visual - target_rgb).square(), valid)
                 )
-                sar_bias[alpha_index] += masked_mean(radar_visual - sar, valid).abs()
-    physical_rmse = torch.sqrt(physical_mse / len(dataset))
-    visual_rmse = torch.sqrt(optical_mse / len(dataset))
-    mean_sar_bias = sar_bias / len(dataset)
+                scene_sar_bias = masked_mean(radar_visual - sar, valid)
+                sar_signed_bias[alpha_index] += scene_sar_bias
+                sar_scene_abs_bias[alpha_index] += scene_sar_bias.abs()
+    physical_rmse /= len(dataset)
+    visual_rmse = optical_rmse / len(dataset)
+    mean_sar_bias = (sar_signed_bias / len(dataset)).abs()
+    mean_sar_scene_abs_bias = sar_scene_abs_bias / len(dataset)
     optical_valid = visual_rmse <= 1.05 * physical_rmse
     sar_valid = mean_sar_bias <= 0.5
     optical_index = (
         int(torch.nonzero(optical_valid, as_tuple=False)[-1]) if optical_valid.any() else 0
     )
-    sar_index = int(torch.nonzero(sar_valid, as_tuple=False)[-1]) if sar_valid.any() else 0
+    sar_bias_gate_satisfied = bool(sar_valid.any())
+    sar_index = (
+        int(torch.nonzero(sar_valid, as_tuple=False)[-1]) if sar_bias_gate_satisfied else 0
+    )
     optical_alpha = float(alphas[optical_index])
     sar_alpha = float(alphas[sar_index])
     payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
     optical_scale_name = model.amplitude_scale_name("optical")
+    sar_scale_name = model.amplitude_scale_name("sar")
     payload["model"][optical_scale_name] = torch.tensor(optical_alpha)
-    payload["model"]["sar_alpha_scale"] = torch.tensor(sar_alpha)
+    payload["model"][sar_scale_name] = torch.tensor(sar_alpha)
     if "ema" in payload:
         payload["ema"]["state"][optical_scale_name] = torch.tensor(optical_alpha)
-        payload["ema"]["state"]["sar_alpha_scale"] = torch.tensor(sar_alpha)
+        payload["ema"]["state"][sar_scale_name] = torch.tensor(sar_alpha)
     result = {
         "split": "validation_temporal",
         "samples": len(dataset),
@@ -219,6 +233,8 @@ def calibrate_checkpoint(
         "physical_rgb_rmse": float(physical_rmse),
         "calibrated_visual_rgb_rmse": float(visual_rmse[optical_index]),
         "calibrated_sar_bias_db": float(mean_sar_bias[sar_index]),
+        "calibrated_sar_scene_abs_bias_db": float(mean_sar_scene_abs_bias[sar_index]),
+        "sar_bias_gate_satisfied": sar_bias_gate_satisfied,
     }
     payload["calibration"] = result
     destination = Path(output)

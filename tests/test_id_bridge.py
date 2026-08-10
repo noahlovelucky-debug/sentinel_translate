@@ -24,6 +24,8 @@ from sentinel_v3.losses import (
     phase_alignment_loss,
     phase_identifiability_target,
     phase_transport_gain_target,
+    phase_transport_signed_coefficient_target,
+    signed_phase_alignment_loss,
 )
 from sentinel_v3.model import ModelConfig, ObservablePhaseTransportHead, SentinelV3
 from sentinel_v3.sensors import SENTINEL1, SENTINEL2
@@ -72,6 +74,7 @@ def _haar_model(
     phase_transport_null_calibrated: bool = False,
     phase_transport_null_quantile: float = 0.75,
     phase_transport_support_epsilon: float = 0.01,
+    phase_transport_carrier_mode: str = "physical_gain",
 ) -> SentinelV3:
     return SentinelV3(
         ModelConfig(
@@ -106,6 +109,7 @@ def _haar_model(
             phase_transport_null_calibrated=phase_transport_null_calibrated,
             phase_transport_null_quantile=phase_transport_null_quantile,
             phase_transport_support_epsilon=phase_transport_support_epsilon,
+            phase_transport_carrier_mode=phase_transport_carrier_mode,
         )
     )
 
@@ -241,6 +245,8 @@ def test_phase_transport_config_ranges_and_configs() -> None:
         ModelConfig(phase_transport_null_quantile=1.0)
     with pytest.raises(ValueError, match="support_epsilon"):
         ModelConfig(phase_transport_support_epsilon=0.0)
+    with pytest.raises(ValueError, match="carrier_mode"):
+        ModelConfig(phase_transport_carrier_mode="unknown")
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_hf_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_hf_weight"):
@@ -259,6 +265,14 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["model"]["phase_transport_null_quantile"] = 0.0
     with pytest.raises(ValueError, match="phase_transport_null_quantile"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_carrier_mode"] = "unknown"
+    with pytest.raises(ValueError, match="phase_transport_carrier_mode"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["train"]["phase_transport_signed_alignment_weight"] = -0.01
+    with pytest.raises(ValueError, match="phase_transport_signed_alignment_weight"):
         validate_config(config)
 
     root = Path(__file__).parents[1] / "configs"
@@ -324,6 +338,36 @@ def test_null_calibrated_phase_transport_configs() -> None:
         assert config["paths"]["output"].endswith("_v4")
         assert config["paths"]["reports"].endswith("_v4")
     assert load_config(root / names[0])["validation"]["enabled"] is False
+    assert load_config(root / names[-1])["validation"]["full_steps"] == []
+
+
+def test_canonical_ncopc_phase_transport_configs() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "canonical_2017_2024_phase_transport_ncopc_connectivity.yaml",
+        "canonical_2017_2024_phase_transport_ncopc_pilot.yaml",
+    )
+    expected_steps = (100, 1000)
+    expected_validation = (100, 250)
+    for name, steps, validation_every in zip(
+        names, expected_steps, expected_validation, strict=True
+    ):
+        config = load_config(root / name)
+        model = config["model"]
+        train = config["train"]
+        assert train["stage"] == "phase_transport"
+        assert train["max_steps"] == steps
+        assert train["batch_size"] == 1
+        assert train["gradient_accumulation"] == 2
+        assert train["validate_every"] == validation_every
+        assert train["flow_rollout_steps"] == 1
+        assert train["phase_transport_signed_alignment_weight"] == pytest.approx(0.05)
+        assert model["phase_transport_null_calibrated"] is True
+        assert model["phase_transport_carrier_mode"] == "orthogonal_source"
+        assert "2017_2024" in config["paths"]["train_shards"]
+        assert "ncopc" in config["paths"]["output"]
+        assert "ncopc" in config["paths"]["reports"]
+        validate_config(config)
     assert load_config(root / names[-1])["validation"]["full_steps"] == []
 
 
@@ -899,6 +943,69 @@ def test_null_calibrated_phase_transport_migrates_v3_gain_rows_after_ema_overlay
     torch.testing.assert_close(target_output.bias, initial_state[bias_name][:3])
 
 
+def test_orthogonal_carrier_loads_legacy_projection_and_starts_at_parallel_delta() -> None:
+    legacy = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+    ).eval()
+    carrier = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    ).eval()
+    legacy_state = {name: value.detach().clone() for name, value in legacy.state_dict().items()}
+    loaded, missing = training_module._load_compatible_state(carrier, legacy_state)
+    assert loaded > 0 and missing > 0
+    head = carrier.phase_transport_head
+    torch.testing.assert_close(
+        head.carrier_source_phase_projection.weight,
+        legacy.phase_transport_head.source_phase_projection.weight,
+    )
+    torch.testing.assert_close(
+        head.carrier_source_phase_projection.bias,
+        legacy.phase_transport_head.source_phase_projection.bias,
+    )
+    torch.testing.assert_close(head.carrier_head.weight, torch.zeros_like(head.carrier_head.weight))
+    torch.testing.assert_close(head.carrier_head.bias, torch.zeros_like(head.carrier_head.bias))
+
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = legacy.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    parallel_delta, _ = legacy.phase_transport_delta(pyramid, base, SENTINEL2)
+    total_delta, diagnostics = carrier.phase_transport_delta(pyramid, base, SENTINEL2)
+    torch.testing.assert_close(diagnostics["carrier_delta"], torch.zeros_like(total_delta), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(diagnostics["parallel_delta"], parallel_delta, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(total_delta, parallel_delta, atol=0.0, rtol=0.0)
+    legacy_detail = legacy.visual_detail(pyramid, SENTINEL1, SENTINEL2, base.shape[-2:], base)
+    carrier_detail = carrier.visual_detail(pyramid, SENTINEL1, SENTINEL2, base.shape[-2:], base)
+    torch.testing.assert_close(carrier_detail, legacy_detail, atol=0.0, rtol=0.0)
+
+    with torch.no_grad():
+        head.carrier_head.bias.fill_(0.25)
+    resumed = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    )
+    resumed_loaded, resumed_missing = training_module._load_compatible_state(
+        resumed, {name: value.detach().clone() for name, value in carrier.state_dict().items()}
+    )
+    assert resumed_loaded > 0 and resumed_missing < len(resumed.state_dict())
+    resumed_state = resumed.state_dict()
+    for name, value in carrier.state_dict().items():
+        if name.startswith("phase_transport_head.carrier_"):
+            torch.testing.assert_close(resumed_state[name], value)
+
+
 def test_observable_phase_transport_sigmoid_gate_is_smooth_and_bounded() -> None:
     raw_gain = torch.tensor(((-30.0, 0.0, 30.0),), requires_grad=True)
     gate = ObservablePhaseTransportHead.gain_gate(raw_gain)
@@ -977,6 +1084,251 @@ def test_observable_phase_transport_coherence_and_alignment_are_sign_invariant()
     assert bool(torch.isfinite(aligned_loss))
     assert float(aligned_loss) + 0.5 < float(perpendicular_loss)
     torch.testing.assert_close(aligned_loss, inverted_loss, atol=1e-6, rtol=1e-6)
+
+
+def test_signed_phase_alignment_prefers_matching_polarity_and_zero_energy_is_finite() -> None:
+    source = torch.randn(2, 3, 32, 32, requires_grad=True)
+    target_bands = tuple(
+        source[:, band : band + 1].detach().repeat(1, 3, 1, 1) for band in range(3)
+    )
+    valid = torch.ones(2, 1, 32, 32)
+    aligned = signed_phase_alignment_loss(source, target_bands, valid)
+    inverted = signed_phase_alignment_loss(-source, target_bands, valid)
+    assert bool(torch.isfinite(aligned))
+    assert float(aligned.detach()) + 1.0 < float(inverted.detach())
+
+    zero_source = torch.zeros_like(source, requires_grad=True)
+    zero_loss = signed_phase_alignment_loss(
+        zero_source,
+        tuple(torch.zeros_like(band) for band in target_bands),
+        valid,
+    )
+    assert bool(torch.isfinite(zero_loss))
+    zero_loss.backward()
+    assert zero_source.grad is not None
+    assert bool(torch.isfinite(zero_source.grad).all())
+
+
+def test_orthogonal_source_phase_carrier_injects_luminance_without_low_frequency_leakage() -> None:
+    torch.manual_seed(31)
+    head = ObservablePhaseTransportHead(
+        (8, 16, 32, 32),
+        hidden=32,
+        null_calibrated=True,
+        carrier_mode="orthogonal_source",
+    )
+    height = width = 32
+    physical = torch.randn(2, 3, height, width)
+    physical_bands = torch.stack(frequency_bands(physical, levels=3), dim=1)
+    full_gains = torch.full((2, 3, height, width), 0.25)
+    source = torch.randn(2, 3, height, width, requires_grad=True)
+
+    carriers, carrier_rms, carrier_orthogonality = head.orthogonal_source_carriers(
+        source, physical_bands
+    )
+    delta, diagnostics = head._orthogonal_source_delta(source, physical_bands, full_gains)
+    inverted_delta, _ = head._orthogonal_source_delta(-source, physical_bands, full_gains)
+    assert bool(torch.isfinite(carriers).all())
+    assert bool(torch.isfinite(carrier_rms).all())
+    assert bool(torch.isfinite(carrier_orthogonality).all())
+    assert float(carrier_orthogonality.detach().abs().mean()) < 0.15
+    assert float(carrier_rms.detach().mean()) > 0.0
+    assert diagnostics["carrier_components"].requires_grad
+    assert diagnostics["carrier_components"].shape == (2, 3, 3, height, width)
+    torch.testing.assert_close(carriers[:, :, 0], carriers[:, :, 1], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(carriers[:, :, 1], carriers[:, :, 2], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(delta[:, 0], delta[:, 1], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(delta[:, 1], delta[:, 2], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(inverted_delta, -delta, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(diagnostics["carrier_components"], carriers)
+    torch.testing.assert_close(diagnostics["carrier_rms"], carrier_rms)
+    torch.testing.assert_close(diagnostics["carrier_orthogonality"], carrier_orthogonality)
+    leakage = F.avg_pool2d(delta, 8, stride=8).abs().mean()
+    assert float((leakage / delta.abs().mean().clamp_min(1e-8)).detach()) < 0.1
+
+
+def test_orthogonal_source_phase_carrier_forward_uses_source_phase_projection() -> None:
+    torch.manual_seed(33)
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    )
+    head = model.phase_transport_head
+    with torch.no_grad():
+        head.output[-1].weight.zero_()
+        head.output[-1].bias.fill_(12.0)
+        head.carrier_source_phase_projection.weight.zero_()
+        head.carrier_source_phase_projection.bias.zero_()
+        for band in range(3):
+            head.carrier_source_phase_projection.weight[band, band, 0, 0] = 1.0
+        head.carrier_head.weight.zero_()
+        head.carrier_head.bias.fill_(1.0)
+    pyramid = (
+        torch.randn(1, 8, 32, 32),
+        torch.randn(1, 16, 16, 16),
+        torch.randn(1, 32, 8, 8),
+        torch.randn(1, 32, 4, 4),
+    )
+    physical = torch.randn(1, 3, 32, 32)
+    delta, diagnostics = head(pyramid, physical)
+    inverted_delta, inverted_diagnostics = head((-pyramid[0], *pyramid[1:]), physical)
+    assert int(torch.count_nonzero(delta)) > 0
+    assert {
+        "parallel_delta",
+        "carrier_delta",
+        "carrier_source_phase",
+        "carrier_signed_gate",
+        "carrier_effective_signed_coeff",
+        "carrier_support",
+    } <= diagnostics.keys()
+    torch.testing.assert_close(
+        inverted_diagnostics["carrier_delta"],
+        -diagnostics["carrier_delta"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        inverted_delta,
+        inverted_diagnostics["parallel_delta"] + inverted_diagnostics["carrier_delta"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_orthogonal_source_phase_carrier_respects_null_support_and_zero_physical_rms(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    torch.manual_seed(37)
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    )
+    head = model.phase_transport_head
+    assert head.carrier_mode == "orthogonal_source"
+    height = width = 32
+    source = torch.randn(1, 3, height, width, requires_grad=True)
+    zero_physical = torch.zeros(1, 3, height, width, requires_grad=True)
+    zero_bands = torch.stack(frequency_bands(zero_physical, levels=3), dim=1)
+    zero_delta, _ = head._orthogonal_source_delta(
+        source, zero_bands, torch.ones(1, 3, height, width)
+    )
+    torch.testing.assert_close(zero_delta, torch.zeros_like(zero_delta), atol=0.0, rtol=0.0)
+    zero_delta.square().mean().backward()
+    assert source.grad is not None and bool(torch.isfinite(source.grad).all())
+    assert zero_physical.grad is not None and bool(torch.isfinite(zero_physical.grad).all())
+
+    valid = torch.ones(1, 1, height, width)
+    pyramid = model.encode(torch.randn(1, 2, height, width), SENTINEL1, valid)
+    physical = torch.randn(1, 3, height, width)
+
+    def no_carrier_support(
+        _source_phase: torch.Tensor,
+        _physical_bands: torch.Tensor,
+        coherence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros_like(coherence)
+        return zeros, zeros, zeros
+
+    with torch.no_grad():
+        head.output[-1].bias.fill_(12.0)
+        head.carrier_head.bias.fill_(1.0)
+    monkeypatch.setattr(head, "_carrier_null_calibrated_support", no_carrier_support)
+    delta, diagnostics = head(pyramid, physical)
+    torch.testing.assert_close(
+        diagnostics["carrier_delta"],
+        torch.zeros_like(diagnostics["carrier_delta"]),
+        atol=0.0,
+        rtol=0.0,
+    )
+    torch.testing.assert_close(
+        delta,
+        diagnostics["parallel_delta"],
+        atol=0.0,
+        rtol=0.0,
+    )
+    assert {"carrier_rms", "carrier_orthogonality", "carrier_support"} <= diagnostics.keys()
+
+
+def test_physical_gain_carrier_mode_preserves_legacy_phase_transport_formula() -> None:
+    torch.manual_seed(41)
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+    )
+    assert model.config.phase_transport_carrier_mode == "physical_gain"
+    head = model.phase_transport_head
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    physical = torch.randn(1, 3, 32, 32)
+    delta, diagnostics = head(pyramid, physical)
+    physical_bands = torch.stack(frequency_bands(physical, levels=3), dim=1)
+    full_gains = F.interpolate(
+        diagnostics["gain"], size=physical.shape[-2:], mode="bilinear", align_corners=False
+    )
+    expected = highpass((full_gains.unsqueeze(2) * physical_bands).sum(dim=1))
+    torch.testing.assert_close(delta, expected, atol=0.0, rtol=0.0)
+    assert "carrier_rms" not in diagnostics
+    assert "carrier_orthogonality" not in diagnostics
+
+
+def test_phase_transport_gain_oracle_prefers_aligned_carriers_over_orthogonal_physical() -> None:
+    height = width = 16
+    columns = (
+        torch.arange(width).remainder(2).mul(2).sub(1).float().view(1, 1, 1, width)
+    ).expand(1, 3, height, width)
+    rows = (
+        torch.arange(height).remainder(2).mul(2).sub(1).float().view(1, 1, height, 1)
+    ).expand(1, 3, height, width)
+    physical_bands = torch.zeros(1, 3, 3, height, width)
+    physical_bands[:, 0] = columns
+    aligned_carriers = torch.zeros_like(physical_bands)
+    aligned_carriers[:, 0] = rows
+    residual = 0.1 * rows
+    valid = torch.ones(1, 1, height, width)
+    caps = (0.5, 0.25, 0.1)
+
+    physical_oracle = phase_transport_gain_target(physical_bands, residual, valid, caps)
+    carrier_oracle = phase_transport_gain_target(aligned_carriers, residual, valid, caps)
+    unhelpful_carriers = physical_bands.clone()
+    unhelpful_oracle = phase_transport_gain_target(unhelpful_carriers, residual, valid, caps)
+    torch.testing.assert_close(physical_oracle, torch.zeros_like(physical_oracle))
+    assert float(carrier_oracle[:, 0].mean()) > 0.0
+    torch.testing.assert_close(unhelpful_oracle, torch.zeros_like(unhelpful_oracle))
+
+
+def test_phase_transport_signed_coefficient_oracle_preserves_polarity() -> None:
+    height = width = 16
+    component = (
+        torch.arange(width).remainder(2).mul(2).sub(1).float().view(1, 1, 1, width)
+    ).expand(1, 3, height, width)
+    carriers = torch.zeros(1, 3, 3, height, width)
+    carriers[:, 0] = component
+    valid = torch.ones(1, 1, height, width)
+    caps = (0.5, 0.25, 0.1)
+    positive = phase_transport_signed_coefficient_target(
+        carriers, 0.1 * component, valid, caps
+    )
+    empty = phase_transport_signed_coefficient_target(
+        carriers, torch.zeros_like(component), valid, caps
+    )
+    negative = phase_transport_signed_coefficient_target(
+        carriers, -0.1 * component, valid, caps
+    )
+    assert float(positive[:, 0].mean()) > 0.0
+    torch.testing.assert_close(empty, torch.zeros_like(empty))
+    assert float(negative[:, 0].mean()) < 0.0
+    torch.testing.assert_close(negative, -positive, atol=1e-6, rtol=1e-6)
 
 
 @pytest.mark.parametrize(
@@ -1069,6 +1421,44 @@ def test_phase_optical_only_keeps_sar_detail_amplitude_and_seeded_sampling_legac
         initialized.legacy_residual_dit.input.weight,
         legacy.residual_dit.input.weight,
     )
+
+
+def test_phase_optical_visual_zero_residual_skips_id_bridge_flow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+    ).eval()
+    model.set_amplitude_scale("optical", 1.0)
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    detail = torch.zeros_like(base)
+    calls: list[str] = []
+
+    def unexpected_flow(*_args: object, **_kwargs: object) -> torch.Tensor:
+        calls.append("flow")
+        raise AssertionError("zero phase Optical residual must bypass the 48-channel flow")
+
+    monkeypatch.setattr(model, "sample_id_bridge_residual", unexpected_flow)
+    residual = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=29)
+    torch.testing.assert_close(residual, torch.zeros_like(base), atol=0.0, rtol=0.0)
+    assert calls == []
+
+    model.config.id_bridge_optical_innovation_band_scales = (0.1, 0.0, 0.0)
+
+    def sampled_flow(*_args: object, **_kwargs: object) -> torch.Tensor:
+        calls.append("flow")
+        return torch.full_like(base, 0.125)
+
+    monkeypatch.setattr(model, "sample_id_bridge_residual", sampled_flow)
+    residual = model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=29)
+    torch.testing.assert_close(residual, torch.full_like(base, 0.125), atol=0.0, rtol=0.0)
+    assert calls == ["flow"]
 
 
 def test_phase_id_bridge_training_uses_optical_oracle_and_antithetic_rollout(
@@ -1864,6 +2254,58 @@ def test_visual_detail_and_residual_dispatch_id_and_legacy_paths(
     assert calls == ["legacy_detail", "legacy_sample", "id_sample"]
 
 
+def test_id_bridge_visual_residual_applies_one_amplitude_scale(
+    tiny_model: SentinelV3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyramid = tiny_model.encode(
+        torch.randn(1, 2, 32, 32), SENTINEL1, torch.ones(1, 1, 32, 32)
+    )
+    base = torch.rand(1, 3, 32, 32)
+    detail = torch.zeros_like(base)
+
+    def id_sample(
+        _pyramid: object,
+        physical: torch.Tensor,
+        _target: object,
+        *,
+        seed: int,
+        steps: int | None,
+        return_origin: bool = False,
+    ) -> torch.Tensor:
+        assert physical is base and steps is None and not return_origin
+        generator = torch.Generator(device=physical.device).manual_seed(seed)
+        return torch.randn(physical.shape, generator=generator, device=physical.device)
+
+    tiny_model.config.id_bridge_enabled = True
+    monkeypatch.setattr(tiny_model, "sample_id_bridge_residual", id_sample)
+    tiny_model.set_amplitude_scale("optical", 1.0)
+    reference = tiny_model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=19)
+    tiny_model.set_amplitude_scale("optical", 0.0)
+    suppressed = tiny_model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=19)
+    tiny_model.set_amplitude_scale("optical", 0.37)
+    scaled = tiny_model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=19)
+    torch.testing.assert_close(suppressed, torch.zeros_like(reference), atol=0.0, rtol=0.0)
+    torch.testing.assert_close(scaled, reference * tiny_model.optical_alpha_scale)
+
+    def legacy_sample(
+        _pyramid: object,
+        _target: object,
+        shape: tuple[int, int, int, int],
+        *,
+        seed: int,
+        steps: int | None,
+        bridge_anchor: torch.Tensor | None,
+    ) -> torch.Tensor:
+        assert shape == tuple(base.shape)
+        assert seed == 19 and steps is None and bridge_anchor is detail
+        return torch.full_like(base, 0.2)
+
+    tiny_model.config.id_bridge_enabled = False
+    monkeypatch.setattr(tiny_model, "sample_residual", legacy_sample)
+    legacy = tiny_model.sample_visual_residual(pyramid, SENTINEL2, base, detail, seed=19)
+    torch.testing.assert_close(legacy, torch.full_like(base, 0.2))
+
+
 def test_id_bridge_only_opens_origin_and_generic_flow_parameters(tiny_model: SentinelV3) -> None:
     _set_trainable(tiny_model, "id_bridge")
     trainable = {
@@ -2017,6 +2459,7 @@ def test_id_bridge_optimizer_updates_origin_and_checkpoint_ema(tiny_model: Senti
         "phase_transport_null_calibrated": False,
         "phase_transport_null_quantile": 0.75,
         "phase_transport_support_epsilon": 0.01,
+        "phase_transport_carrier_mode": "physical_gain",
         "antithetic_weight": 0.0,
     }
 
@@ -2073,6 +2516,7 @@ def test_haar_id_bridge_optimizer_and_checkpoint_metadata() -> None:
         "phase_transport_null_calibrated": False,
         "phase_transport_null_quantile": 0.75,
         "phase_transport_support_epsilon": 0.01,
+        "phase_transport_carrier_mode": "physical_gain",
         "antithetic_weight": 0.0,
     }
 
@@ -2349,6 +2793,223 @@ def test_null_calibrated_phase_transport_trains_without_offsets_and_keeps_long_g
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_orthogonal_source_phase_transport_trains_only_head_and_keeps_long_gaps_zero() -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    )
+    _set_trainable(model, "phase_transport")
+    carrier_prefixes = (
+        "phase_transport_head.carrier_source_phase_projection.",
+        "phase_transport_head.carrier_adapter.",
+        "phase_transport_head.carrier_head.",
+    )
+    trainable = {
+        name for name, parameter in model.named_parameters() if parameter.requires_grad
+    }
+    assert trainable and all(name.startswith(carrier_prefixes) for name in trainable)
+    assert not model.phase_transport_head.source_phase_projection.weight.requires_grad
+    assert not model.phase_transport_head.output[-1].weight.requires_grad
+    optimizer = _optimizer(
+        model,
+        {"learning_rate": 1e-3, "encoder_learning_rate": 1e-3, "weight_decay": 0.0},
+        "phase_transport",
+        torch.device("cpu"),
+    )
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    assert optimizer_ids == {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+    before_step = {
+        name: parameter.detach().clone() for name, parameter in model.named_parameters()
+    }
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+        phase_transport_utility_weight=0.25,
+        phase_transport_signed_alignment_weight=0.05,
+    )
+    objective.set_progress(1, 100)
+    loss, metrics = objective(_batch(), "phase_transport")
+    assert bool(torch.isfinite(loss))
+    for name in (
+        "signed_phase_alignment",
+        "carrier_rms",
+        "carrier_orthogonality",
+        "carrier_oracle_fine",
+        "carrier_oracle_active_fraction",
+        "carrier_oracle_supported_fraction",
+        "carrier_gate_fine",
+        "carrier_effective_fine",
+        "carrier_delta_rms",
+    ):
+        assert f"sar2opt/{name}" in metrics
+        assert bool(torch.isfinite(metrics[f"sar2opt/{name}"]))
+    loss.backward()
+    source_projection = model.phase_transport_head.carrier_source_phase_projection
+    assert source_projection.weight.grad is not None
+    assert int(torch.count_nonzero(source_projection.weight.grad)) > 0
+    carrier_head = model.phase_transport_head.carrier_head
+    assert carrier_head.bias.grad is not None
+    assert int(torch.count_nonzero(carrier_head.bias.grad)) > 0
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith(carrier_prefixes)
+    )
+    optimizer.step()
+    changed = {
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(parameter.detach(), before_step[name])
+    }
+    assert changed and all(name.startswith(carrier_prefixes) for name in changed)
+
+    model.zero_grad(set_to_none=True)
+    zero_loss, _ = objective(_batch(delta_days=2), "phase_transport")
+    zero_loss.backward()
+    assert float(zero_loss.detach()) == 0.0
+    assert all(
+        parameter.grad is not None and int(torch.count_nonzero(parameter.grad)) == 0
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_orthogonal_source_phase_transport_uses_detached_carrier_oracle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    )
+    _set_trainable(model, "phase_transport")
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+        phase_transport_utility_weight=0.25,
+        phase_transport_signed_alignment_weight=0.05,
+    )
+    captured: dict[str, torch.Tensor] = {}
+    original_delta = model.phase_transport_delta
+    original_context = objective._physical_context
+    original_anchor = model.id_bridge_anchor_detail
+
+    def capture_delta(*args: object, **kwargs: object) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        delta, diagnostics = original_delta(*args, **kwargs)  # type: ignore[arg-type]
+        captured["carrier_components"] = diagnostics["carrier_components"]
+        captured["parallel_delta"] = diagnostics["parallel_delta"]
+        return delta, diagnostics
+
+    def capture_context(*args: object, **kwargs: object) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]
+    ]:
+        context = original_context(*args, **kwargs)  # type: ignore[arg-type]
+        captured["target"] = context[0]
+        captured["base"] = context[1]
+        captured["valid"] = context[2]
+        return context
+
+    def capture_anchor(*args: object, **kwargs: object) -> torch.Tensor:
+        anchor = original_anchor(*args, **kwargs)  # type: ignore[arg-type]
+        captured["protected_anchor"] = anchor
+        return anchor
+
+    oracle_inputs: list[torch.Tensor] = []
+    oracle_residuals: list[torch.Tensor] = []
+    original_oracle = training_module.phase_transport_signed_coefficient_target
+
+    def capture_oracle(*args: object, **kwargs: object) -> torch.Tensor:
+        oracle_inputs.append(args[0])  # type: ignore[arg-type]
+        oracle_residuals.append(args[1])  # type: ignore[arg-type]
+        return original_oracle(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(model, "phase_transport_delta", capture_delta)
+    monkeypatch.setattr(objective, "_physical_context", capture_context)
+    monkeypatch.setattr(model, "id_bridge_anchor_detail", capture_anchor)
+    monkeypatch.setattr(training_module, "phase_transport_signed_coefficient_target", capture_oracle)
+    objective.set_progress(1, 100)
+    loss, metrics = objective(_batch(), "phase_transport")
+    assert bool(torch.isfinite(loss))
+    assert captured["carrier_components"].requires_grad
+    assert len(oracle_inputs) == 1
+    assert not oracle_inputs[0].requires_grad
+    torch.testing.assert_close(oracle_inputs[0], captured["carrier_components"].detach())
+    expected_residual = (
+        highpass(captured["target"] - captured["base"].detach()) * captured["valid"]
+        - captured["protected_anchor"]
+        - captured["parallel_delta"].detach()
+    )
+    torch.testing.assert_close(oracle_residuals[0], expected_residual)
+    assert float(metrics["sar2opt/carrier_oracle_active"]) == 1.0
+    assert not any("carrier_components" in name for name in metrics)
+
+
+def test_physical_gain_phase_transport_keeps_physical_oracle_components(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+    )
+    _set_trainable(model, "phase_transport")
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+        phase_transport_utility_weight=0.25,
+    )
+    captured: dict[str, torch.Tensor] = {}
+    original_context = objective._physical_context
+
+    def capture_context(*args: object, **kwargs: object) -> tuple[
+        torch.Tensor, torch.Tensor, torch.Tensor, tuple[torch.Tensor, ...]
+    ]:
+        context = original_context(*args, **kwargs)  # type: ignore[arg-type]
+        captured["base"] = context[1]
+        return context
+
+    oracle_inputs: list[torch.Tensor] = []
+    original_oracle = training_module.phase_transport_gain_target
+
+    def capture_oracle(*args: object, **kwargs: object) -> torch.Tensor:
+        oracle_inputs.append(args[0])  # type: ignore[arg-type]
+        return original_oracle(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(objective, "_physical_context", capture_context)
+    monkeypatch.setattr(training_module, "phase_transport_gain_target", capture_oracle)
+    objective.set_progress(1, 100)
+    _, metrics = objective(_batch(), "phase_transport")
+    expected = torch.stack(frequency_bands(captured["base"].detach(), levels=3), dim=1)
+    assert len(oracle_inputs) == 1
+    torch.testing.assert_close(oracle_inputs[0], expected)
+    assert "sar2opt/carrier_oracle_active" not in metrics
 
 
 def test_id_bridge_objective_updates_origin_and_generic_flow(tiny_model: SentinelV3) -> None:
