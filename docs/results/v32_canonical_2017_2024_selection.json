@@ -1,0 +1,9 @@
+{
+  "physical_pass": true,
+  "visual_pass": false,
+  "joint_pass": false,
+  "protocol_hash": "f72deee58e7c421bd6af9d96164a272717564f94b7c227e4b38fa4e915f61606",
+  "selected": [
+    "best_physical.pt"
+  ]
+}

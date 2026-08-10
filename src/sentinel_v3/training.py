@@ -1475,6 +1475,19 @@ class JointObjective(nn.Module):
             metrics["dists"] = dists.detach()
         return total, metrics
 
+    @staticmethod
+    def _carrier_alignment_mask(valid: Tensor, carrier_support: Tensor) -> Tensor:
+        """Restrict signed carrier supervision to detached null-exceedance support."""
+
+        active = carrier_support.detach().gt(0.0).any(dim=1, keepdim=True)
+        active = F.interpolate(active.to(valid), size=valid.shape[-2:], mode="nearest")
+        return valid * active.detach()
+
+    def _carrier_signed_alignment_mask(self, valid: Tensor, carrier_support: Tensor) -> Tensor:
+        if self.model.config.phase_transport_carrier_support_mode == "binary_exceedance":
+            return self._carrier_alignment_mask(valid, carrier_support)
+        return valid
+
     def _carrier_phase_transport_direction(
         self,
         *,
@@ -1504,18 +1517,19 @@ class JointObjective(nn.Module):
         )
         strict_valid = (latent_valid >= 0.999).to(carrier_support)
         support_active = (carrier_support.detach() > 0.0).to(carrier_support)
+        carrier_alignment_mask = self._carrier_signed_alignment_mask(valid, carrier_support)
         oracle_signed_coeff = phase_transport_signed_coefficient_target(
             carrier_components,
             residual_after_protected,
             valid,
-            self.model.config.phase_transport_gain_caps,
+            self.model.config.phase_transport_carrier_gain_caps,
         ).detach()
         oracle_energy = F.avg_pool2d(
             carrier_components.float().square().sum(dim=2), 4, stride=4
         )
-        cap_values = oracle_energy.new_tensor(self.model.config.phase_transport_gain_caps).view(
-            1, 3, 1, 1
-        )
+        cap_values = oracle_energy.new_tensor(
+            self.model.config.phase_transport_carrier_gain_caps
+        ).view(1, 3, 1, 1)
         oracle_supported = (
             (oracle_energy > 1e-7)
             & (latent_valid.expand_as(oracle_energy) >= 0.999)
@@ -1552,8 +1566,12 @@ class JointObjective(nn.Module):
         signed_phase_alignment = signed_phase_alignment_loss(
             diagnostics["carrier_source_phase"],
             carrier_target_bands,
-            valid,
+            carrier_alignment_mask,
             residual_weights,
+        )
+        carrier_alignment_active_fraction = (
+            carrier_alignment_mask.float().sum()
+            / valid.float().sum().clamp_min(1e-8)
         )
         parallel_phase_alignment = phase_alignment_loss(
             diagnostics["source_phase"], frequency_bands(target, levels=3), valid, residual_weights
@@ -1598,18 +1616,37 @@ class JointObjective(nn.Module):
             "carrier_oracle_fine": oracle_signed_coeff[:, 0].mean().detach(),
             "carrier_oracle_mid": oracle_signed_coeff[:, 1].mean().detach(),
             "carrier_oracle_coarse": oracle_signed_coeff[:, 2].mean().detach(),
+            "carrier_oracle_abs_fine": oracle_signed_coeff[:, 0].abs().mean().detach(),
+            "carrier_oracle_abs_mid": oracle_signed_coeff[:, 1].abs().mean().detach(),
+            "carrier_oracle_abs_coarse": oracle_signed_coeff[:, 2].abs().mean().detach(),
             "carrier_oracle_active_fraction": oracle_active_fraction.detach(),
             "carrier_oracle_supported_fraction": oracle_supported_fraction.detach(),
             "carrier_gate_fine": carrier_signed_gate[:, 0].mean().detach(),
             "carrier_gate_mid": carrier_signed_gate[:, 1].mean().detach(),
             "carrier_gate_coarse": carrier_signed_gate[:, 2].mean().detach(),
+            "carrier_gate_abs_fine": carrier_signed_gate[:, 0].abs().mean().detach(),
+            "carrier_gate_abs_mid": carrier_signed_gate[:, 1].abs().mean().detach(),
+            "carrier_gate_abs_coarse": carrier_signed_gate[:, 2].abs().mean().detach(),
             "carrier_effective_fine": carrier_effective_signed_coeff[:, 0].mean().detach(),
             "carrier_effective_mid": carrier_effective_signed_coeff[:, 1].mean().detach(),
             "carrier_effective_coarse": carrier_effective_signed_coeff[:, 2].mean().detach(),
+            "carrier_effective_abs_fine": carrier_effective_signed_coeff[:, 0]
+            .abs()
+            .mean()
+            .detach(),
+            "carrier_effective_abs_mid": carrier_effective_signed_coeff[:, 1]
+            .abs()
+            .mean()
+            .detach(),
+            "carrier_effective_abs_coarse": carrier_effective_signed_coeff[:, 2]
+            .abs()
+            .mean()
+            .detach(),
             "carrier_support_fine": carrier_support[:, 0].mean().detach(),
             "carrier_support_mid": carrier_support[:, 1].mean().detach(),
             "carrier_support_coarse": carrier_support[:, 2].mean().detach(),
             "carrier_support_active_fraction": carrier_support_active_fraction.detach(),
+            "carrier_alignment_active_fraction": carrier_alignment_active_fraction.detach(),
             "carrier_delta_rms": carrier_delta_rms.detach(),
             "carrier_rms": diagnostics["carrier_rms"].mean().detach(),
             "carrier_orthogonality": diagnostics["carrier_orthogonality"].abs().mean().detach(),

@@ -69,12 +69,14 @@ def _haar_model(
     optical_correction_scale: float = 1.0,
     phase_transport: bool = False,
     phase_transport_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1),
+    phase_transport_carrier_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1),
     phase_transport_offset_caps_px: tuple[float, float, float] = (0.5, 0.5, 0.5),
     phase_transport_initial_gate: float = 0.02,
     phase_transport_null_calibrated: bool = False,
     phase_transport_null_quantile: float = 0.75,
     phase_transport_support_epsilon: float = 0.01,
     phase_transport_carrier_mode: str = "physical_gain",
+    phase_transport_carrier_support_mode: str = "continuous",
 ) -> SentinelV3:
     return SentinelV3(
         ModelConfig(
@@ -104,12 +106,14 @@ def _haar_model(
             id_bridge_optical_correction_scale=optical_correction_scale,
             phase_transport_enabled=phase_transport,
             phase_transport_gain_caps=phase_transport_gain_caps,
+            phase_transport_carrier_gain_caps=phase_transport_carrier_gain_caps,
             phase_transport_offset_caps_px=phase_transport_offset_caps_px,
             phase_transport_initial_gate=phase_transport_initial_gate,
             phase_transport_null_calibrated=phase_transport_null_calibrated,
             phase_transport_null_quantile=phase_transport_null_quantile,
             phase_transport_support_epsilon=phase_transport_support_epsilon,
             phase_transport_carrier_mode=phase_transport_carrier_mode,
+            phase_transport_carrier_support_mode=phase_transport_carrier_support_mode,
         )
     )
 
@@ -247,6 +251,17 @@ def test_phase_transport_config_ranges_and_configs() -> None:
         ModelConfig(phase_transport_support_epsilon=0.0)
     with pytest.raises(ValueError, match="carrier_mode"):
         ModelConfig(phase_transport_carrier_mode="unknown")
+    assert ModelConfig(phase_transport_carrier_gain_caps=(0.5, 0.25, 0.0)).phase_transport_carrier_gain_caps == (
+        0.5,
+        0.25,
+        0.0,
+    )
+    with pytest.raises(ValueError, match="carrier_gain_caps"):
+        ModelConfig(phase_transport_carrier_gain_caps=(0.5, -0.25, 0.1))
+    with pytest.raises(ValueError, match="carrier_gain_caps"):
+        ModelConfig(phase_transport_carrier_gain_caps=(0.5, 0.25, 1.01))
+    with pytest.raises(ValueError, match="carrier_support_mode"):
+        ModelConfig(phase_transport_carrier_support_mode="unknown")
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_hf_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_hf_weight"):
@@ -270,6 +285,20 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     config["model"]["phase_transport_carrier_mode"] = "unknown"
     with pytest.raises(ValueError, match="phase_transport_carrier_mode"):
         validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_carrier_gain_caps"] = [0.5, 0.25, -0.1]
+    with pytest.raises(ValueError, match="phase_transport_carrier_gain_caps"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_carrier_support_mode"] = "unknown"
+    with pytest.raises(ValueError, match="phase_transport_carrier_support_mode"):
+        validate_config(config)
+    legacy_config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    legacy_config["model"].pop("phase_transport_carrier_gain_caps")
+    legacy_config["model"].pop("phase_transport_carrier_support_mode")
+    validate_config(legacy_config)
+    assert legacy_config["model"]["phase_transport_carrier_gain_caps"] == [0.5, 0.25, 0.1]
+    assert legacy_config["model"]["phase_transport_carrier_support_mode"] == "continuous"
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_signed_alignment_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_signed_alignment_weight"):
@@ -367,6 +396,36 @@ def test_canonical_ncopc_phase_transport_configs() -> None:
         assert "2017_2024" in config["paths"]["train_shards"]
         assert "ncopc" in config["paths"]["output"]
         assert "ncopc" in config["paths"]["reports"]
+        validate_config(config)
+    assert load_config(root / names[-1])["validation"]["full_steps"] == []
+
+
+def test_canonical_ncopc_bnes_phase_transport_configs() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "canonical_2017_2024_phase_transport_ncopc_bnes_connectivity.yaml",
+        "canonical_2017_2024_phase_transport_ncopc_bnes_pilot.yaml",
+    )
+    expected_steps = (100, 1000)
+    expected_validation = (100, 250)
+    for name, steps, validation_every in zip(
+        names, expected_steps, expected_validation, strict=True
+    ):
+        config = load_config(root / name)
+        model = config["model"]
+        train = config["train"]
+        assert train["stage"] == "phase_transport"
+        assert train["max_steps"] == steps
+        assert train["batch_size"] == 1
+        assert train["gradient_accumulation"] == 2
+        assert train["validate_every"] == validation_every
+        assert train["flow_rollout_steps"] == 1
+        assert train["phase_transport_signed_alignment_weight"] == pytest.approx(0.05)
+        assert model["phase_transport_carrier_mode"] == "orthogonal_source"
+        assert model["phase_transport_carrier_support_mode"] == "binary_exceedance"
+        assert model["phase_transport_carrier_gain_caps"] == [0.125, 0.0625, 0.025]
+        assert "ncopc_bnes" in config["paths"]["output"]
+        assert "ncopc_bnes" in config["paths"]["reports"]
         validate_config(config)
     assert load_config(root / names[-1])["validation"]["full_steps"] == []
 
@@ -1006,6 +1065,41 @@ def test_orthogonal_carrier_loads_legacy_projection_and_starts_at_parallel_delta
             torch.testing.assert_close(resumed_state[name], value)
 
 
+def test_bnes_loads_existing_ncopc_state_and_starts_at_parallel_delta() -> None:
+    continuous = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+    ).eval()
+    binary = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_gain_caps=(0.125, 0.0625, 0.025),
+        phase_transport_carrier_support_mode="binary_exceedance",
+    ).eval()
+    loaded, missing = training_module._load_compatible_state(
+        binary, {name: value.detach().clone() for name, value in continuous.state_dict().items()}
+    )
+    assert loaded > 0 and missing == 0
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = continuous.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    continuous_delta, _ = continuous.phase_transport_delta(pyramid, base, SENTINEL2)
+    binary_delta, diagnostics = binary.phase_transport_delta(pyramid, base, SENTINEL2)
+    torch.testing.assert_close(diagnostics["carrier_delta"], torch.zeros_like(binary_delta))
+    torch.testing.assert_close(binary_delta, continuous_delta, atol=0.0, rtol=0.0)
+    metadata = binary.residual_state_metadata()
+    assert metadata["phase_transport_carrier_gain_caps"] == (0.125, 0.0625, 0.025)
+    assert metadata["phase_transport_carrier_support_mode"] == "binary_exceedance"
+
+
 def test_observable_phase_transport_sigmoid_gate_is_smooth_and_bounded() -> None:
     raw_gain = torch.tensor(((-30.0, 0.0, 30.0),), requires_grad=True)
     gate = ObservablePhaseTransportHead.gain_gate(raw_gain)
@@ -1255,6 +1349,193 @@ def test_orthogonal_source_phase_carrier_respects_null_support_and_zero_physical
         rtol=0.0,
     )
     assert {"carrier_rms", "carrier_orthogonality", "carrier_support"} <= diagnostics.keys()
+
+
+def test_carrier_support_modes_keep_continuous_formula_and_binary_is_detached(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = torch.randn(1, 3, 8, 8)
+    physical_bands = torch.randn(1, 3, 3, 8, 8)
+
+    def fixed_null(*_args: object) -> torch.Tensor:
+        return torch.full((1, 3, 2, 2), 0.5)
+
+    continuous = ObservablePhaseTransportHead(
+        (8, 16, 32, 32),
+        hidden=32,
+        carrier_mode="orthogonal_source",
+        support_epsilon=0.1,
+    )
+    monkeypatch.setattr(continuous, "phase_coherence", fixed_null)
+    continuous_coherence = torch.tensor(
+        [[[[0.2, 0.5], [0.7, 0.9]]] * 3], requires_grad=True
+    )
+    continuous_null, continuous_support, _ = continuous._carrier_null_calibrated_support(
+        source, physical_bands, continuous_coherence
+    )
+    continuous_excess = F.relu(continuous_coherence - continuous_null)
+    continuous_expected = continuous_excess / (
+        continuous_excess + continuous_null + continuous.support_epsilon
+    )
+    torch.testing.assert_close(continuous_support, continuous_expected, atol=0.0, rtol=0.0)
+    continuous_support.sum().backward()
+    assert continuous_coherence.grad is not None
+    assert int(torch.count_nonzero(continuous_coherence.grad)) > 0
+
+    binary = ObservablePhaseTransportHead(
+        (8, 16, 32, 32),
+        hidden=32,
+        carrier_mode="orthogonal_source",
+        carrier_support_mode="binary_exceedance",
+    )
+    monkeypatch.setattr(binary, "phase_coherence", fixed_null)
+    binary_coherence = torch.tensor(
+        [[[[float("nan"), 0.5], [0.5001, 0.2]]] * 3], requires_grad=True
+    )
+    binary_null, binary_support, _ = binary._carrier_null_calibrated_support(
+        source, physical_bands, binary_coherence
+    )
+    expected_binary = torch.tensor([[[[0.0, 0.0], [1.0, 0.0]]] * 3])
+    torch.testing.assert_close(binary_null, torch.full_like(binary_null, 0.5))
+    torch.testing.assert_close(binary_support, expected_binary, atol=0.0, rtol=0.0)
+    assert not binary_support.requires_grad
+    assert set(binary_support.unique().tolist()) <= {0.0, 1.0}
+
+
+def test_bnes_carrier_caps_and_support_control_only_the_carrier(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    small = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_gain_caps=(0.125, 0.0625, 0.025),
+        phase_transport_carrier_support_mode="binary_exceedance",
+    ).eval()
+    wide = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_support_mode="binary_exceedance",
+    ).eval()
+    wide.load_state_dict(small.state_dict())
+
+    def support_one(
+        _source_phase: torch.Tensor,
+        _physical_bands: torch.Tensor,
+        coherence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros_like(coherence)
+        return zeros, torch.ones_like(coherence), zeros
+
+    for head in (small.phase_transport_head, wide.phase_transport_head):
+        with torch.no_grad():
+            head.output[-1].bias.fill_(12.0)
+            head.carrier_head.bias.fill_(0.7)
+        monkeypatch.setattr(head, "_carrier_null_calibrated_support", support_one)
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = small.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    physical = torch.randn(1, 3, 32, 32)
+    small_delta, small_diagnostics = small.phase_transport_delta(pyramid, physical, SENTINEL2)
+    wide_delta, wide_diagnostics = wide.phase_transport_delta(pyramid, physical, SENTINEL2)
+    torch.testing.assert_close(
+        small_diagnostics["parallel_delta"], wide_diagnostics["parallel_delta"], atol=0.0, rtol=0.0
+    )
+    torch.testing.assert_close(
+        small_diagnostics["carrier_delta"],
+        0.25 * wide_diagnostics["carrier_delta"],
+        atol=1e-7,
+        rtol=1e-6,
+    )
+    assert int(torch.count_nonzero(small_diagnostics["carrier_delta"])) > 0
+    torch.testing.assert_close(small_diagnostics["carrier_support"], torch.ones_like(small_diagnostics["carrier_support"]))
+
+    with torch.no_grad():
+        small.phase_transport_head.carrier_head.bias.fill_(-0.7)
+    negative_delta, negative_diagnostics = small.phase_transport_delta(pyramid, physical, SENTINEL2)
+    torch.testing.assert_close(
+        negative_diagnostics["carrier_delta"],
+        -small_diagnostics["carrier_delta"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        negative_delta,
+        negative_diagnostics["parallel_delta"] + negative_diagnostics["carrier_delta"],
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    def support_zero(
+        _source_phase: torch.Tensor,
+        _physical_bands: torch.Tensor,
+        coherence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros_like(coherence)
+        return zeros, zeros, zeros
+
+    monkeypatch.setattr(small.phase_transport_head, "_carrier_null_calibrated_support", support_zero)
+    zero_delta, zero_diagnostics = small.phase_transport_delta(pyramid, physical, SENTINEL2)
+    torch.testing.assert_close(zero_diagnostics["carrier_delta"], torch.zeros_like(zero_delta))
+    torch.testing.assert_close(zero_delta, zero_diagnostics["parallel_delta"], atol=0.0, rtol=0.0)
+    assert not torch.equal(small_delta, wide_delta)
+
+
+def test_bnes_alignment_mask_excludes_null_regions_while_continuous_keeps_legacy_loss() -> None:
+    valid = torch.ones(1, 1, 8, 8)
+    support = torch.zeros(1, 3, 2, 2, requires_grad=True)
+    with torch.no_grad():
+        support[:, 0, 0, 1] = 0.001
+        support[:, 2, 1, 0] = 0.75
+    continuous_objective = JointObjective(
+        _haar_model(
+            phase_transport=True,
+            phase_transport_carrier_mode="orthogonal_source",
+        ),
+        [0.5, 0.5],
+    )
+    continuous_mask = continuous_objective._carrier_signed_alignment_mask(valid, support)
+    assert continuous_mask is valid
+    source = torch.randn(1, 3, 8, 8, requires_grad=True)
+    target_bands = tuple(torch.randn(1, 3, 8, 8) for _ in range(3))
+    legacy_loss = signed_phase_alignment_loss(source, target_bands, valid)
+    continuous_loss = signed_phase_alignment_loss(source, target_bands, continuous_mask)
+    torch.testing.assert_close(continuous_loss, legacy_loss, atol=0.0, rtol=0.0)
+
+    binary_objective = JointObjective(
+        _haar_model(
+            phase_transport=True,
+            phase_transport_carrier_mode="orthogonal_source",
+            phase_transport_carrier_support_mode="binary_exceedance",
+        ),
+        [0.5, 0.5],
+    )
+    mask = binary_objective._carrier_signed_alignment_mask(valid, support)
+    expected = torch.zeros_like(valid)
+    expected[..., :4, 4:] = 1.0
+    expected[..., 4:, :4] = 1.0
+    torch.testing.assert_close(mask, expected, atol=0.0, rtol=0.0)
+    assert not mask.requires_grad
+    empty_mask = binary_objective._carrier_signed_alignment_mask(
+        valid, torch.zeros_like(support)
+    )
+    torch.testing.assert_close(empty_mask, torch.zeros_like(valid), atol=0.0, rtol=0.0)
+    empty_loss = signed_phase_alignment_loss(
+        source,
+        target_bands,
+        empty_mask,
+    )
+    assert bool(torch.isfinite(empty_loss))
+    assert float(empty_loss.detach()) == 0.0
+    empty_loss.backward()
+    assert source.grad is not None
+    assert int(torch.count_nonzero(source.grad)) == 0
 
 
 def test_physical_gain_carrier_mode_preserves_legacy_phase_transport_formula() -> None:
@@ -2454,12 +2735,14 @@ def test_id_bridge_optimizer_updates_origin_and_checkpoint_ema(tiny_model: Senti
         "phase_transport_enabled": False,
         "phase_transport_hidden": 128,
         "phase_transport_gain_caps": (0.5, 0.25, 0.1),
+        "phase_transport_carrier_gain_caps": (0.5, 0.25, 0.1),
         "phase_transport_offset_caps_px": (0.5, 0.5, 0.5),
         "phase_transport_initial_gate": 0.02,
         "phase_transport_null_calibrated": False,
         "phase_transport_null_quantile": 0.75,
         "phase_transport_support_epsilon": 0.01,
         "phase_transport_carrier_mode": "physical_gain",
+        "phase_transport_carrier_support_mode": "continuous",
         "antithetic_weight": 0.0,
     }
 
@@ -2511,12 +2794,14 @@ def test_haar_id_bridge_optimizer_and_checkpoint_metadata() -> None:
         "phase_transport_enabled": False,
         "phase_transport_hidden": 128,
         "phase_transport_gain_caps": (0.5, 0.25, 0.1),
+        "phase_transport_carrier_gain_caps": (0.5, 0.25, 0.1),
         "phase_transport_offset_caps_px": (0.5, 0.5, 0.5),
         "phase_transport_initial_gate": 0.02,
         "phase_transport_null_calibrated": False,
         "phase_transport_null_quantile": 0.75,
         "phase_transport_support_epsilon": 0.01,
         "phase_transport_carrier_mode": "physical_gain",
+        "phase_transport_carrier_support_mode": "continuous",
         "antithetic_weight": 0.0,
     }
 
@@ -2805,6 +3090,8 @@ def test_orthogonal_source_phase_transport_trains_only_head_and_keeps_long_gaps_
         optical_innovation_band_scales=(0.0, 0.0, 0.0),
         phase_transport_null_calibrated=True,
         phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_gain_caps=(0.125, 0.0625, 0.025),
+        phase_transport_carrier_support_mode="binary_exceedance",
     )
     _set_trainable(model, "phase_transport")
     carrier_prefixes = (
@@ -2849,10 +3136,15 @@ def test_orthogonal_source_phase_transport_trains_only_head_and_keeps_long_gaps_
         "carrier_rms",
         "carrier_orthogonality",
         "carrier_oracle_fine",
+        "carrier_oracle_abs_fine",
         "carrier_oracle_active_fraction",
         "carrier_oracle_supported_fraction",
         "carrier_gate_fine",
+        "carrier_gate_abs_fine",
         "carrier_effective_fine",
+        "carrier_effective_abs_fine",
+        "carrier_support_fine",
+        "carrier_alignment_active_fraction",
         "carrier_delta_rms",
     ):
         assert f"sar2opt/{name}" in metrics
@@ -2900,6 +3192,8 @@ def test_orthogonal_source_phase_transport_uses_detached_carrier_oracle(
         optical_innovation_band_scales=(0.0, 0.0, 0.0),
         phase_transport_null_calibrated=True,
         phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_gain_caps=(0.125, 0.0625, 0.025),
+        phase_transport_carrier_support_mode="binary_exceedance",
     )
     _set_trainable(model, "phase_transport")
     objective = JointObjective(
@@ -2937,11 +3231,13 @@ def test_orthogonal_source_phase_transport_uses_detached_carrier_oracle(
 
     oracle_inputs: list[torch.Tensor] = []
     oracle_residuals: list[torch.Tensor] = []
+    oracle_caps: list[tuple[float, float, float]] = []
     original_oracle = training_module.phase_transport_signed_coefficient_target
 
     def capture_oracle(*args: object, **kwargs: object) -> torch.Tensor:
         oracle_inputs.append(args[0])  # type: ignore[arg-type]
         oracle_residuals.append(args[1])  # type: ignore[arg-type]
+        oracle_caps.append(tuple(args[3]))  # type: ignore[arg-type]
         return original_oracle(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(model, "phase_transport_delta", capture_delta)
@@ -2953,6 +3249,7 @@ def test_orthogonal_source_phase_transport_uses_detached_carrier_oracle(
     assert bool(torch.isfinite(loss))
     assert captured["carrier_components"].requires_grad
     assert len(oracle_inputs) == 1
+    assert oracle_caps == [(0.125, 0.0625, 0.025)]
     assert not oracle_inputs[0].requires_grad
     torch.testing.assert_close(oracle_inputs[0], captured["carrier_components"].detach())
     expected_residual = (

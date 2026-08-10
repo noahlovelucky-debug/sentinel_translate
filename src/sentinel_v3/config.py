@@ -159,6 +159,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise TypeError("model.phase_transport_hidden must be a positive integer")
     if hidden <= 0:
         raise ValueError("model.phase_transport_hidden must be positive")
+    model.setdefault("phase_transport_carrier_gain_caps", model["phase_transport_gain_caps"])
+    model.setdefault("phase_transport_carrier_support_mode", "continuous")
     for name in ("phase_transport_gain_caps", "phase_transport_offset_caps_px"):
         values = model[name]
         if not isinstance(values, (list, tuple)) or len(values) != 3:
@@ -169,6 +171,21 @@ def validate_config(config: dict[str, Any]) -> None:
         if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in normalized):
             raise ValueError(f"model.{name} must be finite and in [0, 1]")
         model[name] = normalized
+    carrier_gain_caps = model["phase_transport_carrier_gain_caps"]
+    if not isinstance(carrier_gain_caps, (list, tuple)) or len(carrier_gain_caps) != 3:
+        raise ValueError("model.phase_transport_carrier_gain_caps must contain three values")
+    if any(
+        isinstance(value, bool) or not isinstance(value, (int, float))
+        for value in carrier_gain_caps
+    ):
+        raise TypeError("model.phase_transport_carrier_gain_caps must contain numeric values")
+    normalized_carrier_gain_caps = [float(value) for value in carrier_gain_caps]
+    if any(
+        not math.isfinite(value) or not 0.0 <= value <= 1.0
+        for value in normalized_carrier_gain_caps
+    ):
+        raise ValueError("model.phase_transport_carrier_gain_caps must be finite and in [0, 1]")
+    model["phase_transport_carrier_gain_caps"] = normalized_carrier_gain_caps
     initial_gate = float(model["phase_transport_initial_gate"])
     if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
         raise ValueError("model.phase_transport_initial_gate must be finite and in (0, 1)")
@@ -186,6 +203,13 @@ def validate_config(config: dict[str, Any]) -> None:
     if model["phase_transport_carrier_mode"] not in {"physical_gain", "orthogonal_source"}:
         raise ValueError(
             "model.phase_transport_carrier_mode must be physical_gain or orthogonal_source"
+        )
+    if model["phase_transport_carrier_support_mode"] not in {
+        "continuous",
+        "binary_exceedance",
+    }:
+        raise ValueError(
+            "model.phase_transport_carrier_support_mode must be continuous or binary_exceedance"
         )
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:

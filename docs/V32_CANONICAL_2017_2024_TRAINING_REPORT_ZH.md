@@ -1,133 +1,211 @@
-# V3.2 Canonical 2017-2024 训练说明
+# V3.2 Canonical 2017-2024 训练与验收报告
 
-## 状态摘要
+更新时间：2026-08-10（Asia/Shanghai）
 
-- 原始数据源：`/data/data_disk/data_dir`。
-- 规范化数据集目标目录：`/data/datasets/sentinel_translate_v32_2017_2024`。
-- codec 修复提交：`c0639ba Stabilize SAR codec training`。启动器与报告基线提交：`17d225d`，不表示当前 HEAD。
-- SAR codec 的常量局部方差数学奇点已经修复；全套测试为 `207 passed`。
-- 8 卡 smoke 已运行至 320 step，越过此前约 220 step 的故障点并以 exit code 0 结束。
-- 正式 canonical 链已于 `2026-08-09 23:15:30+08:00` 启动，tmux 会话为 `sentinel_v32_canonical_full`；launcher 初始 PID 为 `325000`，physical torchrun 初始 PID 为 `325517`。
-- `23:17:54+08:00` 已切入 physical，8 个 rank 已确认；兼容加载为 520 tensors / new 177，启动验收 GPU 活动为 37-47%，无 OOM。
-- external temporal prior PID `214730` 已恢复并与 physical/codec 并行。最终训练效果尚未产生；按用户要求，本报告不持续监测训练。
+本文只记录 `/data/datasets/sentinel_translate_v32_2017_2024` 上已经完成的 canonical
+训练链。旧 463 样本协议、早期 source-anchor 实验和后续 NC-OPC 消融都与本报告分开，
+不得混用 checkpoint、指标或选模结论。
 
-`scripts/launch_canonical_2017_2024_8gpu.sh` 会先检查训练索引、manifest 和已完成 registration audit 的 HF sidecar。temporal prior 索引不存在时，launcher 会启动或接入已有的 prior 预计算，使其与 bootstrap、physical 和 codec 并行；进入 detail 前强制等待 prior 完成并严格检查索引存在。
+## 1. 最终状态
 
-## 数据集与协议
+- canonical 训练链已经完成：physical 7k、codec 20k、detail 9k、flow 6k、
+  phase transport 5k。
+- 141 样本 `validation_temporal` 上，Physical gate 和 SAR visual gate 通过。
+- Optical visual 的 RMSE、DISTS、Edge F1、PSD、越界率和逐场景风险通过；LPIPS
+  只改善 `3.7111%`，未达到 `5%`，所以 Optical visual、visual 和 joint gate 失败。
+- selection 只发布 `best_physical.pt`，没有 `best_visual.pt` 或 `best_joint.pt`。
+- 三个封闭 test split 尚未运行。当前不能把 visual 结果写成最终 test 或 SOTA 结论。
 
-原始 TIFF 不复制到训练目录。构建产物是排序的 manifest、协议 sidecar、HF eligibility sidecar 和规范化 patch shard。每个 patch 为 `256x256`，每个 SAR-S2 pair 最多 16 个确定性 patch。
+权威文件：
 
-| 项目 | 定义 |
+- validation：`reports_v32_canonical_2017_2024/final_validation.json`
+- selection：`checkpoints_v32_canonical_2017_2024/selection.json`
+- protocol hash：`f72deee58e7c421bd6af9d96164a272717564f94b7c227e4b38fa4e915f61606`
+
+GitHub 快照：
+
+- [`final validation 141`](results/v32_canonical_2017_2024_final_validation_141.json)
+- [`selection`](results/v32_canonical_2017_2024_selection.json)
+- [`canonical panel`](assets/v32_canonical_2017_2024_final_000_sar2opt.png)
+
+## 2. 数据集与防泄漏协议
+
+### 2.1 数据范围
+
+| 项目 | 数量与范围 |
 | --- | --- |
-| S2 输入 | 10 通道，严格顺序 `blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22` |
-| Optical 物理输出 | RGB 3 通道 |
-| SAR 输入/输出 | `vv, vh` 两通道 |
-| 训练有效性 | joint-valid、clear fraction、网格/CRS/shape/transform 约束均已在 manifest 构建阶段检查 |
-| HF 审计 | registration audit 后 14,622 个训练 patch 可作为高频候选 |
+| 原始训练候选 | 2,050 pair，2017-2022 |
+| 接受的训练 pair | 1,947；103 pair 因有效 patch 不足被拒绝 |
+| 训练 patch | 31,152，固定 `256 x 256`，每 pair 16 个 |
+| 高频合格 patch | 14,622，registration audited |
+| validation_temporal | 141 pair，全部 2023，固定中心 `256 x 256` crop |
+| test_spatial | 39 pair，2023，封闭 |
+| test_temporal | 131 pair，2024，封闭 |
+| test_joint | 62 pair，2024，封闭 |
 
-### 固定时空切分
+输入统一到 10 m 网格。Sentinel-2 使用 10 个 surface-reflectance 通道，顺序为
+`blue, green, red, rededge1, rededge2, rededge3, nir, nir08, swir16, swir22`；
+Sentinel-1 使用 `VV, VH` 两个 dB backscatter 通道。
 
-切分不使用随机 patch split。`row==5` 或 `col==5` 为 buffer；其后 `row==6` 或 `col==6` 为 spatial holdout，其余为 core。
+validation mask 只接受 SCL `2/4/5/6/7`。单位、通道顺序、中心 crop、mask 和 manifest
+SHA-256 都写入 `manifests/validation_protocol.json`，并通过 protocol hash 绑定到
+format-v4 checkpoint。旧 463 样本协议与本协议不兼容。
 
-| 集合 | pair 数与时间 | 用途 |
-| --- | --- | --- |
-| train 候选 | 2,050：2017 306、2018 299、2019 474、2020 603、2021 230、2022 138 | core 训练候选 |
-| train 通过 | 1,947 pair，31,152 patch | 有效 patch 检查通过的训练集 |
-| train 拒绝 | 103 pair | `insufficient_valid` |
-| validation_temporal | 141 pair，全部 2023 | 开发期唯一验证协议 |
-| test_spatial | 39 pair，全部 2023 | 最终选模后封闭测试 |
-| test_temporal | 131 pair，全部 2024 | 最终选模后封闭测试 |
-| test_joint | 62 pair，全部 2024 | 最终选模后封闭测试 |
-| buffer | 1,844 pair | 不训练 |
-| unused_spatial | 1,058 pair | 不训练 |
+### 2.2 高频审计
 
-三个 test split 在最终 checkpoint 选定前不得运行或参与超参数选择。新 `validation_temporal` protocol 的 manifest hash、样本数、中心裁剪、mask、单位和通道顺序绑定在 sidecar 与 format-v4 checkpoint 中；它与旧 463-sample protocol 不可混用，不得共享 report、gate、checkpoint resume 或 selection 结论。
+高频监督必须同时满足：
 
-## 模型与训练目标
+- 年份属于 2017-2022 train；
+- `delta_days <= 1`，其中 `0/1` 天权重为 `1.0/0.25`；更长时间差对 residual
+  参数严格零梯度；
+- local-structure NCC registration audit 的估计位移不超过 `0.5 px`；
+- 有效比例至少 `0.8`；云和阴影比例不超过 `0.2`。
 
-共享 physical 主干为 12 层、hidden 768、12 heads 的编码器，配有 rank-64 的方向 adapter 和方向输出头。codec 使用共享 trunk、模态 I/O，执行 4x 下采样的 16-channel latent 表示。detail 为多尺度确定性高频头；ResidualDiT 为 hidden 512、depth 8、heads 8。
+registration audit 使用局部结构梯度、`[-2, 2]` 像素搜索、NCC 至少 `0.10`，且相对
+零位移提升至少 `0.05` 才报告非零位移。审计版本和阈值保存在
+`hf_eligibility.json`。
 
-最终 phase 配置使用 48-channel two-level Haar packet residual state，以及 hidden 128 的 phase transport head。其 gain caps 为 `[0.5, 0.25, 0.1]`，并启用 null-calibrated 约束。
+## 3. 模型设置
 
-| Stage | 训练目标与主要损失 | 可训练参数 |
-| --- | --- | ---: |
-| physical | 跨模态物理基底的低误差确定性预测；重建、光谱/角度、SAR 偏差和对齐约束 | 109,238,278 |
-| codec | 固定 physical 残差的紧凑编解码；masked Charbonnier、梯度、频谱、局部频谱，SAR 另含稳定局部 speckle/variance 项 | 1,073,493 |
-| detail | source-supported 的确定性多尺度高频残差；重建、梯度、边缘、结构和稀疏约束 | 895,755 |
-| flow | 条件 rectified/residual flow：从条件起点运输 latent residual，拟合速度、端点和 rollout 高频/失真约束 | 36,790,705 |
-| phase_transport | 在受保护 source-aware anchor 上学习可观测的目标域 Laplacian detail；高频、phase alignment、gain utility、失真和周期性 perceptual 约束 | 652,166 |
+共享 physical 编码器为 12 层 Transformer，hidden 768、12 heads，方向 residual
+adapter rank 64。方向专用 decoder/radiometry head 分别输出 10 通道 Optical reflectance
+和 2 通道 SAR dB backscatter。
 
-flow 不是从纯噪声直接生成整幅图像。physical 基底先固定，codec/detail/flow/phase 仅对其残差高频建模；flow 通过条件化 latent residual 的 rectified transport 生成随机但受结构条件约束的部分。phase 进一步限制为受保护 anchor 之外、可观测且经 null calibration 支持的高频修正。
+高频组件为：
 
-最终模型总参数为 **195,533,271**。上述 stage 参数数是该阶段优化器实际开放的参数量，而不是五者相加后的独立模型总量。
+- shared residual codec：4 倍压缩、16-channel standardized latent，模态 I/O 独立；
+- multiscale detail head：从完整 FPN 预测确定性 residual；
+- Residual-DiT：hidden 512、8 层、8 heads；
+- phase transport：hidden 128、三频带 gain caps `[0.5, 0.25, 0.1]`，启用
+  cyclic-shift null calibration；
+- phase Optical residual state：two-level Haar packet，48 channels；SAR 保留兼容的
+  16-channel residual path。
 
-## 正式训练设置
+canonical 模型总参数为 `195,533,271`。各阶段实际开放的参数如下：
 
-所有正式阶段使用 8x A100、BF16、EMA、4 worker/rank、persistent worker、prefetch factor 2 和 activation checkpointing（physical 阶段启用）。除 phase 外，快速验证每 1,000 step；physical 的 full validation 为每 4,000 step，codec/detail/flow 为每 5,000 step；phase 的快速验证和保存每 500 step、full validation 在 5,000 step。physical/codec/detail/flow 的 early-stop patience 为 5，phase 为 10。
+| Stage | 可训练参数 | 核心目标 |
+| --- | ---: | --- |
+| physical | 109,238,278 | 低误差、光谱/角度、SAR 辐射与双向对齐 |
+| codec | 1,073,493 | residual 重建、梯度、频谱和 SAR 局部统计 |
+| detail | 895,755 | 可预测的多尺度高频 residual |
+| flow | 36,790,705 | conditional residual rectified flow 的 velocity/endpoint/rollout |
+| phase_transport | 652,166 | 受保护 anchor 外的可观测 Laplacian phase correction |
 
-| Stage | Steps | 每卡 batch | Accumulation | 全局有效 batch | 学习率 |
-| --- | ---: | ---: | ---: | ---: | --- |
-| physical | 20,000 | 2 | 4 | 64 | encoder `2e-6`，physical `1e-5`，adapter `1e-4` |
-| codec | 20,000 | 8 | 1 | 64 | `1e-4` |
-| detail | 20,000 | 4 | 2 | 64 | `1e-4` |
-| flow | 40,000 | 2 | 4 | 64 | `1e-4` |
-| phase_transport | 5,000 | 1 | 2 | 16 | `1e-4` |
+## 4. 实际训练过程
 
-物理阶段还使用 `physical_alignment_every=4` 的无偏稀疏对齐近似和 PCGrad；flow 使用 2-step rollout；phase 使用 1-step rollout，并按配置进行周期性 perceptual 计算。EMA 为 `.999`，phase 为 `.99`。
+所有阶段使用 8x A100、BF16、EMA、4 worker/rank、persistent workers 和 prefetch 2。
+physical 开启 activation checkpointing 和 PCGrad。表中 steps 是实际终点，不是配置上限。
 
-## 质量门槛
+| Stage | 实际 steps | 全局有效 batch | LR | 墙钟 |
+| --- | ---: | ---: | --- | ---: |
+| physical | 7,000 | 64 | encoder `2e-6`、main `1e-5`、adapter `1e-4` | 4:05:10 |
+| codec | 20,000 | 64 | `1e-4` | 0:53:43 |
+| detail | 9,000 | 64 | `1e-4` | 1:01:34 |
+| flow | 6,000 | 64 | `1e-4` | 1:58:24 |
+| phase_transport | 5,000 | 16 | `1e-4` | 0:35:57 |
 
-下游阶段只能继承同一 validation protocol hash 且已通过 physical gate 的 format-v4 checkpoint。checkpoint selection 也会验证 report 和 checkpoint 的 protocol hash 一致。
+正式 stage 墙钟约 8 小时 35 分；加上阶段间 calibration 和 artifact 检查，主链从
+2026-08-09 23:17:54 到 2026-08-10 08:13:13，共约 8 小时 55 分。
 
-**Physical gate** 必须同时满足：
+阶段事实：
 
-- SAR-to-Optical RMSE `<= 0.03909`。
-- SAR-to-Optical SAM `<= 5.716` 度。
-- Optical-to-SAR RMSE `<= 5.0 dB`。
-- Optical-to-SAR physical absolute bias `<= 0.5 dB`。
+1. physical 在 step 4k 产生最佳候选，训练到 7k 后早停；后续所有高频阶段冻结它。
+2. codec 在 20k 通过重建 gate：Optical MAE `0.002582`，SAR MAE `0.523176 dB`。
+3. raw detail 在 9k 没通过全图 gate；confidence calibration 只在可信区域发布，Optical
+   coverage 约 `0.216%`，因此不能把 standalone detail 写成已解决全图高频。
+4. flow 在 6k 早停。最终 phase 配置将 Optical stochastic innovation 和 correction
+   release 都设为零；SAR residual path 保持发布。
+5. phase transport 训练 5k，最终 Optical visual 的改善来自确定性 anchor 和 physical
+   phase detail，不来自随机彩色纹理。
 
-**Optical visual gate** 必须同时满足：
+## 5. 最终 141 样本结果
 
-- visual RGB RMSE 不高于 physical RGB RMSE 的 `1.05x`。
-- LPIPS improvement 与 DISTS improvement 均 `>= 0.05`。
-- visual edge F1 高于 physical edge F1，且 optical PSD distance 低于 physical。
-- pre-projection violation `<= 0.001`。
-- `scene_edge_or_dists_improved_fraction >= 0.70`。
-- `scene_rgb_rmse_degraded_over_5pct_fraction <= 0.10`。
+### 5.1 Physical
 
-**SAR visual gate** 要求 visual absolute bias `<= 0.5 dB`，且 visual PSD distance、ENL error、histogram distance、P01 error 和 P99 error 都低于对应的 SAR mean baseline。joint gate 要求 physical、Optical visual 和 SAR visual 三者全部通过。
+| 指标 | 结果 | 门槛 | 状态 |
+| --- | ---: | ---: | --- |
+| SAR -> Optical RMSE | `0.0326609` | `<= 0.03909` | 通过 |
+| SAR -> Optical SAM | `5.58075 deg` | `<= 5.716 deg` | 通过 |
+| Optical -> SAR RMSE | `4.50149 dB` | `<= 5.0 dB` | 通过 |
+| Optical -> SAR signed bias | `0.01087 dB` | `<= 0.5 dB` | 通过 |
 
-## 路径与执行链
+RGB-only physical RMSE 为 `0.02663915`。Physical 是论文中 RMSE、SAM 和辐射指标的
+主输出，不能用 best-of-K visual 样本替代。
 
-| 类型 | 路径 |
+### 5.2 Optical visual
+
+| 指标 | Physical | Visual | 状态 |
+| --- | ---: | ---: | --- |
+| RGB RMSE | `0.02663915` | `0.02695340` | ratio `1.01180`，通过 1.05 门槛 |
+| LPIPS | `0.199744` | `0.192331` | 改善 `3.7111%`，未到 5% |
+| DISTS | `0.204725` | `0.190849` | 改善 `6.7778%`，通过 |
+| Edge F1 | `0.439870` | `0.523919` | 改善 |
+| PSD distance | `0.00611677` | `0.00604207` | 改善 |
+| pre-projection violation | - | `0.016716%` | 通过 0.1% 门槛 |
+
+`94.33%` 场景 Edge 改善，`87.23%` 场景 DISTS 改善，`97.16%` 至少一项改善；
+`7.09%` 场景的 RGB RMSE 退化超过 5%，低于 10% 上限。唯一 aggregate 硬失败项是
+LPIPS，所以不能发布 Optical visual 或 joint checkpoint。
+
+### 5.3 SAR visual
+
+| 指标 | Physical/mean | Visual | 趋势 |
+| --- | ---: | ---: | --- |
+| signed bias | `0.01087 dB` | `0.01635 dB` | 均通过 |
+| PSD distance | `0.65475` | `0.28154` | 改善 |
+| ENL error | `0.18116` | `0.07391` | 改善 |
+| histogram distance | `0.004823` | `0.001350` | 改善 |
+| P01 error | `4.1113 dB` | `1.6178 dB` | 改善 |
+| P99 error | `5.3851 dB` | `2.9792 dB` | 改善 |
+
+SAR visual gate 通过。`scene_abs_bias` 约 `0.765 dB` 只作为离散场景诊断；正式 gate
+按协议使用跨场景 signed mean 后取绝对值，避免把正负偏差错误地当作同号系统偏差。
+
+## 6. 收尾故障与修复记录
+
+主训练权重没有损坏。原 launcher 在训练后收尾阶段曾失败，根因有三项：
+
+1. calibration 仍调用旧 `deterministic_detail/sample_residual` API，把 SAR 的 16-channel
+   状态送入 Optical 48-channel flow；现已统一走 `visual_detail/sample_visual_residual`。
+2. Optical calibration 原先计算 `sqrt(mean(scene MSE))`，SAR 原先计算 mean scene-abs
+   bias，与 evaluator 口径不一致；现已改为逐场景 RMSE 平均，以及 signed scene mean
+   聚合后取绝对值。
+3. selection 直接 `torch.save` 到 `best_physical.pt` 软链接可能覆盖原始 step checkpoint；
+   现已用同目录临时普通文件原子 replace。原始 physical step-4k SHA-256 前后保持
+   `62d6b9140c407ab7d60429262474376939c102c1b3e65af7e046f37dab27f729`。
+
+修复后 calibration 选择 Optical/SAR alpha 均为 `1.0`，正式评估和 selection 已成功完成。
+
+## 7. Artifact 与复现
+
+| Artifact | 路径 |
 | --- | --- |
 | 数据根 | `/data/datasets/sentinel_translate_v32_2017_2024` |
-| 配置 | `configs/canonical_2017_2024_{physical,codec,detail,flow,phase_transport}.yaml` |
-| Launcher | `scripts/launch_canonical_2017_2024_8gpu.sh` |
-| Checkpoint 根 | `/data/code/sentinel_translat/v3.2/checkpoints_v32_canonical_2017_2024` |
-| 日志 | `/data/code/sentinel_translat/v3.2/checkpoints_v32_canonical_2017_2024/logs/*.log` |
-| Report 根 | `/data/code/sentinel_translat/v3.2/reports_v32_canonical_2017_2024` |
-| 关键中间件 | `best_physical.pt`、`best_codec.pt`、`best_detail_calibrated.pt`、`flow_anchor_calibrated.pt`、`final_calibrated.pt` |
+| canonical config | `configs/canonical_2017_2024_*.yaml` |
+| launcher | `scripts/launch_canonical_2017_2024_8gpu.sh` |
+| stage checkpoints | `checkpoints_v32_canonical_2017_2024/{physical,codec,detail,flow,phase_transport}` |
+| calibrated checkpoint | `checkpoints_v32_canonical_2017_2024/final_calibrated.pt` |
+| selected physical | `checkpoints_v32_canonical_2017_2024/best_physical.pt` |
+| final validation | `reports_v32_canonical_2017_2024/final_validation.json` |
+| panels | `reports_v32_canonical_2017_2024/final_validation_panels` |
 
-launcher 支持同阶段 checkpoint resume。初始 physical 权重默认来自 `/data/code/sentinel_translat/v3.2/checkpoints_v32_temporal/best_physical.pt`，并使用 EMA 初始化。训练日志位于 checkpoint 根下的 `logs/`；不要把旧 protocol 的日志、报告或 checkpoint 放入这条选择链。
-
-按需人工查看即可：
+重新评估 validation：
 
 ```bash
-tmux attach -t sentinel_v32_canonical_full
-tail -n 100 -F /data/code/sentinel_translat/v3.2/checkpoints_v32_canonical_2017_2024/logs/physical.log
+CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src python -m sentinel_v3.cli \
+  --config configs/canonical_2017_2024_phase_transport.yaml \
+  evaluate \
+  --checkpoint checkpoints_v32_canonical_2017_2024/final_calibrated.pt \
+  --split validation_temporal \
+  --output reports_v32_canonical_2017_2024/final_validation.json
 ```
 
-## 时间预算与后续动作
+只有 `best_joint.pt` 存在时才允许运行三个 test split。当前该文件不存在，因此不要运行
+closed-test 命令。
 
-| 工作 | 估计时长 |
-| --- | --- |
-| temporal prior 预计算 | 约 4-6 小时，可与 physical/codec 并行 |
-| physical | 约 5-10 小时 |
-| codec | 约 2-4 小时 |
-| detail | 约 2-4 小时 |
-| flow | 约 12-20 小时 |
-| phase、校准与最终验证 | 约 3-6 小时 |
-| 总计 | 正式 GPU 链墙钟约 24-44 小时，保守预算 24-48 小时 |
+## 8. 结论
 
-早停可能缩短实际时长。总预算指正式 GPU 链墙钟；temporal prior 的大部分时间由 physical/codec 覆盖，但若 prior 异常缓慢，detail 前的强制等待会增加墙钟时间。本轮正式链已经启动；完成后根据最终 protocol-bound validation 和封闭 test report 做一次性验收，不在本报告中预先声明任何最终指标或视觉效果。
+本轮 canonical 训练已经完成了低误差 physical 和 SAR 高频统计恢复，也证明了 Optical
+确定性边缘增强可以在很小 RMSE 代价下改善 DISTS、Edge 和 PSD。它尚未完成 Optical
+感知门槛；当前发布物只能是 `best_physical.pt`。后续 NC-OPC 等实验必须继续使用同一
+validation protocol，并且只有在 validation 选模完成后才可解封 test。

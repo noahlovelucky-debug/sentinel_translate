@@ -1,485 +1,395 @@
-# Sentinel Translate V3.2：完整模型、监督标签、训练流程与当前结果
+# Sentinel Translate V3.2：当前完整流程、模型与结果
 
-更新日期：2026-08-09
+更新日期：2026-08-10（Asia/Shanghai）
 
 代码目录：`/data/code/sentinel_translat/v3.2`
 
-固定验证协议：`validation_temporal`，463 个样本，协议哈希：
-`891d34fe1e507ce66b8f6d7f93d096ad911f77112ad57fe22611c8ec4b46594b`
+本文是 V3.2 当前主线的单一事实来源。主线数据为 2017–2024 canonical 数据集，固定验证集为
+141 个 2023 样本。旧 463 样本、2017–2018 实验和失败的 learned-codec bridge 只作为消融，
+不能与当前 checkpoint 或指标混用。
 
-本文是 V3.2 当前状态的单一事实来源。文中严格区分“完整验证通过”、
-“完整验证未通过”和“仅 connectivity 实验”三种状态，不把设计或小样本结果写成最终结论。
+## 1. 当前结论
 
-## 1. 一页结论
+V3.2 是双方向、双输出的 Sentinel-1/Sentinel-2 条件图像生成模型：
 
-V3.2 是一个双向、双输出的 Sentinel-1/Sentinel-2 图生图模型：
-
-| 方向 | 输入 | 输出 | 单位 |
+| 方向 | 输入 | 目标 | 单位 |
 | --- | --- | --- | --- |
-| SAR→Optical | Sentinel-1 VV/VH | Sentinel-2 10 波段；visual 使用 RGB | 反射率 `[0,1]` |
-| Optical→SAR | Sentinel-2 10 波段 | Sentinel-1 VV/VH | dB |
+| SAR -> Optical | Sentinel-1 `VV,VH` | Sentinel-2 10 波段；感知评估使用 RGB | surface reflectance `[0,1]` |
+| Optical -> SAR | Sentinel-2 10 波段 | Sentinel-1 `VV,VH` | dB backscatter |
 
-模型不强迫同一个输出同时获得最低 RMSE 和最丰富纹理：
+两个输出承担不同目标：
 
 ```text
-physical = 确定性的辐射/低频/可辨识结构预测
+physical = deterministic radiometric prediction
 visual   = bounded(physical + observable_detail + sampled_innovation)
 ```
 
-- `physical` 是论文的 RMSE、SAM 和 bias 主结果，已在 463 样本上通过全部硬门槛。
-- Optical 当前最好的完整验证结果是 source-aware deterministic anchor：RMSE 只退化
-  `1.945%`，Edge F1 和 PSD 改善，但 LPIPS/DISTS 只改善 `3.35%/4.21%`，且
-  `12.31%` 场景 RMSE 退化超过 5%，因此仍未达到最终 Optical visual 门槛。
-- SAR visual 已能明显改善 PSD、ENL、直方图和 P01/P99 尾部，解决一部分“只生成中间
-  dB 值”的问题。
-- 新的 Identifiability-conditioned Haar residual flow 已通过单测、8 卡 smoke 和 100-step
-  connectivity。它修复了旧 codec bridge 的彩色格纹和 anchor 信息损失，但尚未证明带来
-  超过 source-anchor 的 Optical 增益，所以没有盲目启动 1k/40k 全量训练。
-- 当前结果还不能作为“完整双向 visual 已达到 SOTA”的论文结果；可以作为方法原型和
-  正负实验链条，最终投稿仍需 Optical 完整验证过门槛、消融和封闭 test。
+- `physical` 负责 RMSE、SAM、辐射和低频结构，141 样本的四个硬门槛全部通过。
+- Optical visual 的 RMSE、DISTS、Edge F1、PSD、越界率和多数场景风险通过；LPIPS 改善
+  `3.7111%`，没有达到 `5%`，因此尚不能发布 Optical visual 或 joint checkpoint。
+- SAR visual 已通过当前门槛，明显改善 PSD、ENL、直方图以及 P01/P99 亮暗尾部误差。
+- 当前 Optical visual 主要来自确定性 phase/anchor detail；随机纹理 release 为零。模型不是
+  “已经生成真实随机 RGB 纹理”，图像仍偏平滑。
+- 后续研究主线是 Null-Calibrated Orthogonal Phase Carrier（NC-OPC）：只在源图证据超过
+  循环移位空假设的频带/位置增加正交细节。连续支持的 1k 消融没有产生有效增益，正在验证
+  Binary Null-Exceedance Support（BNES）。这仍是 validation 阶段假设，不是论文结论。
 
-## 2. 输出接口与物理边界
-
-`translate(..., mode="physical"|"visual")` 保持兼容。
-
-`mode="visual"` 的 `TranslationResult` 提供：
-
-- `physical`：冻结的确定性底座；
-- `deterministic_detail`：可观测、可对齐的像素域细节；
-- `stochastic_residual`：Haar innovation flow 解码结果；
-- `residual_amplitude`：旧 codec flow 的幅度图，id bridge 路径可为空；
-- `pre_projection_violation`：合成前越界比例。
-
-Optical 不用 clamp 掩盖失控幅度。代码先计算线性候选的越界率，再将 detail/residual
-换算为 logit 增量并经 sigmoid 回到 `[0,1]`。SAR 在 dB 域相加，最后限制到
-`[-50,5] dB`。固定 seed 必须逐位可重复；主结果禁止 best-of-K。
-
-## 3. 数据与防泄漏协议
-
-### 3.1 数据范围
-
-- 训练只使用 2017–2018 train split。
-- validation/test 图像不得进入 physical、detail、codec、flow 或 calibration 训练。
-- 固定 manifest 决定 pair、中心 crop、有效 mask、通道顺序和单位。
-- 463 validation 报告只有 protocol hash 相同才可比较或选 checkpoint。
-
-### 3.2 高频样本审计
-
-高频监督只接受时相接近且配准可靠的 patch：
+权威产物：
 
 ```text
-delta_days = 0 -> weight 1.00
-delta_days = 1 -> weight 0.25
-delta_days = 2/3 -> weight 0.00
+dataset:    /data/datasets/sentinel_translate_v32_2017_2024
+checkpoint: checkpoints_v32_canonical_2017_2024/final_calibrated.pt
+physical:   checkpoints_v32_canonical_2017_2024/best_physical.pt
+validation: reports_v32_canonical_2017_2024/final_validation.json
+selection:  checkpoints_v32_canonical_2017_2024/selection.json
+protocol:   f72deee58e7c421bd6af9d96164a272717564f94b7c227e4b38fa4e915f61606
 ```
 
-`delta_days>1` 对所有 residual 参数必须精确零梯度。估计位移大于 `0.5 px`、云/阴影、
-低有效比例等 patch 由 `hf_eligibility` sidecar 排除；当前 sidecar 有 3,044 个可用 patch。
-时序先验也只索引 train acquisition，并采用 leave-one-out sidecar，防止目标帧泄漏。
+当前只有 `best_physical.pt` 可发布。三个封闭 test split 尚未运行。
 
-## 4. 完整模型框架
+GitHub 内可直接审计的结果快照：
+
+- [`v32_canonical_2017_2024_final_validation_141.json`](results/v32_canonical_2017_2024_final_validation_141.json)
+- [`v32_canonical_2017_2024_selection.json`](results/v32_canonical_2017_2024_selection.json)
+
+## 2. 数据、尺寸与防泄漏协议
+
+### 2.1 数据划分
+
+| Split | 年份 | 数量 | 用途 |
+| --- | ---: | ---: | --- |
+| train candidates | 2017–2022 | 2,050 pair | 训练候选 |
+| accepted train | 2017–2022 | 1,947 pair / 31,152 patch | physical 与阶段训练 |
+| high-frequency eligible | 2017–2022 | 14,622 patch | detail/flow/phase 高频监督 |
+| validation_temporal | 2023 | 141 pair | 选模与所有公开 validation 结论 |
+| test_spatial | 2023 | 39 pair | 封闭测试 |
+| test_temporal | 2024 | 131 pair | 封闭测试 |
+| test_joint | 2024 | 62 pair | 封闭测试 |
+
+训练每个接受 pair 固定提取 16 个 `256 x 256` patch；validation/test 使用固定中心
+`256 x 256` crop。全部数据对齐到 10 m 网格。Sentinel-2 通道顺序是
+`blue,green,red,rededge1,rededge2,rededge3,nir,nir08,swir16,swir22`，Sentinel-1 是
+`vv,vh`。
+
+验证有效 mask 只接受 SCL `2/4/5/6/7`。pair ID、crop、mask、通道、单位和 manifest hash
+共同绑定 format-v4 checkpoint；protocol hash 不同的报告禁止合并选模。
+
+### 2.2 高频资格
+
+高频 patch 必须同时满足：
+
+- 只来自 2017–2022 train，validation/test 零接触；
+- `delta_days=0/1` 权重分别为 `1.0/0.25`；更长时间差对 residual 参数精确零梯度；
+- local-structure NCC 注册审计位移不超过 `0.5 px`；
+- valid ratio 至少 `0.8`，cloud/shadow ratio 不超过 `0.2`；
+- train-only temporal prior 使用 leave-one-out，不能读取目标帧或 validation/test。
+
+注册审计在 `[-2,2]` 像素内搜索；NCC 至少 `0.10` 且相对零位移提升至少 `0.05` 才报告
+非零位移。方法版本和阈值保存在数据集 `hf_eligibility.json`。
+
+## 3. 完整模型
 
 ```mermaid
 flowchart TD
-    X[S1 VV/VH 或 S2 10波段] --> CP[动态物理通道投影]
-    CP --> FPN[H/1 H/2 H/4 H/8 CNN金字塔]
-    FPN --> TR[12层共享Transformer]
-    TR --> AD[3/6/9/12层方向rank-64 adapter]
-    AD --> RD[方向专用radiometric decoder]
-    RD --> P0[neural physical + log variance]
-    P0 --> TP[train-only时序先验 可选]
-    TP --> P[冻结physical]
+    X[S1 VV/VH 或 S2 10波段] --> F[方向输入头与 H/1..H/8 FPN]
+    F --> T[12层 shared Transformer]
+    T --> A[第3/6/9/12层 rank-64 direction adapters]
+    A --> R[方向 radiometric decoder]
+    R --> P[physical mean + log variance]
+    P --> M[train-only temporal calibration 可选]
+    M --> PF[冻结 physical]
 
-    FPN --> DA[可观测detail/physical频带anchor]
-    P --> DA
-    DA --> D[像素域observable detail]
+    F --> D[observable detail / phase anchor]
+    PF --> D
+    D --> DD[deterministic detail]
 
-    FPN --> IO[Identifiability origin head]
-    P --> IO
-    IO --> Z0[z0 = mu + sigma(q) epsilon]
-    FPN --> DIT[8层512维Residual-DiT]
-    Z0 --> DIT
-    DIT --> FM[Heun积分到Haar innovation endpoint]
-    FM --> IH[精确逆Haar]
-    IH --> R[sampled innovation]
+    F --> O[conditional origin: mu, sigma, q]
+    PF --> O
+    O --> Z0[z0 = mu + sigma(q) epsilon]
+    Z0 --> DT[8层 Residual-DiT]
+    F --> DT
+    DT --> B[residual rectified-flow bridge]
+    B --> IH[residual decoder / inverse Haar]
+    IH --> SR[stochastic residual]
 
-    P --> C[有界合成]
-    D --> C
-    R --> C
+    PF --> C[有界合成]
+    DD --> C
+    SR --> C
     C --> V[visual]
 ```
 
-这不是把一个自然图像扩散模型接在翻译器后面的简单拼接。physical、可观测 detail、
-不可辨识 innovation 使用同一个源图金字塔条件，并在统一的 residual 标签、失真预算和
-identifiability 场中训练；但当前 Optical innovation 的额外收益仍是待验证假设。
+### 3.1 Physical：低频、辐射与共享几何
 
-### 4.1 Physical：低频、辐射和共享几何
+- 四尺度 CNN/FPN 保留局部几何；H/8 token 进入 hidden 768、12 层、12 头 Transformer。
+- 第 3/6/9/12 层使用方向专用 rank-64 residual adapter。
+- Optical/SAR 使用各自的 decoder 和轻量 radiometric correction head。
+- 输出目标均值与 log variance；训练可使用 PCGrad 处理共享参数的双方向冲突。
+- metadata 包含 GSD、季节和轨道信息；有可靠 train-only temporal prior 时校准，无覆盖时
+  精确回退 neural physical。
 
-- 每个输入波段使用物理描述符，支持 S1/S2 不同通道数与物理含义。
-- CNN 保留四尺度空间特征；H/8 进入 hidden=768、12 层、12 头 Transformer。
-- 第 3/6/9/12 层各有 Optical/SAR rank-64 residual adapter。
-- 方向专用 decoder 输出目标均值和 log variance，并使用完整 FPN 恢复空间结构。
-- 条件包含输入/目标 GSD、季节、轨道等 metadata；共享参数双任务训练可使用 PCGrad。
-- train-only temporal prior 有覆盖时做季节辐射修正，无覆盖时严格回退 neural physical。
+Physical 的标签是完整目标图像 `y`，不是模糊图或低通伪标签。Optical 约束像素、NLL、
+梯度、局部结构、SAM、光谱幅度和偏差；SAR 还约束 VV/VH 关系与 dB bias。通过门槛后
+physical checkpoint 在所有高频阶段冻结。
 
-physical 的标签就是目标传感器完整像素，不是低通后的伪标签。Optical 联合像素、NLL、
-梯度、局部结构、SAM、光谱幅度和 bias；SAR 还约束 VV/VH 关系及 dB bias。
+### 3.2 确定性高频
 
-### 4.2 可观测 deterministic detail
-
-旧的学习式 `MultiscaleDetailHead` 使用 H/1–H/8 FPN、三层 Laplacian band、
-Charbonnier/gradient/Edge/local-SSIM 和置信度门控。完整校准发现它能安全释放的覆盖率接近
-零，说明跨模态逐像素回归全部残差不可行。
-
-当前效果最好的 Optical detail 改为 source-aware physical anchor：
-
-1. 对冻结 `physical_rgb` 做三层 Laplacian 分解；
-2. 基础 fine-band scale 为 `0.20`；
-3. physical 纹理密度高的 4×4 区域额外增加 `0.10`；
-4. source FPN 高频密度超过场景均值 `1.30×` 的区域额外增加 `0.70`；
-5. 最后再次 high-pass，确保不会改写 physical 的低频辐射。
-
-这些系数来自 validation calibration，并已在 463 样本报告中验证。它主要增强源图可支持的
-边界，而不尝试确定性猜测 SAR 中不存在的 RGB 颜色纹理。
-
-### 4.3 当前高频状态：精确 Haar innovation
-
-旧 residual codec 对自身重建可以过 gate，但 id bridge 的 latent 只要稍微偏离训练流形，
-decoder 就会放大为彩色 checkerboard。修正后的状态不再经过 learned codec：
-
-- 对 residual 做两层正交 Haar packet，H/4 网格每个视觉通道有 16 个系数；
-- Optical 为 `3×16=48` 通道；SAR 为 `2×16=32`，零填充到 48；
-- 每个视觉通道的 LL→LL 系数强制为零，SAR padding 也始终为零；
-- Optical/SAR 固定标准化 scale 分别为 `0.03/4.0`；
-- 逆变换是精确的，不存在 learned decoder 的离流形放大。
-
-因此 flow 只允许修改两层 Haar 支持下的正交高频子空间，不能偷偷改变低频。
-
-### 4.4 Identifiability-conditioned origin 与 Residual-DiT
-
-origin head 同时读取 source FPN 和 physical Haar 高频，输出：
+令 `p=stopgrad(physical)`，`M` 为有效 mask，`H` 为零低频响应的高通算子：
 
 ```text
-mu             : 条件可预测的 innovation 中心
-log_sigma      : 每位置/通道不确定度
-q logits (3带) : 三个频带的 identifiability/reliability
+target_detail = H((y - p) * M) * M
+det_detail    = observable_detail(source_FPN, physical_pyramid)
+texture_gt    = target_detail - stopgrad(det_detail)
 ```
 
-Residual-DiT 为 `D=512`、8 层、8 头。H/1、H/2、H/4、H/8 分别投影到 H/4 latent 网格，
-通过零初始化 gate 注入每层；DiT 输出层也为零初始化。当前 observable-anchor 配置中：
+原始 `MultiscaleDetailHead` 读取 H/1、H/2、H/4、H/8 FPN，以 Charbonnier、梯度、Edge、
+local SSIM 和分频损失学习跨模态可预测边缘。canonical 训练中它的安全释放覆盖很低，不能
+承担全图高频。
+
+当前 Optical 使用受保护的三频带 phase/anchor：只搬运 physical 与 source 共同支持的亮度
+结构，不确定颜色不做确定性猜测。NC-OPC 在此基础上增加一个严格加法嵌套项：
 
 ```text
-z0 = mu + flow_noise_scale * sigmoid(log_sigma) * (1-q) * epsilon
-z1 = Haar(texture_innovation_gt)
-zt = (1-t) z0 + t z1
+new_detail = frozen_parallel_detail + orthogonal_source_carrier
+```
+
+carrier 先相对 physical 频带亮度做局部正交化，再用循环移位 source 构造 null coherence。
+零初始化保证新模型 step 0 与 canonical phase checkpoint 逐位一致；carrier 关闭时也必须精确
+回退。BNES 只在真实 coherence 大于 null coherence 的位置开放载波，目标是避免连续支持把
+梯度压到不可见量级。
+
+### 3.3 随机高频与 residual bridge
+
+共享 residual codec 是 4 倍压缩、16-channel standardized latent，Optical/SAR 使用独立
+I/O heads。主 Residual-DiT 为 hidden 512、8 层、8 头，四尺度条件经过零初始化 gate 注入。
+
+Optical 的 phase-identifiability 路线使用 two-level Haar packet residual state：RGB 每通道
+16 个系数，共 48 通道；LL->LL 系数固定为零，防止随机分支改写 physical 低频。SAR 当前
+发布路径保留经验证的 16-channel residual state。离开训练流形后产生彩色 checkerboard 的
+旧 learned-codec Optical bridge 已否决，不是当前最佳模型。
+
+conditional origin 预测 `mu`、`log_sigma` 和三个频带的 identifiability `q`：
+
+```text
+z0 = mu + flow_noise_scale * sigmoid(log_sigma) * (1 - q) * epsilon
+z1 = standardized paired texture_gt residual
+zt = (1 - t) * z0 + t * z1
 velocity_gt = z1 - z0
 ```
 
-推理用固定 seed 采样 `epsilon`，以 Heun 积分从 `t=0` 到 `t=1`，然后按 `q` 和方向
-innovation scale 门控并精确逆 Haar。
+推理以固定 seed 从 `z0` 积分到 residual endpoint。它是带条件中心的 residual rectified-flow
+bridge，不是 DDPM，也不是从纯高斯噪声重新生成整幅图。生成自由度只作用于 physical 未解释
+的 residual。Optical 当前校准将 stochastic release 设为零；SAR stochastic residual 已发布。
 
-## 5. 标签到底是什么
+### 3.4 合成与接口
 
-令 `y` 为目标、`p=stopgrad(physical)`、`M` 为有效 mask、`H` 为高通投影，
-`d_obs` 为冻结像素域 observable anchor。
+`translate(..., mode="physical"|"visual")` 保持兼容。`TranslationResult` 可返回：
 
-### 5.1 SAR→Optical
+- `physical`
+- `deterministic_detail`
+- `stochastic_residual`
+- `residual_amplitude`
+- `pre_projection_violation`
 
-```text
-full_residual_gt = H((y_rgb - p_rgb) * M) * M
-d_obs             = source_aware_physical_anchor(p_rgb, source_FPN)
-innovation_gt     = P_Haar((full_residual_gt - d_obs) * M)
-z1                = Haar(innovation_gt) / 0.03
-visual            = bounded(p_rgb + d_obs + Haar_inverse(z_hat))
-```
+Optical 先报告线性候选的越界比例，再转换为 logit-space 增量并 sigmoid 到 `[0,1]`；不能用
+clamp 掩盖幅度失控。SAR 在 dB 域合成并约束到合法显示范围。主结果使用预注册 fixed seed，
+禁止 best-of-K。
 
-当前 100-step connectivity 配置将 Optical `innovation_scale=0`，即先验证像素 anchor 能
-逐项无损保留，避免未成熟随机纹理破坏结果。训练仍给 DiT endpoint/velocity 梯度，用于
-诊断 innovation 是否可学；只有 quick/full 验证证明改善后才允许发布非零 transport。
+## 4. 监督标签与损失
 
-### 5.2 Optical→SAR
+### 4.1 Physical 标签
 
 ```text
-full_residual_gt = P_Haar((y_db - p_db) * M)
-d_obs            = 0
-innovation_gt    = full_residual_gt
-z1               = Haar(innovation_gt) / 4.0
-visual_db        = bounded(p_db + Haar_inverse(z_hat))
+SAR -> Optical: y = 10-channel surface reflectance
+Optical -> SAR: y = 2-channel VV/VH dB backscatter
 ```
 
-SAR 的随机 speckle 和强/弱散射尾部不能逐像素唯一恢复，因此不以 sampled visual 的
-单次 RMSE 作为真实性结论，而评价 bias、径向 PSD、ENL、histogram 和 P01/P99。
-
-### 5.3 Identifiability 伪标签与损失
-
-`q_oracle` 由 source 高频与三频带 target residual 的局部一致性构造，只用于训练；推理
-只由 source+physical 预测 `q`。总目标包含：
-
-- robust velocity loss；
-- 单步 endpoint 高频重建、gradient、spectrum，SAR 再加 speckle-scale；
-- origin correction 的可靠区拟合/不可靠区收缩；
-- `q` 的 BCE 与 `sigma` 幅度校准；
-- Optical 的 `d_obs + decode(mu)` 高频监督；
-- rollout visual 的 5% RMSE hinge、LPIPS/DISTS；
-- SAR rollout 的高频统计损失。
-
-physical 在所有高频阶段冻结，以上损失不能反向改变已通过门槛的低频底座。
-
-## 6. 是从噪声恢复，还是桥扩散
-
-准确答案是：**当前是带条件中心的 residual rectified-flow bridge，不是 DDPM，也不是从
-纯噪声生成整幅图。**
-
-- 它没有 DDPM 的离散加噪/去噪马尔可夫链，也不预测 diffusion noise schedule。
-- 它在 residual Haar state 中，从 `mu + sigma(q)epsilon` 连续输运到配对目标 residual
-  endpoint；所以具有“桥”的起点/终点语义。
-- `mu` 来自 source+physical，`sigma` 只在低 identifiability 区域开放随机自由度。
-- 最终生成的是 physical 未解释的创新，而不是重新生成已正确的整幅 RGB/SAR。
-- 旧 codec route 是“高斯噪声到 learned residual latent”的标准 conditional rectified
-  flow；已因 decoder 离流形伪影被否决。
-
-## 7. 从 physical 到高频的实际开发与训练顺序
-
-### A. 统一协议并修复 physical
-
-1. 固定 463 pair/crop/mask/unit/hash。
-2. 同协议重评旧 Mean/Refiner/多个 physical step。
-3. 加方向 adapter、radiometric head 和 PCGrad 恢复双向门槛。
-4. 通过完整验证后冻结 checkpoint；旧 checkpoint 只允许 `--init-model`，不恢复旧 optimizer。
-
-### B. 审计高频数据
-
-1. 只使用 train 2017–2018。
-2. 生成 temporal prior 和 `hf_eligibility` sidecar。
-3. 强制 `delta_days=0/1` 权重 `1/0.25`，其余 residual 零梯度。
-
-### C. 已验证/否决的高频路线
-
-1. 学习式 detail：安全覆盖率接近零，保留代码但不作为当前成功结果。
-2. learned residual codec：重建 gate 通过，但 bridge step1000 产生严重彩色格纹，否决。
-3. 无 anchor 的 exact Haar flow：step100 无格纹且 RMSE 安全；继续到 step600 Optical
-   感知指标单调恶化，提前停止。
-4. source-aware pixel anchor：完整 463 上接近最终门槛，是当前最好 Optical visual。
-5. pixel anchor + Haar innovation：修正 anchor 被 Haar 投影损失的问题；完成 128 单测、
-   8 卡双向 smoke 和 step100 quick32。当前 step100 与纯 anchor 基线几乎完全一致，说明
-   表示修复成立，但尚无新增 Optical 收益。
-
-### D. 扩训规则
+### 4.2 Detail 与 flow 标签
 
 ```text
-64-patch/100-step connectivity
-    -> quick32 确实优于 anchor 才跑 1k
-    -> 1k 通过 RMSE/越界/无伪影才跑 5k
-    -> 5k 完整463全部过门槛才跑 20k/40k
-    -> 最后5k只校准 q/sigma/amplitude，不解冻 physical
+r_full     = H((y - p) * M) * M
+d_obs      = deterministic observable detail
+r_texture  = r_full - stopgrad(d_obs)
+z1         = codec_or_Haar(r_texture), standardized
+z0         = conditional origin mu + calibrated noise
+v_target   = z1 - z0
 ```
 
-这套 stop rule 的目的不是节省工程时间，而是防止用训练规模掩盖错误生成分布。当前没有
-启动 1k，是因为 step100 只证明“无损保留 anchor”，还没证明 Optical innovation 有收益。
+Flow 同时约束 robust velocity、单步 endpoint、rollout endpoint、gradient、DISTS 和频谱；
+SAR 额外约束径向 PSD、ENL、局部方差、CDF/直方图与 P01/P99。幅度、q 与 sigma 必须校准，
+随机 residual 的条件均值接近零，不能系统性搬动 physical radiometry。
 
-## 8. 当前定量结果
+### 4.3 NC-OPC 标签
 
-### 8.1 Physical：完整 463，已通过
+训练先从目标高频中减去冻结 anchor 和 parallel phase prediction，再计算 source carrier 对
+剩余三频带 residual 的 signed oracle coefficient。只在有效且超过 null 的 support 上计算
+signed alignment；无 support 时 loss 必须有限且精确为零。其目的不是重建 target-only 纹理，
+而是检验 source 中是否存在被 frozen parallel 路径遗漏、且可传输到目标的方向性结构。
 
-| 指标 | 当前值 | 硬门槛 | 状态 |
+## 5. 实际训练链
+
+canonical 主链使用 8x A100、BF16、EMA、4 worker/rank、persistent workers 和 prefetch 2。
+
+| Stage | 实际 step | 有效 global batch | LR | 墙钟 |
+| --- | ---: | ---: | --- | ---: |
+| physical | 7,000 | 64 | encoder `2e-6`，main `1e-5`，adapter `1e-4` | 4:05:10 |
+| codec | 20,000 | 64 | `1e-4` | 0:53:43 |
+| detail | 9,000 | 64 | `1e-4` | 1:01:34 |
+| flow | 6,000 | 64 | `1e-4` | 1:58:24 |
+| phase_transport | 5,000 | 16 | `1e-4` | 0:35:57 |
+
+正式 stage 合计约 8 小时 35 分；含阶段间 calibration 与检查，主链约 8 小时 55 分。
+physical 最佳候选是 step 4k，后续始终冻结。codec 达到 Optical MAE `0.002582`、SAR MAE
+`0.523176 dB`；detail 和 flow 因验证无改善分别在 9k/6k 停止。
+
+高频实验遵循逐级 stop rule：
+
+```text
+64 patch / 100 step connectivity
+  -> 1k quick32 pilot
+  -> 5k full-141 validation
+  -> 20k-40k full training
+  -> 5k calibration
+```
+
+每一级都必须保持 physical 逐位不变、`delta_days>1` residual 零梯度、fixed seed 可复现，
+并通过 RMSE/越界/伪影门槛。训练规模不能覆盖错误的生成分布。
+
+## 6. 当前 141 样本结果
+
+### 6.1 Physical：已完成
+
+| 指标 | 当前值 | 门槛 | 状态 |
 | --- | ---: | ---: | --- |
-| SAR→Optical RMSE | 0.0382369 | ≤ 0.03909 | 通过 |
-| SAR→Optical SAM | 5.59574° | ≤ 5.716° | 通过 |
-| Optical→SAR RMSE | 4.87565 dB | ≤ 5.0 dB | 通过 |
-| Optical→SAR signed bias | 0.15234 dB | ≤ 0.5 dB | 通过 |
+| SAR -> Optical RMSE | `0.0326609` | `<=0.03909` | 通过 |
+| SAR -> Optical SAM | `5.58075 deg` | `<=5.716 deg` | 通过 |
+| Optical -> SAR RMSE | `4.50149 dB` | `<=5.0 dB` | 通过 |
+| Optical -> SAR signed bias | `0.01087 dB` | `<=0.5 dB` | 通过 |
 
-报告：[v32_physical_full_463.json](results/v32_physical_full_463.json)。
+### 6.2 Optical visual：尚差一个硬指标
 
-### 8.2 当前最佳 source anchor：完整 463
-
-| Optical 指标 | Physical | Visual | 结果 |
+| 指标 | Physical | Visual | 结果 |
 | --- | ---: | ---: | --- |
-| RGB RMSE | 0.0244237 | 0.0248987 | `1.01945×`，通过 5% aggregate guardrail |
-| LPIPS | 0.258653 | 0.249987 | 改善 `3.35%`，未到 5% |
-| DISTS | 0.241518 | 0.231339 | 改善 `4.21%`，未到 5% |
-| Edge F1 | 0.422152 | 0.478237 | 改善 |
-| PSD distance | 0.00519312 | 0.00517585 | 改善 |
-| 合成前越界 | - | `0.00496%` | 通过 |
-| 场景 RMSE 退化>5% | - | `12.31%` | 未到 ≤10% |
+| RGB RMSE | `0.0266392` | `0.0269534` | `1.01180x`，通过 |
+| LPIPS | `0.199744` | `0.192331` | 改善 `3.7111%`，未到 5% |
+| DISTS | `0.204725` | `0.190849` | 改善 `6.7778%`，通过 |
+| Edge F1 | `0.439870` | `0.523919` | 改善 |
+| PSD distance | `0.00611677` | `0.00604207` | 改善 |
+| pre-projection violation | - | `0.016716%` | 通过 |
 
-`73.87%` 场景 Edge 改善，`79.48%` 场景 DISTS 改善。报告：
-[v32_source_anchor_full_463.json](results/v32_source_anchor_full_463.json)。
+`94.33%` 场景 Edge 改善，`87.23%` DISTS 改善，`97.16%` 至少一项改善；`7.09%`
+场景 RGB RMSE 退化超过 5%，低于 10% 上限。LPIPS 是唯一 aggregate 硬失败项。
 
-同一 checkpoint 的 SAR visual 也改善：PSD `0.44849→0.24542`、ENL error
-`0.11401→0.06870`、histogram `0.004137→0.001469`、P01 error
-`4.0265→1.8455 dB`、P99 error `6.1391→4.5238 dB`。
+### 6.3 SAR visual：当前通过
 
-### 8.3 pixel anchor + Haar innovation：step100 quick32
-
-| 指标 | Source-anchor quick32 | 新 bridge step100 | 结论 |
+| 指标 | Physical/mean | Visual | 结果 |
 | --- | ---: | ---: | --- |
-| Visual/Physical RMSE | 1.018319× | 1.018319× | 无损保留 |
-| LPIPS 改善 | 3.1939% | 3.1931% | 基本相同 |
-| DISTS 改善 | 3.9404% | 3.9411% | 基本相同 |
-| Edge F1 | 0.433289 | 0.433265 | 基本相同 |
-| RMSE退化>5%场景 | 9.375% | 9.375% | 通过 quick 门槛 |
+| signed bias | `0.01087 dB` | `0.01635 dB` | 通过 |
+| PSD distance | `0.65475` | `0.28154` | 改善 |
+| ENL error | `0.18116` | `0.07391` | 改善 |
+| histogram distance | `0.004823` | `0.001350` | 改善 |
+| P01 error | `4.1113 dB` | `1.6178 dB` | 改善 |
+| P99 error | `5.3851 dB` | `2.9792 dB` | 改善 |
 
-报告：[v32_id_bridge_pixel_anchor_step100_quick32.json](results/v32_id_bridge_pixel_anchor_step100_quick32.json)。
-这证明像素 anchor 不再被 Haar 丢失，但不能解释为 innovation 已经改善 Optical。
+### 6.4 NC-OPC 消融状态
 
-### 8.4 两个关键失败对照
+严格 phase-5k quick32 baseline：RMSE ratio `1.0153973`，LPIPS 改善 `4.0671%`，DISTS
+改善 `6.8158%`。连续 null support 的 1k pilot 从 step 250 到 1000 与 baseline 的变化均不
+超过约 `0.0013` 个百分点；carrier delta RMS 仅 `4.1e-6` 到 `1.8e-5`。这不是数值崩溃，
+而是支持幅度过小，所以该版本不扩训。BNES 必须先证明 carrier delta 可测且不破坏 baseline，
+才允许进入完整 141 验证。
 
-- learned-codec id bridge step1000：RMSE `1.3897×`，LPIPS/DISTS 分别恶化约
-  `115.9%/61.0%`，面板出现彩色 checkerboard；已否决。
-- unanchored exact-Haar：step100 RMSE `1.0091×` 且无 checkerboard；训练到 step600
-  后 RMSE `1.0637×`、LPIPS/DISTS 恶化 `18.87%/13.39%`，说明表示正确不等于目标
-  transport 正确；已提前停止。
+## 7. 可视化解读
 
-对应报告都保存在 [docs/results](results/) 中，失败结果不会被覆盖或删除。
+canonical panel 位于：
 
-## 9. 当前可视化如何解读
+```text
+reports_v32_canonical_2017_2024/final_validation_panels
+```
 
-### 9.1 当前最佳 source anchor
+![Canonical SAR to Optical example](assets/v32_canonical_2017_2024_final_000_sar2opt.png)
 
-![Source-aware anchor](assets/v32_source_anchor_sar2opt.png)
+SAR -> Optical 面板通常依次显示 Input、Physical、Detail、Texture、Visual、Reference：
 
-从左到右为 Input SAR、Physical、Detail、Texture、Visual、Reference。
+- Physical 已恢复大尺度色彩、地物布局和辐射，但道路、屋顶和田块内部仍偏平滑。
+- Detail 的亮/暗是有符号 residual 的显示，不是白色/黑色地物。
+- Texture 全黑表示当前 Optical stochastic release 精确为零，不是缺数据。
+- Reference 的成片纯黑或不规则黑洞通常在 valid mask 外或原始数据无效；不能解释为真实
+  黑色地表。
+- Visual 比 Physical 边缘更清晰，DISTS/Edge/PSD 已改善，但没有恢复 target 独有的颜色与
+  细纹理，因此不能把它描述成真实高频已解决。
 
-- Physical 已恢复大尺度颜色、地物布局和辐射，但屋顶、道路、田块边缘仍偏平滑。
-- Detail 是有正负号的 residual 可视化。显示为白/亮表示绝对响应强，不代表白色地物；
-  黑色表示该位置 detail 接近零。
-- Texture 为黑是当前 Optical innovation 没有发布，不是缺数据。
-- Visual 相比 Physical 的边缘更清晰，统计上 Edge/DISTS/LPIPS 都改善，但远没有恢复
-  Reference 中全部独有颜色和细纹理。
-- Reference 中成片纯黑/不规则黑洞通常是 valid mask 外或原数据无效区，不能解释为真实
-  黑色地表；SAR 面板中的正常暗像素则可能是真实低后向散射。
+Optical -> SAR 中，白亮通常是强后向散射，深色是低后向散射。Visual 已恢复更多 speckle
+以及强/弱散射尾部；这些随机细节不可能逐像素对应唯一 reference，因此用 PSD、ENL、CDF、
+P01/P99 和 bias 评价，而不是挑选最像 reference 的 seed。
 
-### 9.2 被否决的 codec flow
+历史示例仍保留在 `docs/assets`；其中 failed codec flow 的彩色格纹是伪影，不是有效纹理。
 
-![Failed codec flow](assets/v32_v4_optical_failed.png)
+## 8. 完成目标的标准
 
-该图中的彩色散点/格纹不是“更丰富的高频”，而是 learned decoder 把离流形 latent
-误差放大后的伪影。虽然某些频谱统计可能变近，但 LPIPS/DISTS 和逐场景 RMSE 明显变坏，
-因此不能用肉眼锐度或 PSD 单项把它写成成功。
+Physical 已完成，但最终 visual 只有同时满足以下条件才算整个目标完成：
 
-### 9.3 SAR visual
-
-![SAR visual](assets/validation_000_opt2sar.png)
-
-- Mean VV/VH 是 physical，倾向条件中值，亮暗尾部不足。
-- Sample VV/VH 增加 speckle 和强/弱散射尾部；目前统计上比 mean 更接近 reference。
-- SAR 的白亮通常是强后向散射，深色是低后向散射；只有 mask 外纯黑才表示无数据。
-- 随机 speckle 不可能逐像素恢复唯一真值，所以 fixed-seed sample 用分布统计评价。
-
-## 10. 什么水平才算完成目标
-
-### Physical（已完成）
-
-完整 463 validation 同时通过 RMSE/SAM/bias 四项门槛，且高频训练后逐项不变。
-
-### Optical visual（尚未完成）
-
-- RGB RMSE ≤ `1.05 × Physical`；
-- LPIPS 与 DISTS 各改善 ≥5%；
+- Physical 四个门槛在最终 checkpoint 上保持通过；
+- Optical RGB RMSE `<=1.05 x Physical`；
+- LPIPS 和 DISTS 各改善至少 5%；
 - Edge F1 提高且 Optical PSD distance 降低；
-- 合成前越界 ≤0.1%；
+- pre-projection violation `<=0.1%`；
 - 至少 70% 场景 Edge F1 或 DISTS 改善；
-- RMSE 退化超过 5%的场景 ≤10%；
-- texture-rich/sparse、时相和地类切片不能由少数容易场景掩盖。
+- RMSE 退化超过 5% 的场景不超过 10%；
+- SAR bias `<=0.5 dB`，PSD、ENL、histogram、P01/P99 全部优于 physical；
+- texture-rich/sparse、地类和时间切片一致，paired Wilcoxon + Holm `p<0.05`，报告 95%
+  bootstrap CI；
+- validation 选模锁定后，三个封闭 test split 均支持结论；禁止 best-of-K。
 
-### SAR visual（当前验证已通过，最终仍需随最终 checkpoint 复核）
+## 9. 论文定位与创新假设
 
-- signed bias ≤0.5 dB；
-- PSD、ENL、histogram、P01/P99 全部优于 physical mean；
-- 多 seed 有纹理差异，但局部均值和结构方差受控。
+当前论文主张候选是 **Null-Calibrated Orthogonal Residual Bridge**，而不是模块列表：
 
-validation 选模完成后才能运行三个封闭 test split。论文表格使用预注册 fixed seed；多 seed
-只用于覆盖率和分布校准，禁止 best-of-K。
+1. 先用硬门槛冻结可识别的跨模态辐射和低频；
+2. 将可观测结构与不可辨识纹理分离，生成分支不能改写低频；
+3. 用 source cyclic-shift null 作为样本内反事实，只有超过空假设的方向性证据才能进入
+   orthogonal carrier；
+4. additive zero-init nesting 让每次方法升级都有严格、可复现实验对照；
+5. residual bridge 只生成 physical 未解释的条件分布，并受 5% distortion budget 约束。
 
-## 11. 论文导向的方法定位
+这比“Transformer + wavelet + flow”简单拼接更可检验，但只有 BNES/full-141/closed-test
+消融真正改善指标后才能作为已验证创新。当前不能声称 SOTA 或论文目标完成。
 
-当前最有潜力的统一方法名是 **Identifiability-Conditioned Orthogonal Residual Flow
-Bridge**，核心不是“Transformer + Haar + flow”的部件列表，而是一个可检验的分解：
+设计借鉴但不照搬：
 
-1. 经硬门槛验证的 physical 固定可识别的辐射和低频；
-2. source/physical 共同支持的边缘留在像素域 deterministic anchor；
-3. 两层正交 Haar 将生成自由度限制在不改写低频的 innovation 子空间；
-4. `q` 同时控制起点不确定度、可预测 correction 和 transport 幅度；
-5. 以 5% distortion budget 和多数场景门槛约束 perception-distortion trade-off。
+- [UPSR, CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/html/Zhang_Uncertainty-guided_Perturbation_for_Image_Super-Resolution_Diffusion_Model_CVPR_2025_paper.html)
+- [HDW-SR, CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/html/Yang_HDW-SR_High-Frequency_Guided_Diffusion_Model_based_on_Wavelet_Decomposition_for_CVPR_2026_paper.html)
+- [Residual Diffusion Bridge, CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/html/Wang_Residual_Diffusion_Bridge_Model_for_Image_Restoration_CVPR_2026_paper.html)
+- [CDTSDE, ICLR 2026](https://openreview.net/forum?id=it0GTdiW9t)
+- [TexADiff, CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/html/Zhang_Remote_Sensing_Image_Super-Resolution_for_Imbalanced_Textures_A_Texture-Aware_Diffusion_CVPR_2026_paper.html)
 
-它借鉴但不照搬 2025–2026 方法：
+V3.2 不使用 MAE，不使用 GAN，也不引入自然图像 text-to-image 大底座。
 
-- [UPSR, CVPR 2025](https://openaccess.thecvf.com/content/CVPR2025/html/Zhang_Uncertainty-guided_Perturbation_for_Image_Super-Resolution_Diffusion_Model_CVPR_2025_paper.html)：用空间不确定度控制生成自由度；
-- [HDW-SR, CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/html/Yang_HDW-SR_High-Frequency_Guided_Diffusion_Model_based_on_Wavelet_Decomposition_for_CVPR_2026_paper.html)：只生成 PreSR 未解释的 wavelet residual；
-- [Residual Diffusion Bridge, CVPR 2026](https://openaccess.thecvf.com/content/CVPR2026/papers/Wang_Residual_Diffusion_Bridge_Model_for_Image_Restoration_CVPR_2026_paper.pdf)：用 residual bridge 避免重建已正确区域；
-- [CDTSDE, ICLR 2026](https://openreview.net/forum?id=it0GTdiW9t)：用空间/通道自适应跨模态轨迹处理局部 domain shift。
+## 10. 复现与能力边界
 
-与这些工作的差别应通过消融证明，而不是只在文字中声称：无 `q`、无 pixel anchor、
-codec latent vs exact Haar、允许/禁止 LL→LL、固定 Gaussian origin vs conditional origin、
-1/4/8/16 steps、Optical/SAR 分方向结果。还需 paired Wilcoxon + Holm 和 bootstrap 95% CI。
+完整 canonical 训练事实见
+[`V32_CANONICAL_2017_2024_TRAINING_REPORT_ZH.md`](V32_CANONICAL_2017_2024_TRAINING_REPORT_ZH.md)。
 
-目前创新结构已经形成，但 Optical 主指标未过门槛，因此还不能声称论文方法已验证成功。
-
-## 12. 运行、checkpoint 与复现
-
-关键产物：
-
-```text
-已过 physical：
-  checkpoints_v32_temporal/best_physical.pt
-
-当前最佳完整463 source anchor：
-  checkpoints_v32_anchor_source/full463_candidate.pt
-
-Haar pixel-anchor connectivity：
-  checkpoints_v32_id_bridge_haar_anchor_connectivity_v4/
-
-报告：
-  docs/results/v32_physical_full_463.json
-  docs/results/v32_source_anchor_full_463.json
-  docs/results/v32_id_bridge_pixel_anchor_step100_quick32.json
-```
-
-代码质量验证：
+基础验证：
 
 ```bash
 cd /data/code/sentinel_translat/v3.2
 PYTHONPATH=src pytest -q
-ruff check src tests
+ruff check .
 git diff --check
 ```
 
-8 卡双向 smoke：
+重新评估 validation：
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=1 PYTHONPATH=src \
-torchrun --standalone --nproc_per_node=8 -m sentinel_v3.cli \
-  --config configs/smoke_id_bridge_haar_anchor.yaml train \
-  --limit 64 \
-  --init-model checkpoints_v32_anchor_source/full463_candidate.pt \
-  --output checkpoints_v32_id_bridge_haar_anchor_smoke \
-  --reports reports_v32_id_bridge_haar_anchor_smoke --save-final
+CUDA_VISIBLE_DEVICES=7 PYTHONPATH=src python -m sentinel_v3.cli \
+  --config configs/canonical_2017_2024_phase_transport.yaml \
+  evaluate \
+  --checkpoint checkpoints_v32_canonical_2017_2024/final_calibrated.pt \
+  --split validation_temporal \
+  --output reports_v32_canonical_2017_2024/final_validation.json
 ```
 
-100-step connectivity：
-
-```bash
-CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7 OMP_NUM_THREADS=1 PYTHONPATH=src \
-torchrun --standalone --nproc_per_node=8 -m sentinel_v3.cli \
-  --config configs/id_bridge_haar_anchor_connectivity.yaml train \
-  --limit 64 \
-  --init-model checkpoints_v32_anchor_source/full463_candidate.pt \
-  --output checkpoints_v32_id_bridge_haar_anchor_connectivity \
-  --reports reports_v32_id_bridge_haar_anchor_connectivity --save-final
-```
-
-Checkpoint format 为 v4，保存 residual state metadata、codec/version、协议 hash、最佳指标、
-EMA 及各 optimizer/scheduler 状态。V3.1 权重只能作为 `--init-model` 兼容初始化，不能恢复
-旧 optimizer；所有 V3.2 产物留在独立 `checkpoints_v32*` 路径。
-
-## 13. 能力边界
-
-- SAR→Optical 是 many-to-many。模型可恢复共同几何和条件分布合理的纹理，不能承诺找回
-  SAR 从未观测到的唯一真实颜色/屋顶纹理。
-- Optical→SAR 的 speckle 和极端散射同样不唯一；physical 负责确定性辐射，visual 负责
-  条件统计真实性。
-- 当前网络可处理满足下采样尺寸约束的不同 patch 大小和 GSD 条件，但不能声称支持任意
-  未见传感器或任意分辨率。新传感器需要物理描述符、单位/PSF/MTF 标定、配对训练数据和
-  独立验证。
-- 当前可视化比最初 physical 更锐，SAR 尾部显著改善；Optical 仍只是“安全的小幅细节
-  增强”，不是完成了真实高频恢复。
+能力边界：SAR 和 Optical 是 many-to-many。模型可以恢复共同几何和合理条件分布，不能从
+SAR 唯一确定真实 RGB 色彩/纹理，也不能从 Optical 唯一确定真实 speckle。网络可处理已标定
+尺寸/GSD 的 patch，但不能声称支持任意传感器或任意分辨率；新传感器必须补齐物理描述符、
+通道/单位、PSF/MTF、配对训练数据和独立验证。

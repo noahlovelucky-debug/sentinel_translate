@@ -847,6 +847,8 @@ class ObservablePhaseTransportHead(nn.Module):
         null_quantile: float = 0.75,
         support_epsilon: float = 0.01,
         carrier_mode: str = "physical_gain",
+        carrier_gain_caps: Sequence[float] | None = None,
+        carrier_support_mode: str = "continuous",
     ) -> None:
         super().__init__()
         if len(gain_caps) != 3 or len(offset_caps_px) != 3:
@@ -863,13 +865,34 @@ class ObservablePhaseTransportHead(nn.Module):
             raise ValueError(
                 "phase transport carrier_mode must be physical_gain or orthogonal_source"
             )
+        resolved_carrier_gain_caps = gain_caps if carrier_gain_caps is None else carrier_gain_caps
+        if not isinstance(resolved_carrier_gain_caps, (tuple, list)) or len(
+            resolved_carrier_gain_caps
+        ) != 3:
+            raise ValueError("phase transport carrier_gain_caps must contain three values")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in resolved_carrier_gain_caps
+        ):
+            raise TypeError("phase transport carrier_gain_caps must contain numeric values")
+        if any(
+            not math.isfinite(float(value)) or not 0.0 <= float(value) <= 1.0
+            for value in resolved_carrier_gain_caps
+        ):
+            raise ValueError("phase transport carrier_gain_caps must be finite and in [0, 1]")
+        if carrier_support_mode not in {"continuous", "binary_exceedance"}:
+            raise ValueError(
+                "phase transport carrier_support_mode must be continuous or binary_exceedance"
+            )
         self.gain_caps = tuple(float(value) for value in gain_caps)
+        self.carrier_gain_caps = tuple(float(value) for value in resolved_carrier_gain_caps)
         self.offset_caps_px = tuple(float(value) for value in offset_caps_px)
         self.initial_gate = float(initial_gate)
         self.null_calibrated = null_calibrated
         self.null_quantile = float(null_quantile)
         self.support_epsilon = float(support_epsilon)
         self.carrier_mode = carrier_mode
+        self.carrier_support_mode = carrier_support_mode
         self.pyramid_projections = nn.ModuleList(
             [nn.Conv2d(channels, 32, 1) for channels in pyramid_channels]
         )
@@ -1005,6 +1028,10 @@ class ObservablePhaseTransportHead(nn.Module):
             ).reshape(*coherence.shape[:2], 1, 1)
             null_coherence = 0.5 * (null_height + null_width)
         null_level = null_level.to(coherence).detach()
+        if self.carrier_support_mode == "binary_exceedance":
+            finite_coherence = torch.nan_to_num(coherence, nan=0.0, posinf=0.0, neginf=0.0)
+            support = (finite_coherence > null_level).to(coherence).detach()
+            return null_level, support, null_coherence
         excess = F.relu(coherence - null_level)
         support = excess / (excess + null_level + self.support_epsilon)
         return null_level, support, null_coherence
@@ -1107,7 +1134,7 @@ class ObservablePhaseTransportHead(nn.Module):
             )
         )
         carrier_effective_signed_coeff = carrier_signed_gate * carrier_support
-        gain_caps = carrier_raw.new_tensor(self.gain_caps).view(1, 3, 1, 1)
+        gain_caps = carrier_raw.new_tensor(self.carrier_gain_caps).view(1, 3, 1, 1)
         carrier_coefficients = gain_caps * carrier_effective_signed_coeff
         full_carrier_coefficients = F.interpolate(
             carrier_coefficients,
@@ -1505,12 +1532,14 @@ class ModelConfig:
     phase_transport_enabled: bool = False
     phase_transport_hidden: int = 128
     phase_transport_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1)
+    phase_transport_carrier_gain_caps: tuple[float, float, float] = (0.5, 0.25, 0.1)
     phase_transport_offset_caps_px: tuple[float, float, float] = (0.5, 0.5, 0.5)
     phase_transport_initial_gate: float = 0.02
     phase_transport_null_calibrated: bool = False
     phase_transport_null_quantile: float = 0.75
     phase_transport_support_epsilon: float = 0.01
     phase_transport_carrier_mode: str = "physical_gain"
+    phase_transport_carrier_support_mode: str = "continuous"
     architecture: str = "v3.2"
 
     def __post_init__(self) -> None:
@@ -1564,6 +1593,21 @@ class ModelConfig:
             if any(not math.isfinite(value) or not 0.0 <= value <= 1.0 for value in normalized):
                 raise ValueError(f"{name} must be finite and in [0, 1]")
             setattr(self, name, normalized)
+        carrier_gain_caps = self.phase_transport_carrier_gain_caps
+        if not isinstance(carrier_gain_caps, (tuple, list)) or len(carrier_gain_caps) != 3:
+            raise ValueError("phase_transport_carrier_gain_caps must contain three values")
+        if any(
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            for value in carrier_gain_caps
+        ):
+            raise TypeError("phase_transport_carrier_gain_caps must contain numeric values")
+        normalized_carrier_gain_caps = tuple(float(value) for value in carrier_gain_caps)
+        if any(
+            not math.isfinite(value) or not 0.0 <= value <= 1.0
+            for value in normalized_carrier_gain_caps
+        ):
+            raise ValueError("phase_transport_carrier_gain_caps must be finite and in [0, 1]")
+        self.phase_transport_carrier_gain_caps = normalized_carrier_gain_caps
         initial_gate = float(self.phase_transport_initial_gate)
         if not math.isfinite(initial_gate) or not 0.0 < initial_gate < 1.0:
             raise ValueError("phase_transport_initial_gate must be finite and in (0, 1)")
@@ -1581,6 +1625,13 @@ class ModelConfig:
         if self.phase_transport_carrier_mode not in {"physical_gain", "orthogonal_source"}:
             raise ValueError(
                 "phase_transport_carrier_mode must be physical_gain or orthogonal_source"
+            )
+        if self.phase_transport_carrier_support_mode not in {
+            "continuous",
+            "binary_exceedance",
+        }:
+            raise ValueError(
+                "phase_transport_carrier_support_mode must be continuous or binary_exceedance"
             )
 
 
@@ -1635,6 +1686,8 @@ class SentinelV3(nn.Module):
             cfg.phase_transport_null_quantile,
             cfg.phase_transport_support_epsilon,
             cfg.phase_transport_carrier_mode,
+            cfg.phase_transport_carrier_gain_caps,
+            cfg.phase_transport_carrier_support_mode,
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("optical_bridge_alpha_scale", torch.ones(()))
@@ -2406,12 +2459,16 @@ class SentinelV3(nn.Module):
             "phase_transport_enabled": self.config.phase_transport_enabled,
             "phase_transport_hidden": self.config.phase_transport_hidden,
             "phase_transport_gain_caps": tuple(self.config.phase_transport_gain_caps),
+            "phase_transport_carrier_gain_caps": tuple(
+                self.config.phase_transport_carrier_gain_caps
+            ),
             "phase_transport_offset_caps_px": tuple(self.config.phase_transport_offset_caps_px),
             "phase_transport_initial_gate": self.config.phase_transport_initial_gate,
             "phase_transport_null_calibrated": self.config.phase_transport_null_calibrated,
             "phase_transport_null_quantile": self.config.phase_transport_null_quantile,
             "phase_transport_support_epsilon": self.config.phase_transport_support_epsilon,
             "phase_transport_carrier_mode": self.config.phase_transport_carrier_mode,
+            "phase_transport_carrier_support_mode": self.config.phase_transport_carrier_support_mode,
         }
 
     def sample_id_bridge_residual(
