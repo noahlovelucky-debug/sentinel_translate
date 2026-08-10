@@ -161,6 +161,7 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError("model.phase_transport_hidden must be positive")
     model.setdefault("phase_transport_carrier_gain_caps", model["phase_transport_gain_caps"])
     model.setdefault("phase_transport_carrier_support_mode", "continuous")
+    model.setdefault("phase_transport_carrier_basis_trainable", True)
     for name in ("phase_transport_gain_caps", "phase_transport_offset_caps_px"):
         values = model[name]
         if not isinstance(values, (list, tuple)) or len(values) != 3:
@@ -211,6 +212,8 @@ def validate_config(config: dict[str, Any]) -> None:
         raise ValueError(
             "model.phase_transport_carrier_support_mode must be continuous or binary_exceedance"
         )
+    if not isinstance(model["phase_transport_carrier_basis_trainable"], bool):
+        raise TypeError("model.phase_transport_carrier_basis_trainable must be a bool")
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:
             raise ValueError(f"model.{name} must be non-negative")

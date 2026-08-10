@@ -77,6 +77,7 @@ def _haar_model(
     phase_transport_support_epsilon: float = 0.01,
     phase_transport_carrier_mode: str = "physical_gain",
     phase_transport_carrier_support_mode: str = "continuous",
+    phase_transport_carrier_basis_trainable: bool = True,
 ) -> SentinelV3:
     return SentinelV3(
         ModelConfig(
@@ -114,6 +115,7 @@ def _haar_model(
             phase_transport_support_epsilon=phase_transport_support_epsilon,
             phase_transport_carrier_mode=phase_transport_carrier_mode,
             phase_transport_carrier_support_mode=phase_transport_carrier_support_mode,
+            phase_transport_carrier_basis_trainable=phase_transport_carrier_basis_trainable,
         )
     )
 
@@ -262,6 +264,9 @@ def test_phase_transport_config_ranges_and_configs() -> None:
         ModelConfig(phase_transport_carrier_gain_caps=(0.5, 0.25, 1.01))
     with pytest.raises(ValueError, match="carrier_support_mode"):
         ModelConfig(phase_transport_carrier_support_mode="unknown")
+    assert ModelConfig().phase_transport_carrier_basis_trainable is True
+    with pytest.raises(TypeError, match="carrier_basis_trainable"):
+        ModelConfig(phase_transport_carrier_basis_trainable=1)  # type: ignore[arg-type]
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_hf_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_hf_weight"):
@@ -293,12 +298,18 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     config["model"]["phase_transport_carrier_support_mode"] = "unknown"
     with pytest.raises(ValueError, match="phase_transport_carrier_support_mode"):
         validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_carrier_basis_trainable"] = 1
+    with pytest.raises(TypeError, match="phase_transport_carrier_basis_trainable"):
+        validate_config(config)
     legacy_config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     legacy_config["model"].pop("phase_transport_carrier_gain_caps")
     legacy_config["model"].pop("phase_transport_carrier_support_mode")
+    legacy_config["model"].pop("phase_transport_carrier_basis_trainable")
     validate_config(legacy_config)
     assert legacy_config["model"]["phase_transport_carrier_gain_caps"] == [0.5, 0.25, 0.1]
     assert legacy_config["model"]["phase_transport_carrier_support_mode"] == "continuous"
+    assert legacy_config["model"]["phase_transport_carrier_basis_trainable"] is True
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_signed_alignment_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_signed_alignment_weight"):
@@ -426,6 +437,38 @@ def test_canonical_ncopc_bnes_phase_transport_configs() -> None:
         assert model["phase_transport_carrier_gain_caps"] == [0.125, 0.0625, 0.025]
         assert "ncopc_bnes" in config["paths"]["output"]
         assert "ncopc_bnes" in config["paths"]["reports"]
+        validate_config(config)
+    assert load_config(root / names[-1])["validation"]["full_steps"] == []
+
+
+def test_canonical_ncopc_stationary_phase_transport_configs() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "canonical_2017_2024_phase_transport_ncopc_stationary_connectivity.yaml",
+        "canonical_2017_2024_phase_transport_ncopc_stationary_pilot.yaml",
+    )
+    expected_steps = (100, 1000)
+    expected_validation = (100, 250)
+    for name, steps, validation_every in zip(
+        names, expected_steps, expected_validation, strict=True
+    ):
+        config = load_config(root / name)
+        model = config["model"]
+        train = config["train"]
+        assert train["stage"] == "phase_transport"
+        assert train["max_steps"] == steps
+        assert train["batch_size"] == 1
+        assert train["gradient_accumulation"] == 2
+        assert train["validate_every"] == validation_every
+        assert train["flow_rollout_steps"] == 1
+        assert train["phase_transport_utility_weight"] == pytest.approx(1.0)
+        assert train["phase_transport_signed_alignment_weight"] == pytest.approx(0.0)
+        assert model["phase_transport_carrier_mode"] == "orthogonal_source"
+        assert model["phase_transport_carrier_support_mode"] == "binary_exceedance"
+        assert model["phase_transport_carrier_gain_caps"] == [1.0, 0.5, 0.2]
+        assert model["phase_transport_carrier_basis_trainable"] is False
+        assert "ncopc_stationary" in config["paths"]["output"]
+        assert "ncopc_stationary" in config["paths"]["reports"]
         validate_config(config)
     assert load_config(root / names[-1])["validation"]["full_steps"] == []
 
@@ -2743,6 +2786,7 @@ def test_id_bridge_optimizer_updates_origin_and_checkpoint_ema(tiny_model: Senti
         "phase_transport_support_epsilon": 0.01,
         "phase_transport_carrier_mode": "physical_gain",
         "phase_transport_carrier_support_mode": "continuous",
+        "phase_transport_carrier_basis_trainable": True,
         "antithetic_weight": 0.0,
     }
 
@@ -2802,6 +2846,7 @@ def test_haar_id_bridge_optimizer_and_checkpoint_metadata() -> None:
         "phase_transport_support_epsilon": 0.01,
         "phase_transport_carrier_mode": "physical_gain",
         "phase_transport_carrier_support_mode": "continuous",
+        "phase_transport_carrier_basis_trainable": True,
         "antithetic_weight": 0.0,
     }
 
@@ -3094,6 +3139,7 @@ def test_orthogonal_source_phase_transport_trains_only_head_and_keeps_long_gaps_
         phase_transport_carrier_support_mode="binary_exceedance",
     )
     _set_trainable(model, "phase_transport")
+    assert model.config.phase_transport_carrier_basis_trainable is True
     carrier_prefixes = (
         "phase_transport_head.carrier_source_phase_projection.",
         "phase_transport_head.carrier_adapter.",
@@ -3178,6 +3224,161 @@ def test_orthogonal_source_phase_transport_trains_only_head_and_keeps_long_gaps_
         for parameter in model.parameters()
         if parameter.requires_grad
     )
+
+
+def test_stationary_carrier_phase_transport_freezes_basis_and_preserves_zero_init(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    bnes = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_gain_caps=(1.0, 0.5, 0.2),
+        phase_transport_carrier_support_mode="binary_exceedance",
+    ).eval()
+    stationary = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+        phase_transport_carrier_mode="orthogonal_source",
+        phase_transport_carrier_gain_caps=(1.0, 0.5, 0.2),
+        phase_transport_carrier_support_mode="binary_exceedance",
+        phase_transport_carrier_basis_trainable=False,
+    ).eval()
+    stationary.load_state_dict(bnes.state_dict())
+    _set_trainable(stationary, "phase_transport")
+    prefixes = (
+        "phase_transport_head.carrier_adapter.",
+        "phase_transport_head.carrier_head.",
+    )
+    trainable = {
+        name for name, parameter in stationary.named_parameters() if parameter.requires_grad
+    }
+    assert trainable and all(name.startswith(prefixes) for name in trainable)
+    assert not stationary.phase_transport_head.carrier_source_phase_projection.weight.requires_grad
+    optimizer = _optimizer(
+        stationary,
+        {"learning_rate": 1e-3, "encoder_learning_rate": 1e-3, "weight_decay": 0.0},
+        "phase_transport",
+        torch.device("cpu"),
+    )
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    assert optimizer_ids == {
+        id(parameter) for parameter in stationary.parameters() if parameter.requires_grad
+    }
+
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = bnes.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    baseline_delta, _ = bnes.phase_transport_delta(pyramid, base, SENTINEL2)
+    ema = EMA(stationary, decay=0.9)
+    with ema.apply_to(stationary):
+        stationary_delta, diagnostics = stationary.phase_transport_delta(pyramid, base, SENTINEL2)
+    torch.testing.assert_close(diagnostics["carrier_delta"], torch.zeros_like(stationary_delta))
+    torch.testing.assert_close(stationary_delta, diagnostics["parallel_delta"], atol=0.0, rtol=0.0)
+    torch.testing.assert_close(stationary_delta, baseline_delta, atol=0.0, rtol=0.0)
+    assert stationary.residual_state_metadata()["phase_transport_carrier_basis_trainable"] is False
+
+    def support_one(
+        _source_phase: torch.Tensor,
+        _physical_bands: torch.Tensor,
+        coherence: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        zeros = torch.zeros_like(coherence)
+        return zeros, torch.ones_like(coherence), zeros
+
+    monkeypatch.setattr(stationary.phase_transport_head, "_carrier_null_calibrated_support", support_one)
+    before_step = {
+        name: parameter.detach().clone() for name, parameter in stationary.named_parameters()
+    }
+    objective = JointObjective(
+        stationary,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+        phase_transport_utility_weight=1.0,
+        phase_transport_signed_alignment_weight=0.0,
+    )
+    objective.set_progress(1, 100)
+    loss, metrics = objective(_batch(), "phase_transport")
+    assert bool(torch.isfinite(loss))
+    assert "sar2opt/carrier_coeff_corr_fine" in metrics
+    loss.backward()
+    assert stationary.phase_transport_head.carrier_source_phase_projection.weight.grad is None
+    assert all(
+        parameter.grad is None
+        for name, parameter in stationary.named_parameters()
+        if not name.startswith(prefixes)
+    )
+    optimizer.step()
+    changed = {
+        name
+        for name, parameter in stationary.named_parameters()
+        if not torch.equal(parameter.detach(), before_step[name])
+    }
+    assert changed and all(name.startswith(prefixes) for name in changed)
+
+    stationary.zero_grad(set_to_none=True)
+    zero_loss, _ = objective(_batch(delta_days=2), "phase_transport")
+    zero_loss.backward()
+    assert float(zero_loss.detach()) == 0.0
+    assert all(
+        parameter.grad is not None and int(torch.count_nonzero(parameter.grad)) == 0
+        for parameter in stationary.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_carrier_coefficient_diagnostics_cover_perfect_anti_and_empty_support() -> None:
+    oracle = torch.tensor(
+        [
+            [
+                [[0.2, -0.4], [0.6, -0.8]],
+                [[0.1, -0.3], [0.5, -0.7]],
+                [[0.15, -0.25], [0.45, -0.65]],
+            ]
+        ]
+    )
+    support = torch.ones_like(oracle)
+    support[..., 0, 0] = 0.0
+    strict_valid = torch.ones(1, 1, 2, 2)
+    strict_valid[..., 0, 1] = 0.0
+    weights = torch.ones(1)
+    target = oracle * support
+    perfect = target.clone()
+    perfect[..., 0, 0] = 99.0
+    perfect[..., 0, 1] = -99.0
+    perfect_metrics = JointObjective._carrier_coefficient_diagnostics(
+        perfect, oracle, support, strict_valid, weights
+    )
+    anti_metrics = JointObjective._carrier_coefficient_diagnostics(
+        -target, oracle, support, strict_valid, weights
+    )
+    empty_metrics = JointObjective._carrier_coefficient_diagnostics(
+        perfect, oracle, torch.zeros_like(support), strict_valid, weights
+    )
+    for name in ("fine", "mid", "coarse"):
+        assert float(perfect_metrics[f"carrier_coeff_mae_{name}"]) == pytest.approx(0.0)
+        assert float(perfect_metrics[f"carrier_coeff_corr_{name}"]) == pytest.approx(1.0)
+        assert float(perfect_metrics[f"carrier_sign_accuracy_{name}"]) == pytest.approx(1.0)
+        assert float(anti_metrics[f"carrier_coeff_mae_{name}"]) > 0.0
+        assert float(anti_metrics[f"carrier_coeff_corr_{name}"]) == pytest.approx(-1.0)
+        assert float(anti_metrics[f"carrier_sign_accuracy_{name}"]) == pytest.approx(0.0)
+        assert float(empty_metrics[f"carrier_coeff_mae_{name}"]) == pytest.approx(0.0)
+        assert float(empty_metrics[f"carrier_coeff_corr_{name}"]) == pytest.approx(0.0)
+        assert float(empty_metrics[f"carrier_sign_accuracy_{name}"]) == pytest.approx(0.0)
+    assert all(bool(torch.isfinite(value)) for value in empty_metrics.values())
 
 
 def test_orthogonal_source_phase_transport_uses_detached_carrier_oracle(

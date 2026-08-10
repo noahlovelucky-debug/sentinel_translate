@@ -1540,6 +1540,7 @@ class ModelConfig:
     phase_transport_support_epsilon: float = 0.01
     phase_transport_carrier_mode: str = "physical_gain"
     phase_transport_carrier_support_mode: str = "continuous"
+    phase_transport_carrier_basis_trainable: bool = True
     architecture: str = "v3.2"
 
     def __post_init__(self) -> None:
@@ -1633,6 +1634,8 @@ class ModelConfig:
             raise ValueError(
                 "phase_transport_carrier_support_mode must be continuous or binary_exceedance"
             )
+        if not isinstance(self.phase_transport_carrier_basis_trainable, bool):
+            raise TypeError("phase_transport_carrier_basis_trainable must be a bool")
 
 
 class SentinelV3(nn.Module):
@@ -2469,6 +2472,7 @@ class SentinelV3(nn.Module):
             "phase_transport_support_epsilon": self.config.phase_transport_support_epsilon,
             "phase_transport_carrier_mode": self.config.phase_transport_carrier_mode,
             "phase_transport_carrier_support_mode": self.config.phase_transport_carrier_support_mode,
+            "phase_transport_carrier_basis_trainable": self.config.phase_transport_carrier_basis_trainable,
         }
 
     def sample_id_bridge_residual(

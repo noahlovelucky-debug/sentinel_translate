@@ -1488,6 +1488,78 @@ class JointObjective(nn.Module):
             return self._carrier_alignment_mask(valid, carrier_support)
         return valid
 
+    @staticmethod
+    def _carrier_coefficient_diagnostics(
+        effective_signed_coeff: Tensor,
+        oracle_signed_coeff: Tensor,
+        carrier_support: Tensor,
+        strict_valid: Tensor,
+        residual_weights: Tensor,
+    ) -> dict[str, Tensor]:
+        """Measure detached carrier-coefficient fidelity only on valid active support."""
+
+        with torch.no_grad():
+            effective = torch.nan_to_num(
+                effective_signed_coeff.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            oracle = torch.nan_to_num(
+                oracle_signed_coeff.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            support = torch.nan_to_num(
+                carrier_support.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            valid = torch.nan_to_num(
+                strict_valid.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp(0.0, 1.0)
+            sample_weight = torch.nan_to_num(
+                residual_weights.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp_min(0.0)
+            target = oracle * support
+            active_weight = (
+                sample_weight[:, None, None, None]
+                * valid
+                * support.gt(0.0).to(effective)
+            )
+            zero = effective.new_zeros(())
+
+            def weighted_average(values: Tensor, weights: Tensor) -> Tensor:
+                total_weight = weights.sum()
+                return torch.where(
+                    total_weight > 0.0,
+                    (values * weights).sum() / total_weight.clamp_min(1e-8),
+                    zero,
+                )
+
+            metrics: dict[str, Tensor] = {}
+            for band, name in enumerate(("fine", "mid", "coarse")):
+                prediction = effective[:, band]
+                target_band = target[:, band]
+                band_weight = active_weight[:, band]
+                mae = weighted_average((prediction - target_band).abs(), band_weight)
+                prediction_mean = weighted_average(prediction, band_weight)
+                target_mean = weighted_average(target_band, band_weight)
+                centered_prediction = prediction - prediction_mean
+                centered_target = target_band - target_mean
+                covariance = weighted_average(
+                    centered_prediction * centered_target, band_weight
+                )
+                prediction_variance = weighted_average(centered_prediction.square(), band_weight)
+                target_variance = weighted_average(centered_target.square(), band_weight)
+                denominator = torch.sqrt(prediction_variance * target_variance)
+                correlation = torch.where(
+                    denominator > 1e-8,
+                    covariance / denominator.clamp_min(1e-8),
+                    zero,
+                ).clamp(-1.0, 1.0)
+                sign_weight = band_weight * target_band.abs().gt(1e-4).to(band_weight)
+                sign_accuracy = weighted_average(
+                    prediction.sign().eq(target_band.sign()).to(band_weight), sign_weight
+                )
+                metrics[f"carrier_coeff_mae_{name}"] = torch.nan_to_num(mae)
+                metrics[f"carrier_coeff_corr_{name}"] = torch.nan_to_num(correlation)
+                metrics[f"carrier_sign_accuracy_{name}"] = torch.nan_to_num(sign_accuracy)
+            return metrics
+
     def _carrier_phase_transport_direction(
         self,
         *,
@@ -1557,6 +1629,13 @@ class JointObjective(nn.Module):
             ),
             utility_weight.float(),
         )
+        carrier_coefficient_metrics = self._carrier_coefficient_diagnostics(
+            carrier_effective_signed_coeff,
+            oracle_signed_coeff,
+            carrier_support,
+            strict_valid,
+            residual_weights,
+        )
         support_weight = residual_weights[:, None, None, None] * strict_valid
         carrier_support_active_fraction = (
             (support_active * support_weight).sum()
@@ -1613,6 +1692,7 @@ class JointObjective(nn.Module):
             "coherence_mid": coherence[:, 1].mean().detach(),
             "coherence_coarse": coherence[:, 2].mean().detach(),
             "carrier_oracle_active": phase_delta.new_tensor(1.0),
+            **carrier_coefficient_metrics,
             "carrier_oracle_fine": oracle_signed_coeff[:, 0].mean().detach(),
             "carrier_oracle_mid": oracle_signed_coeff[:, 1].mean().detach(),
             "carrier_oracle_coarse": oracle_signed_coeff[:, 2].mean().detach(),
@@ -2443,11 +2523,9 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
     elif stage == "phase_transport":
         if model.config.phase_transport_carrier_mode == "orthogonal_source":
             head = model.phase_transport_head
-            modules = (
-                head.carrier_source_phase_projection,
-                head.carrier_adapter,
-                head.carrier_head,
-            )
+            modules = (head.carrier_adapter, head.carrier_head)
+            if model.config.phase_transport_carrier_basis_trainable:
+                modules = (head.carrier_source_phase_projection, *modules)
         else:
             modules = (model.phase_transport_head,)
     elif stage in {"balance", "overfit"}:
