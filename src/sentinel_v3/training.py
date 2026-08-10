@@ -183,6 +183,7 @@ class JointObjective(nn.Module):
         phase_transport_hf_weight: float = 0.05,
         phase_transport_utility_weight: float = 0.10,
         phase_transport_signed_alignment_weight: float = 0.0,
+        phase_transport_detail_utility_kernel: int = 5,
     ) -> None:
         super().__init__()
         self.model = model
@@ -228,6 +229,14 @@ class JointObjective(nn.Module):
                 "phase_transport_signed_alignment_weight must be finite and non-negative"
             )
         self.phase_transport_signed_alignment_weight = phase_transport_signed_alignment_weight
+        if (
+            isinstance(phase_transport_detail_utility_kernel, bool)
+            or not isinstance(phase_transport_detail_utility_kernel, int)
+            or phase_transport_detail_utility_kernel < 1
+            or phase_transport_detail_utility_kernel % 2 == 0
+        ):
+            raise ValueError("phase_transport_detail_utility_kernel must be an odd positive integer")
+        self.phase_transport_detail_utility_kernel = phase_transport_detail_utility_kernel
         self.risk_flow_steps = max(1, risk_flow_steps)
         self.bridge_flow_steps = max(1, bridge_flow_steps)
         self.last_direction_losses: list[Tensor] = []
@@ -1560,6 +1569,193 @@ class JointObjective(nn.Module):
                 metrics[f"carrier_sign_accuracy_{name}"] = torch.nan_to_num(sign_accuracy)
             return metrics
 
+    @staticmethod
+    def _smoothed_detail_utility_oracle(
+        oracle_scale: Tensor,
+        strict_valid: Tensor,
+        kernel_size: int,
+    ) -> Tensor:
+        """Smooth a detached scale oracle while preserving strict-valid blocks."""
+
+        if (
+            oracle_scale.ndim != 4
+            or oracle_scale.shape[1] != 3
+            or strict_valid.ndim != 4
+            or strict_valid.shape[1] != 1
+            or oracle_scale.shape[0] != strict_valid.shape[0]
+            or oracle_scale.shape[-2:] != strict_valid.shape[-2:]
+        ):
+            raise ValueError("detail utility oracle and strict-valid mask must share BHW")
+        if (
+            isinstance(kernel_size, bool)
+            or not isinstance(kernel_size, int)
+            or kernel_size < 1
+            or kernel_size % 2 == 0
+        ):
+            raise ValueError("detail utility kernel must be an odd positive integer")
+        with torch.no_grad():
+            safe_oracle = torch.nan_to_num(
+                oracle_scale.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            smoothed = F.avg_pool2d(
+                safe_oracle,
+                kernel_size,
+                stride=1,
+                padding=kernel_size // 2,
+                count_include_pad=False,
+            )
+            valid = torch.nan_to_num(
+                strict_valid.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp(0.0, 1.0)
+            return torch.where(valid.expand_as(smoothed) >= 0.999, smoothed, torch.zeros_like(smoothed))
+
+    @staticmethod
+    def _detail_scale_diagnostics(
+        predicted_scale: Tensor,
+        oracle_scale: Tensor,
+        strict_valid: Tensor,
+        residual_weights: Tensor,
+    ) -> dict[str, Tensor]:
+        """Return finite detached scale-oracle diagnostics on strict-valid blocks."""
+
+        with torch.no_grad():
+            prediction = torch.nan_to_num(
+                predicted_scale.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            oracle = torch.nan_to_num(
+                oracle_scale.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            )
+            valid = torch.nan_to_num(
+                strict_valid.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp(0.0, 1.0)
+            sample_weight = torch.nan_to_num(
+                residual_weights.detach().float(), nan=0.0, posinf=0.0, neginf=0.0
+            ).clamp_min(0.0)
+            weights = sample_weight[:, None, None, None] * valid
+            zero = prediction.new_zeros(())
+
+            def weighted_average(values: Tensor, value_weights: Tensor) -> Tensor:
+                total_weight = value_weights.sum()
+                return torch.where(
+                    total_weight > 0.0,
+                    (values * value_weights).sum() / total_weight.clamp_min(1e-8),
+                    zero,
+                )
+
+            metrics: dict[str, Tensor] = {}
+            for band, name in enumerate(("fine", "mid", "coarse")):
+                predicted_band = prediction[:, band]
+                oracle_band = oracle[:, band]
+                band_weight = weights[:, 0]
+                predicted_mean = weighted_average(predicted_band, band_weight)
+                oracle_mean = weighted_average(oracle_band, band_weight)
+                mae = weighted_average((predicted_band - oracle_band).abs(), band_weight)
+                centered_prediction = predicted_band - predicted_mean
+                centered_oracle = oracle_band - oracle_mean
+                covariance = weighted_average(
+                    centered_prediction * centered_oracle, band_weight
+                )
+                prediction_variance = weighted_average(
+                    centered_prediction.square(), band_weight
+                )
+                oracle_variance = weighted_average(centered_oracle.square(), band_weight)
+                denominator = torch.sqrt(prediction_variance * oracle_variance)
+                correlation = torch.where(
+                    denominator > 1e-8,
+                    covariance / denominator.clamp_min(1e-8),
+                    zero,
+                ).clamp(-1.0, 1.0)
+                metrics[f"detail_scale_predicted_mean_{name}"] = torch.nan_to_num(
+                    predicted_mean, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                metrics[f"detail_scale_oracle_mean_{name}"] = torch.nan_to_num(
+                    oracle_mean, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                metrics[f"detail_scale_mae_{name}"] = torch.nan_to_num(
+                    mae, nan=0.0, posinf=0.0, neginf=0.0
+                )
+                metrics[f"detail_scale_corr_{name}"] = torch.nan_to_num(
+                    correlation, nan=0.0, posinf=0.0, neginf=0.0
+                )
+            return metrics
+
+    def _detail_utility_phase_transport_direction(
+        self,
+        *,
+        full_residual: Tensor,
+        base_detail: Tensor,
+        correction: Tensor,
+        diagnostics: dict[str, Tensor],
+        target: Tensor,
+        visual: Tensor,
+        valid: Tensor,
+        residual_weights: Tensor,
+        hf_loss: Tensor,
+        hf_metrics: dict[str, Tensor],
+        rmse_hinge: Tensor,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        """Fit a stationary local magnitude field over frozen observable detail."""
+
+        detail_scale = diagnostics["detail_scale"]
+        latent_valid = F.interpolate(valid, size=detail_scale.shape[-2:], mode="area")
+        strict_valid = (latent_valid >= 0.999).to(detail_scale)
+        scale_cap = float(self.model.config.phase_transport_detail_scale_cap)
+        frozen_bands = torch.stack(frequency_bands(base_detail.detach(), levels=3), dim=1)
+        oracle_gate = phase_transport_gain_target(
+            frozen_bands,
+            full_residual.detach(),
+            valid,
+            (scale_cap, scale_cap, scale_cap),
+        ).detach()
+        oracle_scale = self._smoothed_detail_utility_oracle(
+            scale_cap * oracle_gate,
+            strict_valid,
+            self.phase_transport_detail_utility_kernel,
+        ).detach()
+        utility_weight = residual_weights[:, None, None, None] * strict_valid
+        detail_utility = masked_mean(
+            F.smooth_l1_loss(
+                detail_scale.float(), oracle_scale.float(), beta=0.1, reduction="none"
+            ),
+            utility_weight.float(),
+        )
+        scale_metrics = self._detail_scale_diagnostics(
+            detail_scale,
+            oracle_scale,
+            strict_valid,
+            residual_weights,
+        )
+        correction_rms = torch.sqrt(
+            masked_mean(
+                correction.float().square(),
+                (residual_weights[:, None, None, None] * valid).float(),
+            )
+        )
+        low_frequency_leakage = low_frequency_loss(correction, valid, residual_weights)
+        total = (
+            self.phase_transport_hf_weight * hf_loss
+            + 0.25 * rmse_hinge
+            + self.phase_transport_utility_weight * detail_utility
+        )
+        metrics = {
+            **hf_metrics,
+            "rmse_hinge": rmse_hinge.detach(),
+            "detail_utility": detail_utility.detach(),
+            **scale_metrics,
+            "detail_utility_correction_rms": correction_rms.detach(),
+            "detail_utility_low_frequency_leakage": low_frequency_leakage.detach(),
+        }
+        if self.current_step % self.flow_rollout_every == 0:
+            lpips, dists = self._optical_visual_perceptual(
+                visual, target, valid, residual_weights
+            )
+            total = total + self.flow_rollout_every * self.flow_visual_perceptual_weight * (
+                lpips + dists
+            )
+            metrics["lpips"] = lpips.detach()
+            metrics["dists"] = dists.detach()
+        return total, metrics
+
     def _carrier_phase_transport_direction(
         self,
         *,
@@ -1805,7 +2001,15 @@ class JointObjective(nn.Module):
         protected_anchor = self.model.id_bridge_anchor_detail(pyramid, base, target_spec).detach()
         residual_after_anchor = full_residual - protected_anchor
         phase_delta, diagnostics = self.model.phase_transport_delta(pyramid, base, target_spec)
-        detail = protected_anchor + phase_delta
+        detail_utility_enabled = self.model.config.phase_transport_detail_utility_enabled
+        if detail_utility_enabled:
+            frozen_parallel_delta = diagnostics.get("parallel_delta", phase_delta).detach()
+            base_detail = protected_anchor + frozen_parallel_delta
+            detail, detail_utility_correction = self.model.compose_phase_transport_detail_utility(
+                base_detail, diagnostics["detail_scale"]
+            )
+        else:
+            detail = protected_anchor + phase_delta
         residual_weights = weights[indices]
         hf_loss, hf_metrics = high_frequency_loss(
             detail,
@@ -1830,6 +2034,20 @@ class JointObjective(nn.Module):
         rmse_hinge = (distortion * residual_weights).sum() / residual_weights.sum().clamp_min(
             1e-8
         )
+        if detail_utility_enabled:
+            return self._detail_utility_phase_transport_direction(
+                full_residual=full_residual,
+                base_detail=base_detail,
+                correction=detail_utility_correction,
+                diagnostics=diagnostics,
+                target=target,
+                visual=visual,
+                valid=valid,
+                residual_weights=residual_weights,
+                hf_loss=hf_loss,
+                hf_metrics=hf_metrics,
+                rmse_hinge=rmse_hinge,
+            )
         if self.model.config.phase_transport_carrier_mode == "orthogonal_source":
             return self._carrier_phase_transport_direction(
                 full_residual=full_residual,
@@ -2521,7 +2739,10 @@ def _set_trainable(model: SentinelV3, stage: str) -> None:
     elif stage == "id_utility":
         modules = (model.id_bridge_origin,)
     elif stage == "phase_transport":
-        if model.config.phase_transport_carrier_mode == "orthogonal_source":
+        if model.config.phase_transport_detail_utility_enabled:
+            head = model.phase_transport_head
+            modules = (head.detail_utility_adapter, head.detail_utility_head)
+        elif model.config.phase_transport_carrier_mode == "orthogonal_source":
             head = model.phase_transport_head
             modules = (head.carrier_adapter, head.carrier_head)
             if model.config.phase_transport_carrier_basis_trainable:
@@ -3032,6 +3253,9 @@ def train(
         ),
         phase_transport_signed_alignment_weight=float(
             train_config.get("phase_transport_signed_alignment_weight", 0.0)
+        ),
+        phase_transport_detail_utility_kernel=int(
+            train_config.get("phase_transport_detail_utility_kernel", 5)
         ),
         risk_flow_steps=int(train_config.get("risk_flow_steps", 4)),
         bridge_flow_steps=int(train_config.get("bridge_flow_steps", 4)),

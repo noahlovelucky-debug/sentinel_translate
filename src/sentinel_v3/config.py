@@ -61,6 +61,7 @@ DEFAULT: dict[str, Any] = {
         "phase_transport_hf_weight": 0.05,
         "phase_transport_utility_weight": 0.10,
         "phase_transport_signed_alignment_weight": 0.0,
+        "phase_transport_detail_utility_kernel": 5,
         "risk_flow_steps": 4,
         "bridge_flow_steps": 4,
         "codec_perceptual_every": 8,
@@ -162,6 +163,8 @@ def validate_config(config: dict[str, Any]) -> None:
     model.setdefault("phase_transport_carrier_gain_caps", model["phase_transport_gain_caps"])
     model.setdefault("phase_transport_carrier_support_mode", "continuous")
     model.setdefault("phase_transport_carrier_basis_trainable", True)
+    model.setdefault("phase_transport_detail_utility_enabled", False)
+    model.setdefault("phase_transport_detail_scale_cap", 2.0)
     for name in ("phase_transport_gain_caps", "phase_transport_offset_caps_px"):
         values = model[name]
         if not isinstance(values, (list, tuple)) or len(values) != 3:
@@ -214,6 +217,19 @@ def validate_config(config: dict[str, Any]) -> None:
         )
     if not isinstance(model["phase_transport_carrier_basis_trainable"], bool):
         raise TypeError("model.phase_transport_carrier_basis_trainable must be a bool")
+    if not isinstance(model["phase_transport_detail_utility_enabled"], bool):
+        raise TypeError("model.phase_transport_detail_utility_enabled must be a bool")
+    detail_scale_cap = model["phase_transport_detail_scale_cap"]
+    if isinstance(detail_scale_cap, bool) or not isinstance(detail_scale_cap, (int, float)):
+        raise TypeError("model.phase_transport_detail_scale_cap must be numeric")
+    detail_scale_cap = float(detail_scale_cap)
+    if not math.isfinite(detail_scale_cap):
+        raise ValueError("model.phase_transport_detail_scale_cap must be finite")
+    if model["phase_transport_detail_utility_enabled"] and not 1.0 < detail_scale_cap <= 4.0:
+        raise ValueError(
+            "model.phase_transport_detail_scale_cap must be in (1, 4] when detail utility is enabled"
+        )
+    model["phase_transport_detail_scale_cap"] = detail_scale_cap
     for name in ("flow_noise_scale", "optical_flow_noise_scale", "sar_flow_noise_scale"):
         if model[name] is not None and float(model[name]) < 0.0:
             raise ValueError(f"model.{name} must be non-negative")
@@ -272,6 +288,11 @@ def validate_config(config: dict[str, Any]) -> None:
     ):
         if not math.isfinite(float(train[name])) or float(train[name]) < 0.0:
             raise ValueError(f"train.{name} must be non-negative")
+    detail_utility_kernel = train["phase_transport_detail_utility_kernel"]
+    if isinstance(detail_utility_kernel, bool) or not isinstance(detail_utility_kernel, int):
+        raise TypeError("train.phase_transport_detail_utility_kernel must be an odd positive integer")
+    if detail_utility_kernel < 1 or detail_utility_kernel % 2 == 0:
+        raise ValueError("train.phase_transport_detail_utility_kernel must be an odd positive integer")
     for name in ("flow_rollout_every", "flow_rollout_steps", "flow_rollout_samples"):
         if int(train[name]) < 1:
             raise ValueError(f"train.{name} must be positive")

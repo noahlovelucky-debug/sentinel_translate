@@ -849,6 +849,8 @@ class ObservablePhaseTransportHead(nn.Module):
         carrier_mode: str = "physical_gain",
         carrier_gain_caps: Sequence[float] | None = None,
         carrier_support_mode: str = "continuous",
+        detail_utility_enabled: bool = False,
+        detail_utility_scale_cap: float = 2.0,
     ) -> None:
         super().__init__()
         if len(gain_caps) != 3 or len(offset_caps_px) != 3:
@@ -884,6 +886,19 @@ class ObservablePhaseTransportHead(nn.Module):
             raise ValueError(
                 "phase transport carrier_support_mode must be continuous or binary_exceedance"
             )
+        if not isinstance(detail_utility_enabled, bool):
+            raise TypeError("phase transport detail_utility_enabled must be a bool")
+        if isinstance(detail_utility_scale_cap, bool) or not isinstance(
+            detail_utility_scale_cap, (int, float)
+        ):
+            raise TypeError("phase transport detail_utility_scale_cap must be numeric")
+        detail_scale_cap = float(detail_utility_scale_cap)
+        if not math.isfinite(detail_scale_cap):
+            raise ValueError("phase transport detail_utility_scale_cap must be finite")
+        if detail_utility_enabled and not 1.0 < detail_scale_cap <= 4.0:
+            raise ValueError(
+                "phase transport detail_utility_scale_cap must be in (1, 4] when enabled"
+            )
         self.gain_caps = tuple(float(value) for value in gain_caps)
         self.carrier_gain_caps = tuple(float(value) for value in resolved_carrier_gain_caps)
         self.offset_caps_px = tuple(float(value) for value in offset_caps_px)
@@ -893,6 +908,8 @@ class ObservablePhaseTransportHead(nn.Module):
         self.support_epsilon = float(support_epsilon)
         self.carrier_mode = carrier_mode
         self.carrier_support_mode = carrier_support_mode
+        self.detail_utility_enabled = detail_utility_enabled
+        self.detail_utility_scale_cap = detail_scale_cap
         self.pyramid_projections = nn.ModuleList(
             [nn.Conv2d(channels, 32, 1) for channels in pyramid_channels]
         )
@@ -921,6 +938,21 @@ class ObservablePhaseTransportHead(nn.Module):
             self.carrier_head = nn.Conv2d(carrier_hidden, 3, 1)
             nn.init.zeros_(self.carrier_head.weight)
             nn.init.zeros_(self.carrier_head.bias)
+        if detail_utility_enabled:
+            detail_hidden = max(16, hidden // 4)
+            self.detail_utility_adapter = nn.Sequential(
+                nn.Conv2d(hidden, detail_hidden, 3, padding=1),
+                nn.SiLU(),
+                ResidualBlock(detail_hidden),
+            )
+            self.detail_utility_head = nn.Conv2d(detail_hidden, 3, 1)
+            nn.init.zeros_(self.detail_utility_head.weight)
+            nn.init.zeros_(self.detail_utility_head.bias)
+            with torch.no_grad():
+                initial_probability = 1.0 / detail_scale_cap
+                self.detail_utility_head.bias.fill_(
+                    math.log(initial_probability / (1.0 - initial_probability))
+                )
 
     @staticmethod
     def _full_gradients(values: Tensor) -> tuple[Tensor, Tensor]:
@@ -1217,6 +1249,14 @@ class ObservablePhaseTransportHead(nn.Module):
         )
         features = self.trunk(self.fuse(torch.cat((*scene_features, physical_features), dim=1)))
         output = self.output(features)
+        detail_utility_diagnostics: dict[str, Tensor] = {}
+        if self.detail_utility_enabled:
+            detail_scale_raw = self.detail_utility_head(self.detail_utility_adapter(features))
+            detail_scale = self.detail_utility_scale_cap * torch.sigmoid(detail_scale_raw)
+            detail_utility_diagnostics = {
+                "detail_scale": detail_scale,
+                "detail_scale_raw": detail_scale_raw,
+            }
         raw_gain = output[:, :3]
         source_phase = self.source_phase_projection(pyramid[0])
         source_phase = F.interpolate(
@@ -1244,6 +1284,7 @@ class ObservablePhaseTransportHead(nn.Module):
                 "null_level": null_level,
                 "null_coherence": null_coherence,
                 "source_phase": source_phase,
+                **detail_utility_diagnostics,
             }
             if self.carrier_mode != "orthogonal_source":
                 return parallel_delta, diagnostics
@@ -1274,6 +1315,7 @@ class ObservablePhaseTransportHead(nn.Module):
             "offset_px": offsets,
             "coherence": coherence,
             "source_phase": source_phase,
+            **detail_utility_diagnostics,
         }
         if self.carrier_mode != "orthogonal_source":
             return parallel_delta, diagnostics
@@ -1541,6 +1583,8 @@ class ModelConfig:
     phase_transport_carrier_mode: str = "physical_gain"
     phase_transport_carrier_support_mode: str = "continuous"
     phase_transport_carrier_basis_trainable: bool = True
+    phase_transport_detail_utility_enabled: bool = False
+    phase_transport_detail_scale_cap: float = 2.0
     architecture: str = "v3.2"
 
     def __post_init__(self) -> None:
@@ -1636,6 +1680,20 @@ class ModelConfig:
             )
         if not isinstance(self.phase_transport_carrier_basis_trainable, bool):
             raise TypeError("phase_transport_carrier_basis_trainable must be a bool")
+        if not isinstance(self.phase_transport_detail_utility_enabled, bool):
+            raise TypeError("phase_transport_detail_utility_enabled must be a bool")
+        if isinstance(self.phase_transport_detail_scale_cap, bool) or not isinstance(
+            self.phase_transport_detail_scale_cap, (int, float)
+        ):
+            raise TypeError("phase_transport_detail_scale_cap must be numeric")
+        detail_scale_cap = float(self.phase_transport_detail_scale_cap)
+        if not math.isfinite(detail_scale_cap):
+            raise ValueError("phase_transport_detail_scale_cap must be finite")
+        if self.phase_transport_detail_utility_enabled and not 1.0 < detail_scale_cap <= 4.0:
+            raise ValueError(
+                "phase_transport_detail_scale_cap must be in (1, 4] when detail utility is enabled"
+            )
+        self.phase_transport_detail_scale_cap = detail_scale_cap
 
 
 class SentinelV3(nn.Module):
@@ -1691,6 +1749,8 @@ class SentinelV3(nn.Module):
             cfg.phase_transport_carrier_mode,
             cfg.phase_transport_carrier_gain_caps,
             cfg.phase_transport_carrier_support_mode,
+            cfg.phase_transport_detail_utility_enabled,
+            cfg.phase_transport_detail_scale_cap,
         )
         self.register_buffer("optical_alpha_scale", torch.ones(()))
         self.register_buffer("optical_bridge_alpha_scale", torch.ones(()))
@@ -1981,6 +2041,37 @@ class SentinelV3(nn.Module):
             return torch.zeros_like(physical), {}
         return self.phase_transport_head(pyramid, physical)
 
+    @staticmethod
+    def compose_phase_transport_detail_utility(
+        base_detail: Tensor,
+        detail_scale: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        """Rescale frozen detail bands without introducing a new phase field."""
+
+        if base_detail.ndim != 4 or base_detail.shape[1] != 3:
+            raise ValueError("detail utility base detail must be B3HW")
+        if detail_scale.ndim != 4 or detail_scale.shape[:2] != base_detail.shape[:2]:
+            raise ValueError("detail utility scale must be B3hw for the base detail batch")
+        if base_detail.shape[-2] % 8 or base_detail.shape[-1] % 8:
+            raise ValueError("detail utility base dimensions must be divisible by eight")
+        full_scale = F.interpolate(
+            detail_scale.to(base_detail),
+            size=base_detail.shape[-2:],
+            mode="bilinear",
+            align_corners=False,
+        )
+        scale_offset = full_scale - 1.0
+        bands = frequency_bands(base_detail, levels=3)
+        scaled_bands = sum(
+            (
+                scale_offset[:, band : band + 1] * component
+                for band, component in enumerate(bands)
+            ),
+            torch.zeros_like(base_detail),
+        )
+        correction = highpass(scaled_bands)
+        return base_detail + correction, correction
+
     def phase_transport_detail(
         self,
         pyramid: Pyramid,
@@ -1995,7 +2086,14 @@ class SentinelV3(nn.Module):
             raise ValueError("phase transport is defined for Optical targets only")
         anchor = self.id_bridge_anchor_detail(pyramid, physical, target)
         delta, diagnostics = self.phase_transport_delta(pyramid, physical, target)
-        detail = anchor + delta
+        if self.config.phase_transport_detail_utility_enabled:
+            parallel_delta = diagnostics.get("parallel_delta", delta).detach()
+            base_detail = anchor + parallel_delta
+            detail, _ = self.compose_phase_transport_detail_utility(
+                base_detail, diagnostics["detail_scale"]
+            )
+        else:
+            detail = anchor + delta
         if return_diagnostics:
             return detail, anchor, delta, diagnostics
         return detail
@@ -2473,6 +2571,8 @@ class SentinelV3(nn.Module):
             "phase_transport_carrier_mode": self.config.phase_transport_carrier_mode,
             "phase_transport_carrier_support_mode": self.config.phase_transport_carrier_support_mode,
             "phase_transport_carrier_basis_trainable": self.config.phase_transport_carrier_basis_trainable,
+            "phase_transport_detail_utility_enabled": self.config.phase_transport_detail_utility_enabled,
+            "phase_transport_detail_scale_cap": self.config.phase_transport_detail_scale_cap,
         }
 
     def sample_id_bridge_residual(

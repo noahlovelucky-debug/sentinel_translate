@@ -78,6 +78,8 @@ def _haar_model(
     phase_transport_carrier_mode: str = "physical_gain",
     phase_transport_carrier_support_mode: str = "continuous",
     phase_transport_carrier_basis_trainable: bool = True,
+    phase_transport_detail_utility_enabled: bool = False,
+    phase_transport_detail_scale_cap: float = 2.0,
 ) -> SentinelV3:
     return SentinelV3(
         ModelConfig(
@@ -116,6 +118,8 @@ def _haar_model(
             phase_transport_carrier_mode=phase_transport_carrier_mode,
             phase_transport_carrier_support_mode=phase_transport_carrier_support_mode,
             phase_transport_carrier_basis_trainable=phase_transport_carrier_basis_trainable,
+            phase_transport_detail_utility_enabled=phase_transport_detail_utility_enabled,
+            phase_transport_detail_scale_cap=phase_transport_detail_scale_cap,
         )
     )
 
@@ -267,6 +271,24 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     assert ModelConfig().phase_transport_carrier_basis_trainable is True
     with pytest.raises(TypeError, match="carrier_basis_trainable"):
         ModelConfig(phase_transport_carrier_basis_trainable=1)  # type: ignore[arg-type]
+    assert ModelConfig().phase_transport_detail_utility_enabled is False
+    assert ModelConfig().phase_transport_detail_scale_cap == pytest.approx(2.0)
+    with pytest.raises(TypeError, match="detail_utility_enabled"):
+        ModelConfig(phase_transport_detail_utility_enabled=1)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="detail_scale_cap"):
+        ModelConfig(phase_transport_detail_scale_cap=True)  # type: ignore[arg-type]
+    with pytest.raises(ValueError, match="detail_scale_cap"):
+        ModelConfig(phase_transport_detail_scale_cap=float("inf"))
+    with pytest.raises(ValueError, match="detail_scale_cap"):
+        ModelConfig(
+            phase_transport_detail_utility_enabled=True,
+            phase_transport_detail_scale_cap=1.0,
+        )
+    with pytest.raises(ValueError, match="detail_scale_cap"):
+        ModelConfig(
+            phase_transport_detail_utility_enabled=True,
+            phase_transport_detail_scale_cap=4.01,
+        )
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_hf_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_hf_weight"):
@@ -302,14 +324,35 @@ def test_phase_transport_config_ranges_and_configs() -> None:
     config["model"]["phase_transport_carrier_basis_trainable"] = 1
     with pytest.raises(TypeError, match="phase_transport_carrier_basis_trainable"):
         validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_detail_utility_enabled"] = 1
+    with pytest.raises(TypeError, match="phase_transport_detail_utility_enabled"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["model"]["phase_transport_detail_utility_enabled"] = True
+    config["model"]["phase_transport_detail_scale_cap"] = 1.0
+    with pytest.raises(ValueError, match="phase_transport_detail_scale_cap"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["train"]["phase_transport_detail_utility_kernel"] = 4
+    with pytest.raises(ValueError, match="phase_transport_detail_utility_kernel"):
+        validate_config(config)
+    config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
+    config["train"]["phase_transport_detail_utility_kernel"] = True
+    with pytest.raises(TypeError, match="phase_transport_detail_utility_kernel"):
+        validate_config(config)
     legacy_config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     legacy_config["model"].pop("phase_transport_carrier_gain_caps")
     legacy_config["model"].pop("phase_transport_carrier_support_mode")
     legacy_config["model"].pop("phase_transport_carrier_basis_trainable")
+    legacy_config["model"].pop("phase_transport_detail_utility_enabled")
+    legacy_config["model"].pop("phase_transport_detail_scale_cap")
     validate_config(legacy_config)
     assert legacy_config["model"]["phase_transport_carrier_gain_caps"] == [0.5, 0.25, 0.1]
     assert legacy_config["model"]["phase_transport_carrier_support_mode"] == "continuous"
     assert legacy_config["model"]["phase_transport_carrier_basis_trainable"] is True
+    assert legacy_config["model"]["phase_transport_detail_utility_enabled"] is False
+    assert legacy_config["model"]["phase_transport_detail_scale_cap"] == pytest.approx(2.0)
     config = load_config(Path(__file__).parents[1] / "configs" / "smoke_phase_transport.yaml")
     config["train"]["phase_transport_signed_alignment_weight"] = -0.01
     with pytest.raises(ValueError, match="phase_transport_signed_alignment_weight"):
@@ -469,6 +512,38 @@ def test_canonical_ncopc_stationary_phase_transport_configs() -> None:
         assert model["phase_transport_carrier_basis_trainable"] is False
         assert "ncopc_stationary" in config["paths"]["output"]
         assert "ncopc_stationary" in config["paths"]["reports"]
+        validate_config(config)
+    assert load_config(root / names[-1])["validation"]["full_steps"] == []
+
+
+def test_canonical_spuf_phase_transport_configs() -> None:
+    root = Path(__file__).parents[1] / "configs"
+    names = (
+        "canonical_2017_2024_phase_transport_spuf_connectivity.yaml",
+        "canonical_2017_2024_phase_transport_spuf_pilot.yaml",
+    )
+    expected_steps = (100, 1000)
+    expected_validation = (100, 250)
+    for name, steps, validation_every in zip(
+        names, expected_steps, expected_validation, strict=True
+    ):
+        config = load_config(root / name)
+        model = config["model"]
+        train = config["train"]
+        assert train["stage"] == "phase_transport"
+        assert train["max_steps"] == steps
+        assert train["batch_size"] == 1
+        assert train["gradient_accumulation"] == 2
+        assert train["validate_every"] == validation_every
+        assert train["flow_rollout_steps"] == 1
+        assert train["init_use_ema"] is True
+        assert train["phase_transport_utility_weight"] == pytest.approx(1.0)
+        assert train["phase_transport_detail_utility_kernel"] == 5
+        assert model["phase_transport_carrier_mode"] == "physical_gain"
+        assert model["phase_transport_detail_utility_enabled"] is True
+        assert model["phase_transport_detail_scale_cap"] == pytest.approx(2.0)
+        assert "spuf" in config["paths"]["output"]
+        assert "spuf" in config["paths"]["reports"]
         validate_config(config)
     assert load_config(root / names[-1])["validation"]["full_steps"] == []
 
@@ -2787,6 +2862,8 @@ def test_id_bridge_optimizer_updates_origin_and_checkpoint_ema(tiny_model: Senti
         "phase_transport_carrier_mode": "physical_gain",
         "phase_transport_carrier_support_mode": "continuous",
         "phase_transport_carrier_basis_trainable": True,
+        "phase_transport_detail_utility_enabled": False,
+        "phase_transport_detail_scale_cap": 2.0,
         "antithetic_weight": 0.0,
     }
 
@@ -2847,6 +2924,8 @@ def test_haar_id_bridge_optimizer_and_checkpoint_metadata() -> None:
         "phase_transport_carrier_mode": "physical_gain",
         "phase_transport_carrier_support_mode": "continuous",
         "phase_transport_carrier_basis_trainable": True,
+        "phase_transport_detail_utility_enabled": False,
+        "phase_transport_detail_scale_cap": 2.0,
         "antithetic_weight": 0.0,
     }
 
@@ -3113,6 +3192,264 @@ def test_null_calibrated_phase_transport_trains_without_offsets_and_keeps_long_g
         for name, parameter in model.named_parameters()
         if not name.startswith("phase_transport_head.")
     )
+
+    model.zero_grad(set_to_none=True)
+    zero_loss, _ = objective(_batch(delta_days=2), "phase_transport")
+    zero_loss.backward()
+    assert float(zero_loss.detach()) == 0.0
+    assert all(
+        parameter.grad is not None and int(torch.count_nonzero(parameter.grad)) == 0
+        for parameter in model.parameters()
+        if parameter.requires_grad
+    )
+
+
+def test_spuf_zero_init_is_compatible_with_the_frozen_phase_baseline() -> None:
+    legacy = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+    ).eval()
+    spuf = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+        phase_transport_detail_utility_enabled=True,
+        phase_transport_detail_scale_cap=2.0,
+    ).eval()
+    initial_head = {
+        name: parameter.detach().clone()
+        for name, parameter in spuf.phase_transport_head.detail_utility_head.named_parameters()
+    }
+    loaded, missing = training_module._load_compatible_state(
+        spuf, {name: value.detach().clone() for name, value in legacy.state_dict().items()}
+    )
+    assert loaded > 0 and missing > 0
+    assert not hasattr(legacy.phase_transport_head, "detail_utility_adapter")
+    assert torch.equal(
+        spuf.phase_transport_head.detail_utility_head.weight,
+        initial_head["weight"],
+    )
+    assert torch.equal(spuf.phase_transport_head.detail_utility_head.bias, initial_head["bias"])
+
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = legacy.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    legacy_delta, _ = legacy.phase_transport_delta(pyramid, base, SENTINEL2)
+    spuf_delta, diagnostics = spuf.phase_transport_delta(pyramid, base, SENTINEL2)
+    torch.testing.assert_close(diagnostics["detail_scale"], torch.ones_like(diagnostics["detail_scale"]))
+    torch.testing.assert_close(diagnostics["detail_scale_raw"], torch.zeros_like(diagnostics["detail_scale_raw"]))
+    torch.testing.assert_close(spuf_delta, legacy_delta, atol=0.0, rtol=0.0)
+    legacy_detail = legacy.phase_transport_detail(pyramid, base, SENTINEL2)
+    spuf_detail = spuf.phase_transport_detail(pyramid, base, SENTINEL2)
+    spuf_visual = spuf.visual_detail(pyramid, SENTINEL1, SENTINEL2, (32, 32), base)
+    torch.testing.assert_close(spuf_detail, legacy_detail, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(spuf_visual, legacy_detail, atol=0.0, rtol=0.0)
+    metadata = spuf.residual_state_metadata()
+    assert metadata["phase_transport_detail_utility_enabled"] is True
+    assert metadata["phase_transport_detail_scale_cap"] == pytest.approx(2.0)
+
+
+def test_spuf_composition_scales_existing_detail_bands_without_low_frequency_leakage() -> None:
+    height = width = 32
+    rows = torch.arange(height).view(height, 1)
+    columns = torch.arange(width).view(1, width)
+    checkerboard = rows.add(columns).remainder(2).mul(2).sub(1).float()
+    base_detail = checkerboard.view(1, 1, height, width).expand(1, 3, -1, -1).clone()
+    scales_one = torch.ones(1, 3, 8, 8)
+    detail_one, correction_one = SentinelV3.compose_phase_transport_detail_utility(
+        base_detail, scales_one
+    )
+    torch.testing.assert_close(detail_one, base_detail, atol=0.0, rtol=0.0)
+    torch.testing.assert_close(correction_one, torch.zeros_like(correction_one), atol=0.0, rtol=0.0)
+
+    scales_zero = torch.zeros_like(scales_one)
+    scales_two = torch.full_like(scales_one, 2.0)
+    _, correction_zero = SentinelV3.compose_phase_transport_detail_utility(
+        base_detail, scales_zero
+    )
+    _, correction_two = SentinelV3.compose_phase_transport_detail_utility(
+        base_detail, scales_two
+    )
+    expected_positive = highpass(sum(frequency_bands(base_detail, levels=3)))
+    torch.testing.assert_close(correction_two, expected_positive, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(correction_zero, -expected_positive, atol=1e-6, rtol=1e-6)
+    assert float((correction_two * base_detail).mean()) > 0.0
+    assert float((correction_zero * base_detail).mean()) < 0.0
+    assert float(F.avg_pool2d(correction_two, 4, stride=4).abs().amax()) < 1e-6
+    assert float(F.avg_pool2d(correction_zero, 4, stride=4).abs().amax()) < 1e-6
+
+
+def test_spuf_oracle_smoothing_and_scale_diagnostics_are_finite() -> None:
+    oracle = torch.zeros(1, 3, 5, 5)
+    oracle[:, :, 2, 2] = torch.tensor((0.5, 1.0, 1.5)).view(1, 3)
+    strict_valid = torch.ones(1, 1, 5, 5)
+    smoothed = JointObjective._smoothed_detail_utility_oracle(oracle, strict_valid, 5)
+    expected = F.avg_pool2d(oracle, 5, stride=1, padding=2, count_include_pad=False)
+    torch.testing.assert_close(smoothed, expected)
+    assert not smoothed.requires_grad
+    torch.testing.assert_close(
+        JointObjective._smoothed_detail_utility_oracle(oracle, torch.zeros_like(strict_valid), 5),
+        torch.zeros_like(oracle),
+    )
+
+    oracle = torch.tensor(
+        [
+            [
+                [[0.2, 0.4], [0.6, 0.8]],
+                [[0.3, 0.5], [0.7, 0.9]],
+                [[0.1, 0.6], [1.1, 1.6]],
+            ]
+        ]
+    )
+    strict_valid = torch.ones(1, 1, 2, 2)
+    weights = torch.ones(1)
+    perfect = oracle.clone().requires_grad_()
+    anti = 2.0 - oracle
+    perfect_metrics = JointObjective._detail_scale_diagnostics(
+        perfect, oracle, strict_valid, weights
+    )
+    anti_metrics = JointObjective._detail_scale_diagnostics(anti, oracle, strict_valid, weights)
+    empty_metrics = JointObjective._detail_scale_diagnostics(
+        perfect, oracle, torch.zeros_like(strict_valid), weights
+    )
+    for name in ("fine", "mid", "coarse"):
+        assert float(perfect_metrics[f"detail_scale_mae_{name}"]) == pytest.approx(0.0)
+        assert float(perfect_metrics[f"detail_scale_corr_{name}"]) == pytest.approx(1.0)
+        assert float(anti_metrics[f"detail_scale_mae_{name}"]) > 0.0
+        assert float(anti_metrics[f"detail_scale_corr_{name}"]) == pytest.approx(-1.0)
+        assert float(empty_metrics[f"detail_scale_predicted_mean_{name}"]) == pytest.approx(0.0)
+        assert float(empty_metrics[f"detail_scale_oracle_mean_{name}"]) == pytest.approx(0.0)
+        assert float(empty_metrics[f"detail_scale_mae_{name}"]) == pytest.approx(0.0)
+        assert float(empty_metrics[f"detail_scale_corr_{name}"]) == pytest.approx(0.0)
+    assert all(bool(torch.isfinite(value)) for value in empty_metrics.values())
+    assert not any(value.requires_grad for value in perfect_metrics.values())
+
+
+def test_spuf_phase_transport_trains_only_the_scale_head_and_keeps_long_gaps_zero(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model = _haar_model(
+        anchor_origin=True,
+        phase=True,
+        optical_only=True,
+        phase_transport=True,
+        optical_correction_scale=0.0,
+        optical_innovation_band_scales=(0.0, 0.0, 0.0),
+        phase_transport_null_calibrated=True,
+        phase_transport_detail_utility_enabled=True,
+        phase_transport_detail_scale_cap=2.0,
+    )
+    _set_trainable(model, "phase_transport")
+    prefixes = (
+        "phase_transport_head.detail_utility_adapter.",
+        "phase_transport_head.detail_utility_head.",
+    )
+    trainable = {name for name, parameter in model.named_parameters() if parameter.requires_grad}
+    assert trainable and all(name.startswith(prefixes) for name in trainable)
+    assert not model.phase_transport_head.output[-1].weight.requires_grad
+    assert not model.phase_transport_head.source_phase_projection.weight.requires_grad
+    optimizer = _optimizer(
+        model,
+        {"learning_rate": 1e-3, "encoder_learning_rate": 1e-3, "weight_decay": 0.0},
+        "phase_transport",
+        torch.device("cpu"),
+    )
+    optimizer_ids = {
+        id(parameter) for group in optimizer.param_groups for parameter in group["params"]
+    }
+    assert optimizer_ids == {
+        id(parameter) for parameter in model.parameters() if parameter.requires_grad
+    }
+
+    valid = torch.ones(1, 1, 32, 32)
+    pyramid = model.encode(torch.randn(1, 2, 32, 32), SENTINEL1, valid)
+    base = torch.rand(1, 3, 32, 32)
+    composition_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    original_composition = SentinelV3.compose_phase_transport_detail_utility
+
+    def capture_composition(
+        base_detail: torch.Tensor, detail_scale: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        composition_calls.append((base_detail, detail_scale))
+        return original_composition(base_detail, detail_scale)
+
+    monkeypatch.setattr(
+        SentinelV3,
+        "compose_phase_transport_detail_utility",
+        staticmethod(capture_composition),
+    )
+    ema = EMA(model, decay=0.9)
+    with ema.apply_to(model):
+        detail, anchor, delta, diagnostics = model.phase_transport_detail(
+            pyramid, base, SENTINEL2, return_diagnostics=True
+        )
+    torch.testing.assert_close(diagnostics["detail_scale"], torch.ones_like(diagnostics["detail_scale"]))
+    torch.testing.assert_close(detail, anchor + delta, atol=0.0, rtol=0.0)
+
+    before_step = {name: parameter.detach().clone() for name, parameter in model.named_parameters()}
+    objective = JointObjective(
+        model,
+        [0.5, 0.5],
+        flow_rollout_every=4,
+        flow_visual_perceptual_weight=0.0,
+        phase_transport_utility_weight=1.0,
+        phase_transport_detail_utility_kernel=5,
+    )
+    objective.set_progress(1, 100)
+    loss, metrics = objective(_batch(), "phase_transport")
+    assert bool(torch.isfinite(loss))
+    assert len(composition_calls) >= 2
+    for name in (
+        "detail_utility",
+        "detail_scale_predicted_mean_fine",
+        "detail_scale_oracle_mean_fine",
+        "detail_scale_mae_fine",
+        "detail_scale_corr_fine",
+        "detail_utility_correction_rms",
+        "detail_utility_low_frequency_leakage",
+    ):
+        metric_name = f"sar2opt/{name}"
+        assert metric_name in metrics and bool(torch.isfinite(metrics[metric_name]))
+    loss.backward()
+    assert model.phase_transport_head.detail_utility_head.bias.grad is not None
+    assert int(torch.count_nonzero(model.phase_transport_head.detail_utility_head.bias.grad)) > 0
+    assert all(
+        parameter.grad is None
+        for name, parameter in model.named_parameters()
+        if not name.startswith(prefixes)
+    )
+    optimizer.step()
+    changed = {
+        name
+        for name, parameter in model.named_parameters()
+        if not torch.equal(parameter.detach(), before_step[name])
+    }
+    assert changed and all(name.startswith(prefixes) for name in changed)
+    payload = _checkpoint_payload(
+        model=model,
+        ema=ema,
+        optimizer=optimizer,
+        scheduler=_scheduler(optimizer, warmup=0, maximum=1),
+        stage="phase_transport",
+        step=1,
+        rank_states=[],
+        config={},
+        validation_protocol_hash="test",
+        best_metrics={},
+        quality_gates={},
+    )
+    residual_state = payload["residual_state"]  # type: ignore[index]
+    assert residual_state["phase_transport_detail_utility_enabled"] is True  # type: ignore[index]
+    assert residual_state["phase_transport_detail_scale_cap"] == pytest.approx(2.0)  # type: ignore[index]
 
     model.zero_grad(set_to_none=True)
     zero_loss, _ = objective(_batch(delta_days=2), "phase_transport")
