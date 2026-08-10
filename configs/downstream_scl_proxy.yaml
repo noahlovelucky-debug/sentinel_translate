@@ -1,0 +1,33 @@
+# Immutable inputs for the leakage-safe downstream SCL proxy benchmark.
+paths:
+  manifest: /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl
+  train_shards: /data/datasets/sentinel_translate_v32_2017_2024/shards/train/index.json
+  cache_root: /data/datasets/sentinel_translate_v32_2017_2024/downstream_scl_proxy
+  checkpoint:
+    path: /data/code/sentinel_translat/v3.2/checkpoints_v32_canonical_2017_2024/best_physical.pt
+    sha256: 5c26e96ee639609624d350f4ab4eff272a94b9f799fc9ce51579ee1420881363
+
+cache:
+  crop_size: 256
+  materialized_chunk_size: 32
+
+# Coordinates are retained beside the complete canonical tile identifiers to
+# make the fixed development split auditable without relying on a name parser.
+dev_tiles:
+  - coordinate: [0, 0]
+    tile: Beijing_r0000_c0000_y000000_x000000_h256_w256
+  - coordinate: [0, 4]
+    tile: Beijing_r0000_c0004_y000000_x001024_h256_w256
+  - coordinate: [2, 2]
+    tile: Beijing_r0002_c0002_y000512_x000512_h256_w256
+  - coordinate: [4, 0]
+    tile: Beijing_r0004_c0000_y001024_x000000_h256_w256
+  - coordinate: [4, 4]
+    tile: Beijing_r0004_c0004_y001024_x001024_h256_w256
+
+probe:
+  seeds: [13, 17, 29]
+  epochs: 12
+  steps_per_epoch: 100
+  batch_size: 8
+  width: 16
