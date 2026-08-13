@@ -146,6 +146,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--num-workers", type=int)
     parser.add_argument("--learning-rate", type=float)
     parser.add_argument("--encoder-learning-rate", type=float)
+    parser.add_argument("--trainable-scope", choices=("full", "confidence_only"))
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -927,6 +928,11 @@ def main() -> None:
             train_config,
             learning_rate=learning_rate,
             encoder_learning_rate=encoder_learning_rate,
+            trainable_scope=(
+                train_config.trainable_scope
+                if args.trainable_scope is None
+                else args.trainable_scope
+            ),
         )
         model = SOPAT(model_config)
         initialization: dict[str, object] | None = None
@@ -940,7 +946,9 @@ def main() -> None:
             )
         elif args.init_v3 is not None:
             initialization = initialize_from_v3_checkpoint(model, args.init_v3)
-        configure_sopat_stage(model, args.stage)
+        configure_sopat_stage(
+            model, args.stage, trainable_scope=train_config.trainable_scope
+        )
         activation_checkpointing = bool(training.get("activation_checkpointing", False))
         set_activation_checkpointing = getattr(model, "set_activation_checkpointing", None)
         if callable(set_activation_checkpointing):

@@ -31,6 +31,7 @@ from torch import Tensor, nn
 
 Direction = Literal["sar_to_optical", "optical_to_sar"]
 Stage = Literal["factorizer", "physical"]
+TrainableScope = Literal["full", "confidence_only"]
 
 DIRECTIONS: tuple[Direction, Direction] = ("sar_to_optical", "optical_to_sar")
 SOPAT_V4_FORMAT = 1
@@ -71,6 +72,7 @@ class SOPATTrainConfig:
     """Stage and objective settings shared by both translation directions."""
 
     stage: Stage = "factorizer"
+    trainable_scope: TrainableScope = "full"
     direction_weights: Mapping[str, float] = field(
         default_factory=lambda: {"sar_to_optical": 1.0, "optical_to_sar": 1.0}
     )
@@ -109,6 +111,10 @@ class SOPATTrainConfig:
     def __post_init__(self) -> None:
         if self.stage not in {"factorizer", "physical"}:
             raise ValueError("SOPAT stage must be factorizer or physical")
+        if self.trainable_scope not in {"full", "confidence_only"}:
+            raise ValueError("SOPAT trainable_scope must be full or confidence_only")
+        if self.stage != "physical" and self.trainable_scope != "full":
+            raise ValueError("confidence_only scope is valid only for the physical stage")
         if self.learning_rate <= 0.0 or self.gradient_clip <= 0.0:
             raise ValueError("learning_rate and gradient_clip must be positive")
         encoder_learning_rate = (
@@ -1280,41 +1286,61 @@ class SOPATTrainingModule(nn.Module):
         return total, {"direction_losses": direction_losses, "metrics": metrics}
 
 
-def configure_sopat_stage(model: nn.Module, stage: Stage) -> None:
+def configure_sopat_stage(
+    model: nn.Module, stage: Stage, *, trainable_scope: TrainableScope = "full"
+) -> None:
     """Delegate stage freezing to the core model when it exposes the contract."""
 
     if stage not in {"factorizer", "physical"}:
         raise ValueError("SOPAT stage must be factorizer or physical")
+    if trainable_scope not in {"full", "confidence_only"}:
+        raise ValueError("SOPAT trainable_scope must be full or confidence_only")
+    if stage != "physical" and trainable_scope != "full":
+        raise ValueError("confidence_only scope is valid only for the physical stage")
+    configured = False
     for name in ("set_training_stage", "set_stage"):
         setter = getattr(model, name, None)
         if callable(setter):
             setter(stage)
-            return
-    if stage == "physical":
+            configured = True
+            break
+    if not configured and stage == "physical":
         for parameter in model.parameters():
             parameter.requires_grad_(True)
+    elif not configured:
+        # Explicit fallback for compact cores that expose stable factorizer names.
+        for parameter in model.parameters():
+            parameter.requires_grad_(False)
+        enabled = 0
+        for name in ("encoder", "factorizer", "anchor_reconstructors"):
+            component = getattr(model, name, None)
+            if not isinstance(component, nn.Module):
+                continue
+            for parameter in component.parameters():
+                parameter.requires_grad_(True)
+                enabled += 1
+        if enabled == 0:
+            raise RuntimeError(
+                "SOPAT core must expose set_training_stage/set_stage or public "
+                "factorizer components for factorizer training"
+            )
+    if trainable_scope == "full":
         return
-    # The initial public SOPAT core deliberately keeps the model surface small.
-    # Its factorizer components have stable public names, so use an explicit
-    # fallback rather than accidentally optimizing the transport renderer in
-    # the anchor-only stage.  Future cores should provide ``set_training_stage``
-    # and take precedence above.
     for parameter in model.parameters():
         parameter.requires_grad_(False)
-    component_names = ("encoder", "factorizer", "anchor_reconstructors")
+    renderers = getattr(model, "renderers", None)
+    if not isinstance(renderers, nn.ModuleDict):
+        raise TypeError("confidence_only scope requires model.renderers ModuleDict")
     enabled = 0
-    for name in component_names:
-        component = getattr(model, name, None)
-        if not isinstance(component, nn.Module):
-            continue
-        for parameter in component.parameters():
+    for renderer in renderers.values():
+        confidence = getattr(renderer, "confidence", None)
+        if not isinstance(confidence, nn.Module):
+            raise TypeError("confidence_only scope requires each renderer.confidence module")
+        for parameter in confidence.parameters():
             parameter.requires_grad_(True)
-            enabled += 1
+            enabled += parameter.numel()
     if enabled == 0:
-        raise RuntimeError(
-            "SOPAT core must expose set_training_stage/set_stage or public "
-            "factorizer components for factorizer training"
-        )
+        raise RuntimeError("confidence_only scope selected no trainable parameters")
 
 
 @dataclass

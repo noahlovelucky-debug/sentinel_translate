@@ -45,6 +45,7 @@ training:
       steps: 1500
       learning_rate: 0.0002
       encoder_learning_rate: 0.00001
+      trainable_scope: full
   objective:
     factorizer_anchor_cross_weight: 1.0
     factorizer_common_alignment_weight: 0.25

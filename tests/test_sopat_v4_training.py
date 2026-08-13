@@ -23,6 +23,7 @@ from sentinel_v4.training import (
     SOPATTrainingModule,
     _structural_error,
     _utility_oracle,
+    configure_sopat_stage,
     evaluate_factorizer_loaders,
     initialize_from_sopat_checkpoint,
     initialize_from_v3_checkpoint,
@@ -538,6 +539,35 @@ def test_counterfactual_confidence_weight_is_explicit_in_all_sopat_configs(confi
 def test_counterfactual_confidence_weight_requires_a_finite_nonnegative_value(value: float) -> None:
     with pytest.raises(ValueError, match="counterfactual_confidence_weight|loss weights"):
         SOPATTrainConfig(counterfactual_confidence_weight=value)
+
+
+def test_confidence_only_scope_freezes_everything_except_two_confidence_heads() -> None:
+    model = SOPAT(
+        SOPATConfig(
+            width=8,
+            hidden=32,
+            encoder_depth=1,
+            heads=4,
+            adapter_rank=8,
+            transport_heads=4,
+            anchor_window_size=2,
+        )
+    )
+
+    configure_sopat_stage(model, "physical", trainable_scope="confidence_only")
+
+    trainable = {name for name, value in model.named_parameters() if value.requires_grad}
+    assert trainable == {
+        "renderers.optical.confidence.weight",
+        "renderers.optical.confidence.bias",
+        "renderers.sar.confidence.weight",
+        "renderers.sar.confidence.bias",
+    }
+
+
+def test_confidence_only_scope_rejects_factorizer_stage() -> None:
+    with pytest.raises(ValueError, match="physical stage"):
+        SOPATTrainConfig(stage="factorizer", trainable_scope="confidence_only")
 
 
 def test_candidate_auxiliary_and_utility_are_finite_with_closed_gate() -> None:

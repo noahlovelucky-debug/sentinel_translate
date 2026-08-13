@@ -90,12 +90,15 @@ def test_calibration_cli_exposes_ema_and_learning_rate_overrides(runner_module) 
             "1e-5",
             "--encoder-learning-rate",
             "2e-7",
+            "--trainable-scope",
+            "confidence_only",
         ]
     )
 
     assert parsed.init_use_ema is True
     assert parsed.learning_rate == pytest.approx(1.0e-5)
     assert parsed.encoder_learning_rate == pytest.approx(2.0e-7)
+    assert parsed.trainable_scope == "confidence_only"
 
 
 def test_chunk_preflight_missing_cache_is_clear_and_fail_closed(tmp_path: Path, runner_module) -> None:

@@ -37,7 +37,7 @@ training:
   ema_decay: 0.9
   stages:
     factorizer: {steps: 1, learning_rate: 0.0001, encoder_learning_rate: 0.0001}
-    physical: {steps: 1, learning_rate: 0.0001, encoder_learning_rate: 0.0001}
+    physical: {steps: 1, learning_rate: 0.0001, encoder_learning_rate: 0.0001, trainable_scope: full}
   objective:
     physical_null_change_probability: 1.0
     physical_permutation_probability: 1.0
