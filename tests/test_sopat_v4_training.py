@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import asdict
 from types import SimpleNamespace
@@ -304,12 +305,15 @@ class _GatedToyModel(nn.Module):
         anchor = inputs["target_anchor"]
         assert isinstance(anchor, torch.Tensor)
         candidate = anchor + self.candidate * torch.ones_like(anchor)
-        confidence = torch.sigmoid(self.confidence) * torch.ones_like(anchor[:, :1])
+        confidence_logits = self.confidence * torch.ones_like(anchor[:, :1])
+        confidence = torch.sigmoid(confidence_logits)
         physical = anchor + confidence * (candidate - anchor)
         return SimpleNamespace(
             physical=physical,
             candidate_physical=candidate,
             transport_confidence=confidence,
+            transport_confidence_logits=confidence_logits,
+            transport_evidence=torch.ones_like(confidence),
             log_variance=torch.zeros_like(anchor),
         )
 
@@ -332,6 +336,177 @@ def test_candidate_auxiliary_and_utility_are_finite_with_closed_gate() -> None:
     assert torch.isfinite(metrics["physical_utility"])
     assert model.candidate.grad is not None and model.candidate.grad.abs().item() > 0.0
     assert model.confidence.grad is not None and torch.isfinite(model.confidence.grad)
+
+
+def test_utility_logits_are_amp_safe_and_no_evidence_pixels_are_excluded() -> None:
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=True,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=0.0,
+    )
+    model = _GatedToyModel()
+    batch = _batch(2, 10, batch_size=2)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss, metrics = sopat_direction_objective(model, batch, "sar_to_optical", config)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["physical_utility"])
+    assert model.confidence.grad is not None and torch.isfinite(model.confidence.grad)
+
+    # An all-zero evidence mask must remove every utility-supervision pixel;
+    # the result stays finite and produces no confidence gradient from BCE.
+    class _NoEvidenceToyModel(_GatedToyModel):
+        def forward(self, **inputs: object) -> SimpleNamespace:
+            output = super().forward(**inputs)
+            anchor = inputs["target_anchor"]
+            assert isinstance(anchor, torch.Tensor)
+            # Keep every non-utility term independent of the gate parameter;
+            # any remaining confidence gradient would therefore prove that
+            # no-evidence pixels still participate in BCE supervision.
+            output.physical = anchor
+            output.transport_evidence = torch.zeros_like(output.transport_confidence)
+            return output
+
+    no_evidence = _NoEvidenceToyModel()
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        no_evidence_loss, no_evidence_metrics = sopat_direction_objective(
+            no_evidence, batch, "sar_to_optical", config
+        )
+    no_evidence_loss.backward()
+    assert torch.isfinite(no_evidence_loss)
+    assert torch.isfinite(no_evidence_metrics["physical_utility"])
+    assert no_evidence.confidence.grad is not None
+    assert no_evidence.confidence.grad.abs().item() == 0.0
+
+
+def test_legacy_probability_only_utility_fallback_is_cpu_autocast_safe() -> None:
+    class _LegacyProbabilityToyModel(_GatedToyModel):
+        def forward(self, **inputs: object) -> SimpleNamespace:
+            output = super().forward(**inputs)
+            del output.transport_confidence_logits
+            del output.transport_evidence
+            return output
+
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=True,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=0.0,
+    )
+    model = _LegacyProbabilityToyModel()
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss, metrics = sopat_direction_objective(
+            model, _batch(2, 10, batch_size=2), "sar_to_optical", config
+        )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["physical_utility"])
+    assert model.confidence.grad is not None and torch.isfinite(model.confidence.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA BF16 autocast is unavailable")
+def test_utility_logits_are_cuda_bf16_safe_when_available() -> None:
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=True,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=0.0,
+    )
+    model = _GatedToyModel().cuda()
+    batch = {
+        name: value.cuda() if isinstance(value, torch.Tensor) else value
+        for name, value in _batch(2, 10, batch_size=2).items()
+    }
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss, metrics = sopat_direction_objective(model, batch, "sar_to_optical", config)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["physical_utility"])
+    assert model.confidence.grad is not None and torch.isfinite(model.confidence.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA BF16 autocast is unavailable")
+def test_legacy_probability_utility_fallback_is_cuda_bf16_safe() -> None:
+    class _LegacyProbabilityToyModel(_GatedToyModel):
+        def forward(self, **inputs: object) -> SimpleNamespace:
+            output = super().forward(**inputs)
+            del output.transport_confidence_logits
+            del output.transport_evidence
+            return output
+
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=True,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=0.0,
+    )
+    model = _LegacyProbabilityToyModel().cuda()
+    batch = {
+        name: value.cuda() if isinstance(value, torch.Tensor) else value
+        for name, value in _batch(2, 10, batch_size=2).items()
+    }
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        loss, metrics = sopat_direction_objective(model, batch, "sar_to_optical", config)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["physical_utility"])
+    assert model.confidence.grad is not None and torch.isfinite(model.confidence.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA BF16 autocast is unavailable")
+def test_native_sopat_physical_coupled_step_is_cuda_bf16_safe() -> None:
+    model = SOPAT(
+        SOPATConfig(
+            width=8,
+            hidden=32,
+            encoder_depth=1,
+            heads=4,
+            adapter_rank=8,
+            transport_heads=4,
+            anchor_window_size=2,
+        )
+    ).cuda()
+    model.set_training_stage("physical")
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=True,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=0.0,
+    )
+    batches = {
+        direction: {
+            name: value.cuda() if isinstance(value, torch.Tensor) else value
+        for name, value in batch.items()
+        }
+        for direction, batch in {
+            # H/8 is 1x1 for this compact fixture, so retain two examples for
+            # GroupNorm's training-mode support requirement.
+            "sar_to_optical": _batch(2, 10, batch_size=2),
+            "optical_to_sar": _batch(10, 2, batch_size=2),
+        }.items()
+    }
+    for batch in batches.values():
+        observations = batch["observations"]
+        assert isinstance(observations, torch.Tensor)
+        observations.add_(0.05)
+    module = SOPATTrainingModule(model, config)
+    optimizer = torch.optim.AdamW(module.parameters(), lr=1e-4)
+
+    result = train_coupled_step(module, optimizer, batches, config)
+
+    assert math.isfinite(result.total_loss)
+    assert math.isfinite(result.gradient_norm)
+    assert all(math.isfinite(value) for value in result.direction_losses.values())
 
 
 def test_structural_losses_ignore_invalid_nan_and_extreme_pixels() -> None:

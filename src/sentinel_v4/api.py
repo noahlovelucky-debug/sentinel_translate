@@ -130,6 +130,8 @@ class SOPATResult:
     private_target: Tensor
     target: TargetRequest | tuple[TargetRequest, ...]
     raw_delta: Tensor | None = None
+    transport_confidence_logits: Tensor | None = None
+    transport_evidence: Tensor | None = None
 
     @classmethod
     def from_output(
@@ -158,6 +160,8 @@ class SOPATResult:
             private_target=output.private_target,
             target=target,
             raw_delta=output.raw_delta,
+            transport_confidence_logits=getattr(output, "transport_confidence_logits", None),
+            transport_evidence=getattr(output, "transport_evidence", None),
         )
 
 

@@ -458,6 +458,15 @@ def masked_mean(values: Tensor, valid: Tensor) -> Tensor:
     return (values * mask).sum() / mask.sum().clamp_min(1.0)
 
 
+def _masked_single_channel_mean(values: Tensor, valid: Tensor) -> Tensor:
+    """Average a Bx1xHxW diagnostic only where its binary support is valid."""
+
+    if values.ndim != 4 or values.shape[1] != 1:
+        raise ValueError("SOPAT single-channel diagnostic must have shape Bx1xHxW")
+    mask = _resize_valid(valid, values)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
 def masked_charbonnier(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
     if prediction.shape != target.shape:
         raise ValueError("SOPAT prediction and target must have equal shape")
@@ -917,13 +926,24 @@ def physical_objective(
     if candidate_physical.shape != target.shape:
         raise ValueError("SOPAT candidate_physical must match the target label shape")
     candidate = masked_charbonnier(candidate_physical, target, valid)
+    confidence_shape = (physical.shape[0], 1, *physical.shape[-2:])
     transport_confidence = output_tensor(output, "transport_confidence", required=False)
     if transport_confidence is None:
-        transport_confidence = torch.ones(
-            (physical.shape[0], 1, *physical.shape[-2:]), device=physical.device, dtype=physical.dtype
-        )
-    if transport_confidence.shape != (physical.shape[0], 1, *physical.shape[-2:]):
+        transport_confidence = torch.ones(confidence_shape, device=physical.device, dtype=physical.dtype)
+    if transport_confidence.shape != confidence_shape:
         raise ValueError("SOPAT transport_confidence must have shape Bx1xHxW")
+    transport_confidence_logits = output_tensor(
+        output, "transport_confidence_logits", required=False
+    )
+    if transport_confidence_logits is not None and transport_confidence_logits.shape != confidence_shape:
+        raise ValueError("SOPAT transport_confidence_logits must have shape Bx1xHxW")
+    transport_evidence = output_tensor(output, "transport_evidence", required=False)
+    if transport_evidence is None:
+        # Older V4 checkpoints and focused toy models expose only a
+        # probability.  Preserve their historical utility supervision.
+        transport_evidence = torch.ones_like(transport_confidence)
+    if transport_evidence.shape != confidence_shape:
+        raise ValueError("SOPAT transport_evidence must have shape Bx1xHxW")
     utility_target = _utility_oracle(
         candidate_physical,
         inputs["target_anchor"],
@@ -932,12 +952,26 @@ def physical_objective(
         temperature=config.utility_temperature,
         kernel_size=config.structural_pool_kernel,
     )
-    utility = F.binary_cross_entropy(
-        transport_confidence.clamp(1e-5, 1.0 - 1e-5),
-        utility_target,
-        reduction="none",
-    )
-    utility = masked_mean(utility, valid)
+    # Source-null and source-invalid pixels must remain an exact anchor-copy
+    # route.  They are intentionally excluded from gate supervision rather
+    # than assigned an arbitrary 0.5 "neutral" label.  Native SOPAT provides
+    # raw logits so BCE remains numerically safe under CUDA BF16 autocast.
+    utility_valid = valid * (transport_evidence > 0.0).to(valid)
+    with torch.autocast(device_type=physical.device.type, enabled=False):
+        if transport_confidence_logits is not None:
+            utility_map = F.binary_cross_entropy_with_logits(
+                transport_confidence_logits.float(), utility_target.float(), reduction="none"
+            )
+        else:
+            # Compatibility fallback for old checkpoints and compact test
+            # models.  Probability BCE is explicitly outside autocast because
+            # PyTorch rejects it in mixed-precision CUDA execution.
+            utility_map = F.binary_cross_entropy(
+                transport_confidence.float().clamp(1e-5, 1.0 - 1e-5),
+                utility_target.float(),
+                reduction="none",
+            )
+        utility = _masked_single_channel_mean(utility_map, utility_valid)
     squared_error = (physical - target).square()
     log_variance = output_tensor(output, "log_variance", "physical_log_variance", required=False)
     if log_variance is None:

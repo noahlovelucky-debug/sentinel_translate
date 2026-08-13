@@ -330,12 +330,13 @@ class _TargetRenderer(nn.Module):
         nn.init.zeros_(self.variance.weight)
         nn.init.zeros_(self.variance.bias)
 
-    def forward(self, features: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+    def forward(self, features: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
         features = self.features(features)
         candidate_fraction = torch.tanh(self.delta(features))
-        confidence = torch.sigmoid(self.confidence(features))
+        confidence_logits = self.confidence(features)
+        confidence = torch.sigmoid(confidence_logits)
         log_variance = self.variance(features).clamp(-8.0, 4.0)
-        return candidate_fraction, confidence, log_variance
+        return candidate_fraction, confidence_logits, confidence, log_variance
 
 
 @dataclass
@@ -371,6 +372,8 @@ class SOPATOutput:
     physical: Tensor
     candidate_physical: Tensor
     transport_confidence: Tensor
+    transport_confidence_logits: Tensor
+    transport_evidence: Tensor
     log_variance: Tensor
     transported_change: Pyramid
     common_anchor: Tensor
@@ -797,7 +800,12 @@ class SOPAT(nn.Module):
 
         transported_change: Pyramid = tuple(transported)  # type: ignore[assignment]
         shared_transport = self.transport(transported_change, (height, width))
-        candidate_fraction, confidence, log_variance = self.renderers[target_sensor.modality](shared_transport)
+        (
+            candidate_fraction,
+            confidence_logits,
+            confidence,
+            log_variance,
+        ) = self.renderers[target_sensor.modality](shared_transport)
         # Structural source evidence preserves exact identity for null source
         # change.  The learned confidence is separate: it decides whether a
         # non-null, transported candidate is useful for this target location.
@@ -820,6 +828,12 @@ class SOPAT(nn.Module):
             physical=physical,
             candidate_physical=candidate_physical,
             transport_confidence=transport_confidence,
+            # Keep the learned logit independent of structural evidence.  A
+            # caller can inspect calibration separately from the hard causal
+            # guard, and training can exclude no-evidence pixels rather than
+            # teaching their arbitrary logits toward a neutral probability.
+            transport_confidence_logits=confidence_logits,
+            transport_evidence=source_evidence,
             log_variance=log_variance,
             transported_change=transported_change,
             common_anchor=common_anchor,

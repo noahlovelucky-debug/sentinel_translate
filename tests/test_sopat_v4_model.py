@@ -78,6 +78,8 @@ def test_one_model_supports_both_directions_and_initially_copies_anchor(
     assert torch.equal(output.physical, inputs["target_anchor"])
     assert torch.equal(output.candidate_physical, inputs["target_anchor"])
     assert bool(((output.transport_confidence > 0.0) & (output.transport_confidence < 0.2)).all())
+    assert torch.equal(output.transport_confidence_logits, torch.full_like(output.transport_confidence_logits, -2.0))
+    assert torch.equal(output.transport_evidence, torch.ones_like(output.transport_evidence))
     assert torch.equal(output.pre_projection_violation, torch.zeros_like(output.pre_projection_violation))
     assert torch.equal(output.raw_delta, torch.zeros_like(output.raw_delta))
 
@@ -148,6 +150,18 @@ def test_anchor_room_renderer_stays_bounded_under_huge_logits_and_zero_confidenc
     assert bool(((output.physical >= -1.0) & (output.physical <= 1.0)).all())
     assert torch.equal(output.pre_projection_violation, torch.zeros_like(output.pre_projection_violation))
     torch.testing.assert_close(output.physical, inputs["target_anchor"], atol=0.0, rtol=0.0)  # type: ignore[arg-type]
+
+
+def test_null_source_has_zero_transport_evidence_but_preserves_raw_gate_logits() -> None:
+    model = _tiny_model().eval()
+    inputs = _inputs(changed=False)
+
+    output = model(**inputs)  # type: ignore[arg-type]
+
+    assert torch.equal(output.transport_evidence, torch.zeros_like(output.transport_evidence))
+    assert torch.equal(output.transport_confidence, torch.zeros_like(output.transport_confidence))
+    assert torch.equal(output.transport_confidence_logits, torch.full_like(output.transport_confidence_logits, -2.0))
+    assert torch.equal(output.physical, inputs["target_anchor"])
 
 
 def test_anchor_room_update_reports_only_malformed_anchor_range() -> None:

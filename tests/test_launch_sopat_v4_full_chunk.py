@@ -106,6 +106,37 @@ def test_true_gate_dry_run_preserves_required_chain_order(tmp_path: Path) -> Non
     result = _run(tmp_path, eligible=True)
 
     assert result.returncode == 0, result.stderr
+    event_lines = [
+        line
+        for line in result.stdout.splitlines()
+        if "RUN " in line or "GPU contract valid:" in line
+    ]
+    events = []
+    for line in event_lines:
+        if "GPU contract valid:" in line:
+            events.append("gpu-check")
+        elif "build_sopat_v4_index.py" in line:
+            events.append("build-index")
+        elif "--stage factorizer" in line:
+            events.append("factorizer")
+        elif "--stage physical" in line:
+            events.append("physical")
+        elif "--execute" in line:
+            events.append("build-cache")
+        elif "--verify" in line:
+            events.append("verify-cache")
+
+    assert events == [
+        "gpu-check",
+        "build-index",
+        "build-cache",
+        "verify-cache",
+        "gpu-check",
+        "factorizer",
+        "gpu-check",
+        "physical",
+    ]
+
     run_lines = [line for line in result.stdout.splitlines() if "RUN " in line]
     assert len(run_lines) == 5
     assert "build_sopat_v4_index.py" in run_lines[0]
@@ -115,7 +146,9 @@ def test_true_gate_dry_run_preserves_required_chain_order(tmp_path: Path) -> Non
     assert "--verify" in run_lines[2]
     assert "--stage factorizer" in run_lines[3]
     assert "--stage physical" in run_lines[4]
-    assert (tmp_path / "commands.log").read_text(encoding="utf-8").splitlines() == _expected_gpu_checks()
+    assert (tmp_path / "commands.log").read_text(encoding="utf-8").splitlines() == (
+        _expected_gpu_checks() * 3
+    )
 
 
 def test_launcher_refuses_world_size_or_visible_gpu_mismatch(tmp_path: Path) -> None:

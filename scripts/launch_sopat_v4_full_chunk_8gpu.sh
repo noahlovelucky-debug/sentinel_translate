@@ -112,6 +112,7 @@ PY
       fail "GPU ${physical_gpu} already uses ${used} MiB (> ${GPU_USED_MIB_LIMIT}); no process was touched"
     fi
   done
+  log "GPU contract valid: ${count} visible devices with <= ${GPU_USED_MIB_LIMIT} MiB in use"
 }
 
 validate_publication() {
@@ -188,6 +189,9 @@ run python scripts/build_paired_temporal_chunk_cache.py \
   --workers "${CACHE_WORKERS}" \
   --execute
 run python scripts/build_paired_temporal_chunk_cache.py --destination "${CACHE_ROOT}" --verify
+# The cache build can take hours. Re-check immediately before reserving the
+# eight-process factorizer job instead of relying on the launch-time snapshot.
+validate_gpu_contract
 
 run torchrun --standalone --nproc_per_node=8 scripts/train_sopat_v4.py \
   --config "${FULL_CONFIG}" \
@@ -200,6 +204,9 @@ FACTOR_CHECKPOINT="${OUTPUT}/factorizer/best_factorizer.pt"
 if [[ "${DRY_RUN}" != "1" ]]; then
   require_file "${FACTOR_CHECKPOINT}"
 fi
+# Factorizer training is another long ownership boundary; do not start
+# physical training if another workload claimed a device while it ran.
+validate_gpu_contract
 run torchrun --standalone --nproc_per_node=8 scripts/train_sopat_v4.py \
   --config "${FULL_CONFIG}" \
   --stage physical \
