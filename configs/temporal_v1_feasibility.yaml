@@ -1,0 +1,32 @@
+# Causal Anchor-Delta Transport feasibility protocol.
+# This config is intentionally separate from V3.2's single-frame format-v4 checkpoints.
+data:
+  manifest: /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl
+  orbit: ascending
+  source_frames: 4
+  horizon_days: 180
+  crop_size: 128
+  train_samples: 64
+  validation_samples: 32
+model:
+  architecture: causal_anchor_delta_transport_v1
+  width: 96
+  latent_channels: 32
+  temporal_heads: 4
+  physical: anchor_relative_bounded_delta
+  visual: conditional_residual_bridge
+train:
+  physical_steps: 400
+  batch_size: 2
+  learning_rate: 0.0002
+  precision: bfloat16
+  device: one_available_gpu
+acceptance:
+  pilot:
+    physical_improves_real_anchor: true
+    source_ablation_hurts: true
+    minimum_anchor_rmse_improvement_percent: 5.0
+    minimum_source_ablation_penalty_percent: 1.0
+  scale_up:
+    physical_and_visual_pareto_validation: required
+    strict_causal_holdout: validation_temporal_2023

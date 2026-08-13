@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 from collections.abc import Iterable
+from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 
@@ -27,6 +28,15 @@ REGISTRATION_AUDIT_VERSION = 2
 REGISTRATION_SEARCH_RADIUS_PX = 2
 REGISTRATION_MIN_NCC = 0.10
 REGISTRATION_MIN_IMPROVEMENT = 0.05
+
+
+@dataclass(frozen=True)
+class RegistrationShiftAudit:
+    shift_px: Tensor
+    zero_ncc: Tensor
+    best_ncc: Tensor
+    improvement: Tensor
+    evidence_supported: bool
 
 
 def _file_sha256(path: Path) -> str:
@@ -53,13 +63,35 @@ def estimate_registration_shift(
 ) -> Tensor:
     """Return a nonzero shift only when local cross-modal structure supports it."""
 
+    return registration_shift_audit(
+        s2,
+        sar,
+        valid=valid,
+        maximum_shift_px=maximum_shift_px,
+        minimum_ncc=minimum_ncc,
+        minimum_improvement=minimum_improvement,
+    ).shift_px
+
+
+def registration_shift_audit(
+    s2: Tensor,
+    sar: Tensor,
+    *,
+    valid: Tensor | None = None,
+    maximum_shift_px: int = REGISTRATION_SEARCH_RADIUS_PX,
+    minimum_ncc: float = REGISTRATION_MIN_NCC,
+    minimum_improvement: float = REGISTRATION_MIN_IMPROVEMENT,
+) -> RegistrationShiftAudit:
+    """Estimate displacement and distinguish alignment from absent evidence."""
+
     if s2.ndim != 3 or sar.ndim != 3 or s2.shape[-2:] != sar.shape[-2:]:
         raise ValueError("s2 and sar must be CxHxW tensors on the same grid")
     if maximum_shift_px < 1 or minimum_ncc < -1.0 or minimum_improvement < 0.0:
         raise ValueError("invalid registration-audit thresholds")
     height, width = s2.shape[-2:]
     if height <= 2 * maximum_shift_px or width <= 2 * maximum_shift_px:
-        return s2.new_zeros(())
+        zero = s2.new_zeros(())
+        return RegistrationShiftAudit(zero, zero, zero, zero, False)
     if valid is None:
         joint_valid = torch.ones((height, width), device=s2.device, dtype=torch.bool)
     else:
@@ -107,9 +139,17 @@ def estimate_registration_shift(
             if bool(candidate > best_ncc):
                 best_ncc = candidate
                 best_shift = (dy, dx)
-    if bool(best_ncc >= minimum_ncc and best_ncc - zero_ncc >= minimum_improvement):
-        return s2.new_tensor(math.hypot(*best_shift))
-    return s2.new_zeros(())
+    improvement = best_ncc - zero_ncc
+    shifted = bool(best_ncc >= minimum_ncc and improvement >= minimum_improvement)
+    aligned = bool(zero_ncc >= minimum_ncc and improvement < minimum_improvement)
+    shift = s2.new_tensor(math.hypot(*best_shift)) if shifted else s2.new_zeros(())
+    return RegistrationShiftAudit(
+        shift_px=shift,
+        zero_ncc=zero_ncc,
+        best_ncc=best_ncc,
+        improvement=improvement,
+        evidence_supported=shifted or aligned,
+    )
 
 
 def high_frequency_eligible(

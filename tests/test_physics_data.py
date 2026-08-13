@@ -9,6 +9,7 @@ from sentinel_v3.data import (
     StatefulShardSampler,
     estimate_registration_shift,
     high_frequency_eligible,
+    registration_shift_audit,
     time_weights,
 )
 from sentinel_v3.physics import (
@@ -125,6 +126,12 @@ def test_registration_audit_requires_local_cross_modal_shift_evidence() -> None:
         optical, unrelated_field.unsqueeze(0).repeat(2, 1, 1), valid=valid
     )
     assert float(unrelated) == 0.0
+    assert registration_shift_audit(
+        optical, optical[:2] * 2.0 + 3.0, valid=valid
+    ).evidence_supported
+    assert not registration_shift_audit(
+        optical, unrelated_field.unsqueeze(0).repeat(2, 1, 1), valid=valid
+    ).evidence_supported
 
 
 class _Dataset:

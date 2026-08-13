@@ -1,0 +1,81 @@
+# SOPAT V4 bilateral 64-sample mechanism feasibility protocol.
+data:
+  manifest: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/manifests/pairs.jsonl
+  train_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes_v4_center_evaluable/{direction}/train.jsonl
+  validation_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes_v4_center_evaluable/{direction}/validation.jsonl
+  train_split: train
+  validation_split: validation_temporal
+  horizon_days: 180
+  translation_max_delta_days: 1
+  maximum_observations: 4
+  crop_size: 64
+  minimum_valid_fraction: 0.80
+  registration_audit: true
+  maximum_registration_shift_px: 0.5
+
+model:
+  architecture: sopat_v4
+  width: 64
+  hidden: 768
+  encoder_depth: 12
+  heads: 12
+  adapter_rank: 64
+  transport_heads: 4
+  max_horizon_days: 180
+  translation_tolerance_days: 1
+  anchor_window_size: 8
+
+training:
+  precision: bfloat16
+  world_size: 8
+  batch_size: 1
+  num_workers: 2
+  activation_checkpointing: false
+  log_every: 10
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  ema_decay: 0.999
+  stages:
+    factorizer:
+      steps: 500
+      learning_rate: 0.0001
+      encoder_learning_rate: 0.000002
+    physical:
+      steps: 1500
+      learning_rate: 0.0002
+      encoder_learning_rate: 0.00001
+  objective:
+    factorizer_anchor_cross_weight: 1.0
+    factorizer_common_alignment_weight: 0.25
+    factorizer_private_decorrelation_weight: 0.05
+    physical_charbonnier_weight: 1.0
+    physical_gradient_weight: 0.20
+    physical_optical_spectral_weight: 0.10
+    physical_optical_ndvi_weight: 0.10
+    physical_sar_statistics_weight: 0.10
+    physical_anchor_delta_weight: 0.20
+    physical_null_change_weight: 0.10
+    physical_null_change_probability: 0.25
+    physical_nll_weight: 0.05
+    physical_permutation_weight: 0.05
+    physical_permutation_probability: 0.25
+    physical_anchor_regret_weight: 0.50
+    physical_anchor_regret_margin: 0.0
+  validate_every: 100
+  full_validate_every: 500
+  early_stop_full_validations: 5
+
+validation:
+  batch_size: 4
+  pilot_samples: 32
+  panel_samples: 16
+  selection_phase: feasibility
+  selection:
+    required_tasks: [translation, forecast]
+    required_observation_counts: [one, two_to_three, four_plus]
+    feasibility_overall_anchor_ratio: 1.02
+    feasibility_bucket_anchor_ratio: 1.10
+    feasibility_source_shuffle_min_degradation: 0.01
+    full_source_shuffle_min_degradation: 0.02
+    full_overall_anchor_ratio: 1.0
+    full_bucket_anchor_ratio: 1.0

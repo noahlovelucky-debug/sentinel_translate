@@ -1,0 +1,60 @@
+# Sparse Paired-Anchor Transport V2 research protocol.
+data:
+  manifest: /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl
+  orbit: ascending
+  anchor_pair_max_delta_days: 1
+  maximum_anchors_per_query: 3
+  horizon_days: 180
+  translation_max_delta_days: 1
+  minimum_observations: 1
+  maximum_observations: 8
+  crop_size: 256
+  minimum_valid_fraction: 0.80
+  registration_audit: true
+  maximum_registration_shift_px: 0.5
+  train_split: train
+  validation_split: validation_temporal
+  test_splits: [test_spatial, test_temporal, test_joint]
+  task_modes: [translation, forecast]
+model:
+  architecture: sparse_paired_anchor_transport_v2
+  width: 96
+  latent_channels: 32
+  attention_heads: 4
+  flow_steps: 4
+  deterministic_detail_limit: 0.15
+  visual_residual_limit: 0.20
+  texture_block_size: 4
+training:
+  precision: bfloat16
+  world_size: 8
+  observation_dropout: 0.35
+  query_observation_dropout: 0.50
+  observation_count_probabilities:
+    one: 0.40
+    two_to_three: 0.35
+    four_plus: 0.25
+  stages:
+    physical: {steps: 30000, learning_rate: 0.0002}
+    detail: {steps: 20000, learning_rate: 0.0001}
+    flow: {steps: 40000, learning_rate: 0.0001}
+    balance: {steps: 5000, learning_rate: 0.00001}
+  validate_every: 1000
+  full_validate_every: 5000
+  early_stop_full_validations: 5
+validation:
+  fixed_seed: 71
+  no_best_of_k: true
+  frame_count_bins: [one, two_to_three, four_plus]
+  report_task_modes_separately: true
+  visual_rmse_over_physical_maximum: 1.05
+  minimum_physical_anchor_improvement_percent: 5.0
+  minimum_source_evidence_improvement_percent: 1.0
+  pre_projection_violation_maximum: 0.001
+  minimum_scene_improvement_fraction: 0.70
+  maximum_scene_rmse_regression_fraction: 0.10
+release:
+  require_translation_and_forecast_gates: true
+  require_one_frame_gate: true
+  physical_checkpoint_frozen_before_detail: true
+  validation_selected_release_only: true

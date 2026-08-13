@@ -1,0 +1,1528 @@
+"""Training primitives for bidirectional SOPAT V4.
+
+SOPAT trains one shared model on two homogeneous direction batches per global
+optimizer step.  SAR-to-Optical and Optical-to-SAR have incompatible channel
+counts, so this module deliberately never concatenates them into a fabricated
+mixed tensor batch.  The two forwards instead share the same model, optimizer,
+EMA, global step, checkpoint, and DDP reduction.
+
+The public model contract is intentionally small.  ``forward_direction`` sends
+only causal inputs to a model.  Query labels are extracted separately by the
+objective functions and are never included in model keyword arguments.
+"""
+
+from __future__ import annotations
+
+import contextlib
+import json
+import math
+import os
+import random
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import asdict, dataclass, field, fields, is_dataclass
+from pathlib import Path
+from typing import Literal, Protocol, runtime_checkable
+
+import numpy as np
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from torch import Tensor, nn
+
+Direction = Literal["sar_to_optical", "optical_to_sar"]
+Stage = Literal["factorizer", "physical"]
+
+DIRECTIONS: tuple[Direction, Direction] = ("sar_to_optical", "optical_to_sar")
+SOPAT_V4_FORMAT = 1
+SOPAT_V4_FAMILY = "sopat_v4"
+DEFAULT_V3_INITIALIZATION_PREFIXES: tuple[str, ...] = (
+    "encoder.",
+    "adapter.",
+    "sensor_adapter.",
+    "source_adapter.",
+    "target_adapter.",
+)
+
+
+@runtime_checkable
+class SOPATForwardProtocol(Protocol):
+    """Minimal forward signature implemented by ``sentinel_v4.model.SOPAT``."""
+
+    def forward(
+        self,
+        *,
+        observations: Tensor,
+        observation_valid: Tensor,
+        observation_days: Tensor,
+        observation_present: Tensor,
+        source_anchor: Tensor,
+        source_anchor_valid: Tensor,
+        target_anchor: Tensor,
+        target_anchor_valid: Tensor,
+        source_anchor_days: Tensor,
+        target_anchor_days: Tensor,
+        source_sensor: object,
+        target_sensor: object,
+    ) -> object: ...
+
+
+@dataclass(frozen=True)
+class SOPATTrainConfig:
+    """Stage and objective settings shared by both translation directions."""
+
+    stage: Stage = "factorizer"
+    direction_weights: Mapping[str, float] = field(
+        default_factory=lambda: {"sar_to_optical": 1.0, "optical_to_sar": 1.0}
+    )
+    learning_rate: float = 2e-4
+    encoder_learning_rate: float | None = None
+    weight_decay: float = 1e-4
+    gradient_clip: float = 1.0
+    ema_decay: float = 0.999
+    factorizer_anchor_cross_weight: float = 1.0
+    factorizer_common_alignment_weight: float = 0.5
+    factorizer_private_decorrelation_weight: float = 0.1
+    physical_charbonnier_weight: float = 1.0
+    physical_gradient_weight: float = 0.20
+    physical_optical_spectral_weight: float = 0.10
+    physical_optical_ndvi_weight: float = 0.10
+    physical_sar_statistics_weight: float = 0.10
+    physical_anchor_delta_weight: float = 0.20
+    physical_null_change_weight: float = 0.10
+    physical_null_change_probability: float = 0.25
+    physical_nll_weight: float = 0.05
+    physical_permutation_weight: float = 0.05
+    physical_permutation_probability: float = 0.25
+    physical_anchor_regret_weight: float = 0.25
+    physical_anchor_regret_margin: float = 0.0
+    autocast_bfloat16: bool = True
+
+    def __post_init__(self) -> None:
+        if self.stage not in {"factorizer", "physical"}:
+            raise ValueError("SOPAT stage must be factorizer or physical")
+        if self.learning_rate <= 0.0 or self.gradient_clip <= 0.0:
+            raise ValueError("learning_rate and gradient_clip must be positive")
+        encoder_learning_rate = (
+            self.learning_rate
+            if self.encoder_learning_rate is None
+            else float(self.encoder_learning_rate)
+        )
+        if encoder_learning_rate <= 0.0 or not np.isfinite(encoder_learning_rate):
+            raise ValueError("encoder_learning_rate must be finite and positive")
+        object.__setattr__(self, "encoder_learning_rate", encoder_learning_rate)
+        if not 0.0 <= self.ema_decay < 1.0:
+            raise ValueError("ema_decay must be in [0, 1)")
+        weights = {str(name): float(value) for name, value in self.direction_weights.items()}
+        if set(weights) != set(DIRECTIONS):
+            raise ValueError("direction_weights must contain exactly both SOPAT directions")
+        if any(not np.isfinite(value) or value <= 0.0 for value in weights.values()):
+            raise ValueError("direction_weights must be finite and positive")
+        object.__setattr__(self, "direction_weights", weights)
+        nonnegative = (
+            "factorizer_anchor_cross_weight",
+            "factorizer_common_alignment_weight",
+            "factorizer_private_decorrelation_weight",
+            "physical_charbonnier_weight",
+            "physical_gradient_weight",
+            "physical_optical_spectral_weight",
+            "physical_optical_ndvi_weight",
+            "physical_sar_statistics_weight",
+            "physical_anchor_delta_weight",
+            "physical_null_change_weight",
+            "physical_nll_weight",
+            "physical_permutation_weight",
+            "physical_anchor_regret_weight",
+            "physical_anchor_regret_margin",
+        )
+        if any(float(getattr(self, name)) < 0.0 for name in nonnegative):
+            raise ValueError("SOPAT loss weights and margins must be non-negative")
+        for name in ("physical_null_change_probability", "physical_permutation_probability"):
+            if not 0.0 <= float(getattr(self, name)) <= 1.0:
+                raise ValueError(f"{name} must be in [0, 1]")
+        if self.stage == "factorizer" and (
+            self.factorizer_anchor_cross_weight
+            + self.factorizer_common_alignment_weight
+            + self.factorizer_private_decorrelation_weight
+            <= 0.0
+        ):
+            raise ValueError("factorizer stage needs at least one non-zero objective weight")
+        if self.stage == "physical" and self.physical_charbonnier_weight <= 0.0:
+            raise ValueError("physical stage requires physical_charbonnier_weight > 0")
+
+    @classmethod
+    def from_mapping(cls, values: Mapping[str, object]) -> SOPATTrainConfig:
+        """Construct from a YAML mapping while rejecting unknown model knobs."""
+
+        allowed = {entry.name for entry in fields(cls)}
+        unknown = sorted(set(values).difference(allowed))
+        if unknown:
+            raise ValueError(f"unknown SOPAT training setting(s): {', '.join(unknown)}")
+        return cls(**dict(values))  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class CoupledStepResult:
+    """Detached diagnostics from exactly one two-direction optimizer step."""
+
+    total_loss: float
+    gradient_norm: float
+    direction_losses: Mapping[str, float]
+    metrics: Mapping[str, float]
+
+
+@dataclass(frozen=True)
+class FactorizerValidationResult:
+    """Anchor-only validation summary for the factorizer stage.
+
+    A factorizer has no physical query prediction to compare against the
+    target label.  Its validation signal must therefore remain its declared
+    paired-anchor objective instead of a renderer-dependent physical gate.
+    """
+
+    weighted_loss: float
+    direction_losses: Mapping[str, float]
+    metrics: Mapping[str, float]
+    batches: Mapping[str, int]
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "weighted_loss": self.weighted_loss,
+            "direction_losses": dict(self.direction_losses),
+            "metrics": dict(self.metrics),
+            "batches": dict(self.batches),
+        }
+
+
+class CyclingDirectionIterator:
+    """Repeat an exhausted direction loader with deterministic sampler epochs."""
+
+    def __init__(self, loader: Iterable[Mapping[str, object]], *, seed: int = 0) -> None:
+        self.loader = loader
+        self.seed = int(seed)
+        self.cycles = 0
+        self._iterator: Iterator[Mapping[str, object]] | None = None
+
+    def _set_epoch(self) -> None:
+        sampler = getattr(self.loader, "sampler", None)
+        set_epoch = getattr(sampler, "set_epoch", None)
+        if callable(set_epoch):
+            set_epoch(self.seed + self.cycles)
+
+    def _restart(self) -> None:
+        self._set_epoch()
+        self._iterator = iter(self.loader)
+
+    def __next__(self) -> Mapping[str, object]:
+        if self._iterator is None:
+            self._restart()
+        assert self._iterator is not None
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            self.cycles += 1
+            self._restart()
+            assert self._iterator is not None
+            try:
+                return next(self._iterator)
+            except StopIteration as error:
+                raise RuntimeError("SOPAT direction loader is empty") from error
+
+    def state_dict(self) -> dict[str, int]:
+        return {"seed": self.seed, "cycles": self.cycles}
+
+
+class CoupledDirectionIterator:
+    """Yield one homogeneous microbatch for each direction every global step."""
+
+    def __init__(
+        self,
+        loaders: Mapping[str, Iterable[Mapping[str, object]]],
+        *,
+        seed: int = 0,
+    ) -> None:
+        missing = set(DIRECTIONS).difference(loaders)
+        unexpected = set(loaders).difference(DIRECTIONS)
+        if missing or unexpected:
+            raise ValueError(f"SOPAT loaders require both directions; missing={missing}, unexpected={unexpected}")
+        self._iterators = {
+            direction: CyclingDirectionIterator(loaders[direction], seed=seed + index * 1_000_003)
+            for index, direction in enumerate(DIRECTIONS)
+        }
+        self.global_batches = 0
+
+    def __iter__(self) -> CoupledDirectionIterator:
+        return self
+
+    def __next__(self) -> dict[Direction, Mapping[str, object]]:
+        batch = {direction: next(self._iterators[direction]) for direction in DIRECTIONS}
+        self.global_batches += 1
+        return batch
+
+    def state_dict(self) -> dict[str, object]:
+        return {
+            "global_batches": self.global_batches,
+            "directions": {direction: iterator.state_dict() for direction, iterator in self._iterators.items()},
+        }
+
+
+_FORWARD_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "observations": ("observations", "observation_values"),
+    "observation_valid": ("observation_valid",),
+    "observation_days": ("observation_days",),
+    "observation_present": ("observation_present",),
+    "source_anchor": ("source_anchor", "source_anchor_values"),
+    "source_anchor_valid": ("source_anchor_valid",),
+    "target_anchor": ("target_anchor", "target_anchor_values"),
+    "target_anchor_valid": ("target_anchor_valid",),
+    "source_anchor_days": ("source_anchor_days", "anchor_days"),
+    "target_anchor_days": ("target_anchor_days", "anchor_days"),
+}
+_LABEL_ALIASES: Mapping[str, tuple[str, ...]] = {
+    "target": ("target", "target_values"),
+    "target_valid": ("target_valid",),
+}
+
+
+def _validate_direction(direction: str) -> Direction:
+    if direction not in DIRECTIONS:
+        raise ValueError(f"unsupported SOPAT direction: {direction}")
+    return direction  # type: ignore[return-value]
+
+
+def _tensor_from_aliases(
+    batch: Mapping[str, object],
+    aliases: Sequence[str],
+    name: str,
+    device: torch.device | None,
+) -> Tensor:
+    value = next((batch[candidate] for candidate in aliases if candidate in batch), None)
+    if not isinstance(value, Tensor):
+        raise TypeError(f"SOPAT batch is missing tensor {name}")
+    if device is not None:
+        return value.to(device=device, non_blocking=True)
+    return value
+
+
+def forward_input_tensors(
+    batch: Mapping[str, object], *, device: torch.device | None = None
+) -> dict[str, Tensor]:
+    """Return only tensors permitted to cross the causal model boundary."""
+
+    tensors = {
+        name: _tensor_from_aliases(batch, aliases, name, device)
+        for name, aliases in _FORWARD_ALIASES.items()
+    }
+    tensors["observation_present"] = tensors["observation_present"].bool()
+    return tensors
+
+
+def supervision_tensors(
+    batch: Mapping[str, object], *, device: torch.device | None = None
+) -> dict[str, Tensor]:
+    """Return query labels for losses/metrics, never for a model forward."""
+
+    values = {
+        name: _tensor_from_aliases(batch, aliases, name, device)
+        for name, aliases in _LABEL_ALIASES.items()
+    }
+    if values["target"].ndim != 4 or values["target_valid"].ndim != 4:
+        raise ValueError("SOPAT target and target_valid must have shape BxCxHxW and Bx1xHxW")
+    if values["target_valid"].shape != (
+        values["target"].shape[0],
+        1,
+        *values["target"].shape[-2:],
+    ):
+        raise ValueError("SOPAT target_valid does not match target")
+    return values
+
+
+def direction_sensors(direction: str) -> tuple[object, object]:
+    """Use the stable Sentinel registry until V4 receives external descriptors."""
+
+    _validate_direction(direction)
+    from sentinel_v3.sensors import SENTINEL1, SENTINEL2
+
+    return (SENTINEL1, SENTINEL2) if direction == "sar_to_optical" else (SENTINEL2, SENTINEL1)
+
+
+def _batch_sensor(batch: Mapping[str, object], name: str, fallback: object) -> object:
+    value = batch.get(name)
+    if value is None:
+        return fallback
+    if isinstance(value, (list, tuple)):
+        if not value:
+            return fallback
+        if any(candidate != value[0] for candidate in value[1:]):
+            raise ValueError(f"SOPAT batch has mixed {name} values")
+        return value[0]
+    return value
+
+
+def forward_direction(
+    model: SOPATForwardProtocol | nn.Module,
+    batch: Mapping[str, object],
+    direction: str,
+    *,
+    device: torch.device | None = None,
+) -> object:
+    """Run a causal SOPAT direction forward without passing query labels.
+
+    This function is the sole model-call route used by V4 training and
+    evaluation.  Keeping the whitelist here makes target-label leakage an
+    inspectable invariant rather than a convention in individual callers.
+    """
+
+    direction = _validate_direction(direction)
+    tensors = forward_input_tensors(batch, device=device)
+    source_sensor, target_sensor = direction_sensors(direction)
+    return model(
+        observations=tensors["observations"],
+        observation_valid=tensors["observation_valid"],
+        observation_days=tensors["observation_days"],
+        observation_present=tensors["observation_present"],
+        source_anchor=tensors["source_anchor"],
+        source_anchor_valid=tensors["source_anchor_valid"],
+        target_anchor=tensors["target_anchor"],
+        target_anchor_valid=tensors["target_anchor_valid"],
+        source_anchor_days=tensors["source_anchor_days"],
+        target_anchor_days=tensors["target_anchor_days"],
+        source_sensor=_batch_sensor(batch, "source_sensor", source_sensor),
+        target_sensor=_batch_sensor(batch, "target_sensor", target_sensor),
+    )
+
+
+def _nested_output_value(output: object, name: str) -> object | None:
+    if isinstance(output, Mapping) and name in output:
+        return output[name]
+    if hasattr(output, name):
+        return getattr(output, name)
+    nested = None
+    if isinstance(output, Mapping):
+        nested = output.get("factorizer")
+    elif hasattr(output, "factorizer"):
+        nested = output.factorizer  # type: ignore[attr-defined]
+    if isinstance(nested, Mapping):
+        return nested.get(name)
+    if nested is not None and hasattr(nested, name):
+        return getattr(nested, name)
+    return None
+
+
+def output_tensor(
+    output: object,
+    *names: str,
+    required: bool = True,
+) -> Tensor | None:
+    """Read a tensor from the public SOPAT output or its factorizer payload."""
+
+    for name in names:
+        value = _nested_output_value(output, name)
+        if isinstance(value, Tensor):
+            return value
+        if value is not None:
+            raise TypeError(f"SOPAT output field {name} must be a tensor")
+    if required:
+        raise AttributeError(f"SOPAT output is missing required tensor field one of {names}")
+    return None
+
+
+def _resize_valid(valid: Tensor, values: Tensor) -> Tensor:
+    if valid.shape[0] != values.shape[0] or valid.shape[1] != 1:
+        raise ValueError("SOPAT valid mask must have shape Bx1xHxW")
+    if valid.shape[-2:] == values.shape[-2:]:
+        return valid.to(values)
+    return F.interpolate(valid.float(), size=values.shape[-2:], mode="area").to(values)
+
+
+def masked_mean(values: Tensor, valid: Tensor) -> Tensor:
+    mask = _resize_valid(valid, values).expand_as(values)
+    return (values * mask).sum() / mask.sum().clamp_min(1.0)
+
+
+def masked_charbonnier(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    if prediction.shape != target.shape:
+        raise ValueError("SOPAT prediction and target must have equal shape")
+    return masked_mean(torch.sqrt((prediction - target).square() + 1e-6), valid)
+
+
+def _gradient_loss(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    if prediction.shape[-2] < 2 or prediction.shape[-1] < 2:
+        return prediction.new_zeros(())
+    pred_x = prediction[..., :, 1:] - prediction[..., :, :-1]
+    target_x = target[..., :, 1:] - target[..., :, :-1]
+    pred_y = prediction[..., 1:, :] - prediction[..., :-1, :]
+    target_y = target[..., 1:, :] - target[..., :-1, :]
+    valid_x = valid[..., :, 1:] * valid[..., :, :-1]
+    valid_y = valid[..., 1:, :] * valid[..., :-1, :]
+    return 0.5 * (
+        masked_mean((pred_x - target_x).abs(), valid_x)
+        + masked_mean((pred_y - target_y).abs(), valid_y)
+    )
+
+
+def _effective_valid(inputs: Mapping[str, Tensor], labels: Mapping[str, Tensor]) -> Tensor:
+    target_valid = labels["target_valid"]
+    anchor_valid = inputs["target_anchor_valid"].to(target_valid)
+    if anchor_valid.shape != target_valid.shape:
+        raise ValueError("target_anchor_valid must match target_valid")
+    return target_valid * anchor_valid
+
+
+def _optical_spectral_loss(prediction: Tensor, target: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
+    normalized_prediction = F.normalize(prediction, dim=1, eps=1e-6)
+    normalized_target = F.normalize(target, dim=1, eps=1e-6)
+    cosine = (normalized_prediction * normalized_target).sum(dim=1, keepdim=True).clamp(-1.0, 1.0)
+    spectral = masked_mean(1.0 - cosine, valid)
+    if prediction.shape[1] <= 6:
+        return spectral, prediction.new_zeros(())
+    # Paired temporal V4 keeps the canonical S2 ordering: red=B04 index 2,
+    # NIR=B08 index 6.  This is intentionally a target-only supervision term.
+    pred_reflectance = (prediction + 1.0) * 0.5
+    target_reflectance = (target + 1.0) * 0.5
+    predicted_ndvi = (pred_reflectance[:, 6:7] - pred_reflectance[:, 2:3]) / (
+        pred_reflectance[:, 6:7] + pred_reflectance[:, 2:3] + 1e-4
+    )
+    target_ndvi = (target_reflectance[:, 6:7] - target_reflectance[:, 2:3]) / (
+        target_reflectance[:, 6:7] + target_reflectance[:, 2:3] + 1e-4
+    )
+    return spectral, masked_mean((predicted_ndvi - target_ndvi).abs(), valid)
+
+
+def _sar_statistics_loss(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    mask = _resize_valid(valid, prediction).expand_as(prediction)
+    count = mask.flatten(2).sum(dim=2).clamp_min(1.0)
+    # Variance can be exactly zero on a valid uniform SAR patch.  Computing a
+    # square-root derivative at zero then creates inf gradients even when the
+    # forward loss is finite, so retain this statistic in FP32 with a small
+    # positive floor.
+    prediction32 = prediction.float()
+    target32 = target.float()
+    mask32 = mask.float()
+    count = mask32.flatten(2).sum(dim=2).clamp_min(1.0)
+    predicted_mean = (prediction32 * mask32).flatten(2).sum(dim=2) / count
+    target_mean = (target32 * mask32).flatten(2).sum(dim=2) / count
+    predicted_var = (
+        ((prediction32 - predicted_mean[..., None, None]).square() * mask32)
+        .flatten(2)
+        .sum(dim=2)
+        / count
+    )
+    target_var = (
+        ((target32 - target_mean[..., None, None]).square() * mask32)
+        .flatten(2)
+        .sum(dim=2)
+        / count
+    )
+    standard_deviation_epsilon = 1e-6
+    return (predicted_mean - target_mean).abs().mean() + (
+        (predicted_var.clamp_min(0.0) + standard_deviation_epsilon).sqrt()
+        - (target_var.clamp_min(0.0) + standard_deviation_epsilon).sqrt()
+    ).abs().mean()
+
+
+def _common_private_decorrelation(common: Tensor, private: Tensor, valid: Tensor) -> Tensor:
+    common_map = common.mean(dim=1, keepdim=True)
+    private_map = private.mean(dim=1, keepdim=True)
+    mask = _resize_valid(valid, common_map)
+    if private_map.shape[-2:] != common_map.shape[-2:]:
+        private_map = F.interpolate(private_map, size=common_map.shape[-2:], mode="bilinear", align_corners=False)
+    denominator = mask.flatten(1).sum(dim=1, keepdim=True).clamp_min(1.0)
+    common_mean = (common_map * mask).flatten(1).sum(dim=1, keepdim=True) / denominator
+    private_mean = (private_map * mask).flatten(1).sum(dim=1, keepdim=True) / denominator
+    centered_common = (common_map - common_mean[..., None, None]) * mask
+    centered_private = (private_map - private_mean[..., None, None]) * mask
+    covariance = (centered_common * centered_private).flatten(1).sum(dim=1)
+    common_energy = centered_common.square().flatten(1).sum(dim=1).clamp_min(1e-6)
+    private_energy = centered_private.square().flatten(1).sum(dim=1).clamp_min(1e-6)
+    return (covariance.square() / (common_energy * private_energy)).mean()
+
+
+def factorizer_objective(
+    output: object,
+    inputs: Mapping[str, Tensor],
+    config: SOPATTrainConfig,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Anchor-only factorization objective for shared/common/private states."""
+
+    source_cross = output_tensor(
+        output,
+        "source_anchor_reconstruction",
+        "source_anchor_cross_reconstruction",
+        "reconstructed_source_anchor",
+        "source_anchor_cross",
+    )
+    target_cross = output_tensor(
+        output,
+        "target_anchor_reconstruction",
+        "target_anchor_cross_reconstruction",
+        "reconstructed_target_anchor",
+        "target_anchor_cross",
+    )
+    common_source = output_tensor(output, "common_source", "source_common")
+    common_target = output_tensor(output, "common_target", "target_common")
+    private_source = output_tensor(output, "private_source", "source_private")
+    private_target = output_tensor(output, "private_target", "target_private")
+    assert source_cross is not None
+    assert target_cross is not None
+    assert common_source is not None
+    assert common_target is not None
+    assert private_source is not None
+    assert private_target is not None
+    source_anchor = inputs["source_anchor"]
+    target_anchor = inputs["target_anchor"]
+    source_valid = inputs["source_anchor_valid"]
+    target_valid = inputs["target_anchor_valid"]
+    anchor_cross = 0.5 * (
+        masked_charbonnier(source_cross, source_anchor, source_valid)
+        + masked_charbonnier(target_cross, target_anchor, target_valid)
+    )
+    if common_source.shape != common_target.shape:
+        raise ValueError("SOPAT common source and target states must share a shape")
+    common_valid = _resize_valid(source_valid * target_valid, common_source)
+    common_alignment = masked_mean((common_source - common_target).abs(), common_valid)
+    private_decorrelation = 0.5 * (
+        _common_private_decorrelation(common_source, private_source, common_valid)
+        + _common_private_decorrelation(common_target, private_target, common_valid)
+    )
+    total = (
+        config.factorizer_anchor_cross_weight * anchor_cross
+        + config.factorizer_common_alignment_weight * common_alignment
+        + config.factorizer_private_decorrelation_weight * private_decorrelation
+    )
+    return total, {
+        "factorizer_anchor_cross": anchor_cross.detach(),
+        "factorizer_common_alignment": common_alignment.detach(),
+        "factorizer_private_decorrelation": private_decorrelation.detach(),
+    }
+
+
+def null_change_batch(batch: Mapping[str, object]) -> dict[str, object]:
+    """Replace every source observation by its historical source anchor."""
+
+    inputs = forward_input_tensors(batch)
+    observations = inputs["observations"]
+    source_anchor = inputs["source_anchor"]
+    if observations.shape[0] != source_anchor.shape[0] or observations.shape[2:] != source_anchor.shape[1:]:
+        raise ValueError("source anchor is incompatible with SOPAT observations")
+    replacement = source_anchor[:, None].expand_as(observations).clone()
+    replacement_valid = inputs["source_anchor_valid"][:, None].expand_as(inputs["observation_valid"]).clone()
+    result = dict(batch)
+    result["observations"] = replacement
+    result["observation_valid"] = replacement_valid
+    return result
+
+
+def permutation_batch(
+    batch: Mapping[str, object], *, generator: torch.Generator | None = None
+) -> dict[str, object]:
+    """Permute temporal slots jointly, preserving each observation's timestamp/mask."""
+
+    inputs = forward_input_tensors(batch)
+    frames = inputs["observations"].shape[1]
+    if frames < 2:
+        return dict(batch)
+    order = torch.randperm(
+        frames,
+        device=inputs["observations"].device,
+        generator=_generator_for_device(generator, inputs["observations"].device),
+    )
+    result = dict(batch)
+    result["observations"] = inputs["observations"].index_select(1, order)
+    result["observation_valid"] = inputs["observation_valid"].index_select(1, order)
+    result["observation_days"] = inputs["observation_days"].index_select(1, order)
+    result["observation_present"] = inputs["observation_present"].index_select(1, order)
+    return result
+
+
+def latest_only_batch(batch: Mapping[str, object]) -> dict[str, object]:
+    """Keep the newest real source observation for a trained latest-only variant."""
+
+    inputs = forward_input_tensors(batch)
+    values = inputs["observations"]
+    valid = inputs["observation_valid"]
+    days = inputs["observation_days"]
+    present = inputs["observation_present"].bool()
+    if not bool(present.any(dim=1).all()):
+        raise ValueError("each SOPAT sample needs at least one real observation")
+    sentinel = torch.full_like(days, -float("inf"))
+    selected = torch.where(present, days, sentinel).argmax(dim=1)
+    batch_size = values.shape[0]
+    gather_values = selected[:, None, None, None, None].expand(-1, 1, *values.shape[2:])
+    gather_valid = selected[:, None, None, None, None].expand(-1, 1, *valid.shape[2:])
+    gather_days = selected[:, None]
+    result = dict(batch)
+    result["observations"] = values.gather(1, gather_values)
+    result["observation_valid"] = valid.gather(1, gather_valid)
+    result["observation_days"] = days.gather(1, gather_days)
+    result["observation_present"] = torch.ones(
+        (batch_size, 1), dtype=torch.bool, device=values.device
+    )
+    return result
+
+
+def source_shuffle_batch(
+    batch: Mapping[str, object], *, generator: torch.Generator | None = None
+) -> dict[str, object]:
+    """Shuffle source observations across scenes for a counterfactual baseline."""
+
+    inputs = forward_input_tensors(batch)
+    batch_size = inputs["observations"].shape[0]
+    if batch_size < 2:
+        return dict(batch)
+    order = torch.randperm(
+        batch_size,
+        device=inputs["observations"].device,
+        generator=_generator_for_device(generator, inputs["observations"].device),
+    )
+    result = dict(batch)
+    for name in ("observations", "observation_valid", "observation_days", "observation_present"):
+        result[name] = inputs[name].index_select(0, order)
+    return result
+
+
+def physical_objective(
+    model: SOPATForwardProtocol | nn.Module,
+    output: object,
+    batch: Mapping[str, object],
+    inputs: Mapping[str, Tensor],
+    labels: Mapping[str, Tensor],
+    direction: str,
+    config: SOPATTrainConfig,
+    *,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Physical loss with target-only labels and sampled causal counterfactuals."""
+
+    direction = _validate_direction(direction)
+    physical = output_tensor(output, "physical")
+    assert physical is not None
+    target = labels["target"]
+    valid = _effective_valid(inputs, labels)
+    if physical.shape != target.shape:
+        raise ValueError("SOPAT physical output must match the target label shape")
+    charbonnier = masked_charbonnier(physical, target, valid)
+    gradient = _gradient_loss(physical, target, valid)
+    if direction == "sar_to_optical":
+        spectral, ndvi = _optical_spectral_loss(physical, target, valid)
+        sar_statistics = physical.new_zeros(())
+    else:
+        spectral = physical.new_zeros(())
+        ndvi = physical.new_zeros(())
+        sar_statistics = _sar_statistics_loss(physical, target, valid)
+    target_delta = target - inputs["target_anchor"]
+    predicted_delta = physical - inputs["target_anchor"]
+    anchor_delta = masked_charbonnier(predicted_delta, target_delta, valid)
+    squared_error = (physical - target).square()
+    log_variance = output_tensor(output, "log_variance", "physical_log_variance", required=False)
+    if log_variance is None:
+        log_variance = torch.zeros_like(physical)
+    if log_variance.shape != physical.shape:
+        if log_variance.shape == (physical.shape[0], 1, *physical.shape[-2:]):
+            log_variance = log_variance.expand_as(physical)
+        else:
+            raise ValueError("SOPAT log_variance must have BxCxHxW or Bx1xHxW shape")
+    nll = 0.5 * masked_mean(squared_error * (-log_variance).exp() + log_variance, valid)
+    per_example_error = _per_example_stable_rmse(physical, target, valid)
+    anchor_error = _per_example_rmse(inputs["target_anchor"], target, valid)
+    anchor_regret = torch.relu(per_example_error - anchor_error + config.physical_anchor_regret_margin).mean()
+    null_change = physical.new_zeros(())
+    source_evidence = physical.new_zeros(())
+    if _sample_probability(config.physical_null_change_probability, physical.device, generator):
+        null_output = forward_direction(model, null_change_batch(batch), direction, device=physical.device)
+        null_physical = output_tensor(null_output, "physical")
+        assert null_physical is not None
+        if null_physical.shape != physical.shape:
+            raise ValueError("SOPAT null-change physical output must match the target label shape")
+        # This is an identity constraint, not a detached comparison to the
+        # query label.  With every source observation replaced by the historic
+        # source anchor, the model must recover the paired target anchor.
+        null_change = _per_example_stable_rmse(
+            null_physical,
+            inputs["target_anchor"],
+            inputs["target_anchor_valid"],
+        ).mean()
+        # Retain real-versus-null source evidence as a diagnostic only.  It
+        # must never replace the differentiable null identity objective.
+        null_error = _per_example_rmse(null_physical.detach(), target, valid)
+        source_evidence = torch.relu(
+            per_example_error - null_error + config.physical_anchor_regret_margin
+        ).mean()
+    permutation = physical.new_zeros(())
+    if _sample_probability(config.physical_permutation_probability, physical.device, generator):
+        permuted_output = forward_direction(
+            model, permutation_batch(batch, generator=generator), direction, device=physical.device
+        )
+        permuted_physical = output_tensor(permuted_output, "physical")
+        assert permuted_physical is not None
+        permutation = masked_mean((physical - permuted_physical).abs(), valid)
+    total = (
+        config.physical_charbonnier_weight * charbonnier
+        + config.physical_gradient_weight * gradient
+        + config.physical_optical_spectral_weight * spectral
+        + config.physical_optical_ndvi_weight * ndvi
+        + config.physical_sar_statistics_weight * sar_statistics
+        + config.physical_anchor_delta_weight * anchor_delta
+        + config.physical_null_change_weight * null_change
+        + config.physical_nll_weight * nll
+        + config.physical_permutation_weight * permutation
+        + config.physical_anchor_regret_weight * anchor_regret
+    )
+    return total, {
+        "physical_charbonnier": charbonnier.detach(),
+        "physical_gradient": gradient.detach(),
+        "physical_spectral": spectral.detach(),
+        "physical_ndvi": ndvi.detach(),
+        "physical_sar_statistics": sar_statistics.detach(),
+        "physical_anchor_delta": anchor_delta.detach(),
+        "physical_null_change": null_change.detach(),
+        "physical_source_evidence": source_evidence.detach(),
+        "physical_nll": nll.detach(),
+        "physical_permutation": permutation.detach(),
+        "physical_anchor_regret": anchor_regret.detach(),
+        "physical_rmse": per_example_error.mean().detach(),
+        "anchor_rmse": anchor_error.mean().detach(),
+    }
+
+
+def sopat_direction_objective(
+    model: SOPATForwardProtocol | nn.Module,
+    batch: Mapping[str, object],
+    direction: str,
+    config: SOPATTrainConfig,
+    *,
+    device: torch.device | None = None,
+    generator: torch.Generator | None = None,
+) -> tuple[Tensor, dict[str, Tensor]]:
+    """Forward one direction and apply its selected stage objective."""
+
+    direction = _validate_direction(direction)
+    inputs = forward_input_tensors(batch, device=device)
+    if config.stage == "factorizer":
+        output = factorize_sopat_anchors(model, batch, direction, device=device)
+        return factorizer_objective(output, inputs, config)
+    output = forward_direction(model, batch, direction, device=device)
+    labels = supervision_tensors(batch, device=device)
+    return physical_objective(model, output, batch, inputs, labels, direction, config, generator=generator)
+
+
+def factorize_sopat_anchors(
+    model: SOPATForwardProtocol | nn.Module,
+    batch: Mapping[str, object],
+    direction: str,
+    *,
+    device: torch.device | None = None,
+) -> object:
+    """Run the anchor-only core route used by the factorizer stage.
+
+    The call intentionally contains no observations, time sequence, or query
+    target labels.  Core models without the public shortcut retain the causal
+    full-forward compatibility path, but current SOPAT V4 implements it and
+    avoids encoding an otherwise unused history stack.
+    """
+
+    direction = _validate_direction(direction)
+    shortcut = getattr(model, "factorize_anchors", None)
+    if not callable(shortcut):
+        return forward_direction(model, batch, direction, device=device)
+    inputs = forward_input_tensors(batch, device=device)
+    source_sensor, target_sensor = direction_sensors(direction)
+    return shortcut(
+        source_anchor=inputs["source_anchor"],
+        source_anchor_valid=inputs["source_anchor_valid"],
+        target_anchor=inputs["target_anchor"],
+        target_anchor_valid=inputs["target_anchor_valid"],
+        source_sensor=_batch_sensor(batch, "source_sensor", source_sensor),
+        target_sensor=_batch_sensor(batch, "target_sensor", target_sensor),
+    )
+
+
+class SOPATTrainingModule(nn.Module):
+    """DDP-visible wrapper for one coupled, bidirectional model forward.
+
+    DDP must observe both direction-specific renderers in the *same* forward.
+    Splitting the directions over a ``no_sync`` microbatch and a synchronized
+    microbatch leaves one renderer absent from the latter autograd graph, which
+    can silently desynchronize its parameters across ranks.  This wrapper
+    therefore computes the two homogeneous direction objectives sequentially
+    inside one DDP-visible graph; the caller performs exactly one backward.
+    """
+
+    def __init__(self, model: SOPATForwardProtocol | nn.Module, config: SOPATTrainConfig) -> None:
+        super().__init__()
+        if not isinstance(model, nn.Module):
+            raise TypeError("SOPAT training model must be an nn.Module")
+        self.model = model
+        self.config = config
+
+    def forward(
+        self,
+        batches: Mapping[str, Mapping[str, object]],
+        generator: torch.Generator | None = None,
+    ) -> tuple[Tensor, dict[str, object]]:
+        missing = set(DIRECTIONS).difference(batches)
+        unexpected = set(batches).difference(DIRECTIONS)
+        if missing or unexpected:
+            raise ValueError(
+                "SOPAT coupled forward requires exactly both directions; "
+                f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+            )
+        direction_losses: dict[str, Tensor] = {}
+        metrics: dict[str, Tensor] = {}
+        total: Tensor | None = None
+        for direction in DIRECTIONS:
+            loss, direction_metrics = sopat_direction_objective(
+                self.model,
+                batches[direction],
+                direction,
+                self.config,
+                device=_module_device(self.model),
+                generator=generator,
+            )
+            weighted = loss * float(self.config.direction_weights[direction])
+            if not bool(torch.isfinite(weighted)):
+                raise FloatingPointError(f"non-finite SOPAT {direction} loss")
+            total = weighted if total is None else total + weighted
+            direction_losses[direction] = loss.detach()
+            for name, value in direction_metrics.items():
+                metrics[f"{direction}/{name}"] = value.detach()
+        assert total is not None
+        return total, {"direction_losses": direction_losses, "metrics": metrics}
+
+
+def configure_sopat_stage(model: nn.Module, stage: Stage) -> None:
+    """Delegate stage freezing to the core model when it exposes the contract."""
+
+    if stage not in {"factorizer", "physical"}:
+        raise ValueError("SOPAT stage must be factorizer or physical")
+    for name in ("set_training_stage", "set_stage"):
+        setter = getattr(model, name, None)
+        if callable(setter):
+            setter(stage)
+            return
+    if stage == "physical":
+        for parameter in model.parameters():
+            parameter.requires_grad_(True)
+        return
+    # The initial public SOPAT core deliberately keeps the model surface small.
+    # Its factorizer components have stable public names, so use an explicit
+    # fallback rather than accidentally optimizing the transport renderer in
+    # the anchor-only stage.  Future cores should provide ``set_training_stage``
+    # and take precedence above.
+    for parameter in model.parameters():
+        parameter.requires_grad_(False)
+    component_names = ("encoder", "factorizer", "anchor_reconstructors")
+    enabled = 0
+    for name in component_names:
+        component = getattr(model, name, None)
+        if not isinstance(component, nn.Module):
+            continue
+        for parameter in component.parameters():
+            parameter.requires_grad_(True)
+            enabled += 1
+    if enabled == 0:
+        raise RuntimeError(
+            "SOPAT core must expose set_training_stage/set_stage or public "
+            "factorizer components for factorizer training"
+        )
+
+
+@dataclass
+class ModelEMA:
+    """Small CPU/GPU-safe EMA owned by one bidirectional SOPAT checkpoint."""
+
+    decay: float
+    state: dict[str, Tensor]
+
+    @classmethod
+    def create(cls, model: nn.Module, decay: float) -> ModelEMA:
+        if not 0.0 <= decay < 1.0:
+            raise ValueError("EMA decay must be in [0, 1)")
+        state = {name: value.detach().clone() for name, value in model.state_dict().items()}
+        return cls(decay=float(decay), state=state)
+
+    def update(self, model: nn.Module) -> None:
+        current = model.state_dict()
+        if set(current) != set(self.state):
+            raise RuntimeError("SOPAT EMA state no longer matches model state")
+        with torch.no_grad():
+            for name, value in current.items():
+                average = self.state[name]
+                if average.shape != value.shape:
+                    raise RuntimeError(f"SOPAT EMA tensor shape changed: {name}")
+                if torch.is_floating_point(average):
+                    average.lerp_(value.detach().to(average), 1.0 - self.decay)
+                else:
+                    average.copy_(value.detach().to(average))
+
+    def state_dict(self) -> dict[str, object]:
+        return {"decay": self.decay, "state": {name: value.clone() for name, value in self.state.items()}}
+
+    def load_state_dict(self, values: Mapping[str, object]) -> None:
+        decay = values.get("decay")
+        state = values.get("state")
+        if not isinstance(decay, (int, float)) or not isinstance(state, Mapping):
+            raise TypeError("invalid SOPAT EMA checkpoint state")
+        loaded = {str(name): value for name, value in state.items() if isinstance(value, Tensor)}
+        if set(loaded) != set(self.state):
+            raise RuntimeError("SOPAT EMA checkpoint keys differ from model")
+        for name, value in loaded.items():
+            if value.shape != self.state[name].shape:
+                raise RuntimeError(f"SOPAT EMA checkpoint shape differs for {name}")
+        self.decay = float(decay)
+        self.state = {name: value.detach().clone() for name, value in loaded.items()}
+
+    @contextlib.contextmanager
+    def average_parameters(self, model: nn.Module) -> Iterator[None]:
+        original = {name: value.detach().clone() for name, value in model.state_dict().items()}
+        model.load_state_dict(self.state, strict=True)
+        try:
+            yield
+        finally:
+            model.load_state_dict(original, strict=True)
+
+
+def train_coupled_step(
+    module: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    batches: Mapping[str, Mapping[str, object]],
+    config: SOPATTrainConfig,
+    *,
+    ema: ModelEMA | None = None,
+    generator: torch.Generator | None = None,
+) -> CoupledStepResult:
+    """Run one weighted two-direction DDP step with a single optimizer update."""
+
+    missing = set(DIRECTIONS).difference(batches)
+    if missing:
+        raise ValueError(f"coupled SOPAT step is missing directions: {sorted(missing)}")
+    optimizer.zero_grad(set_to_none=True)
+    parameter_device = _module_device(module)
+    with torch.autocast(
+        device_type=parameter_device.type,
+        dtype=torch.bfloat16,
+        enabled=config.autocast_bfloat16 and parameter_device.type == "cuda",
+    ):
+        output = module(batches, generator)
+    if not isinstance(output, tuple) or len(output) != 2:
+        raise TypeError("SOPAT training module must return (loss, diagnostics)")
+    total, diagnostics = output
+    if not isinstance(total, Tensor) or not isinstance(diagnostics, Mapping):
+        raise TypeError("SOPAT training module returned invalid coupled loss or diagnostics")
+    if not bool(torch.isfinite(total)):
+        raise FloatingPointError("non-finite coupled SOPAT loss")
+    total.backward()
+    direction_values = diagnostics.get("direction_losses")
+    metric_values = diagnostics.get("metrics")
+    if not isinstance(direction_values, Mapping) or not isinstance(metric_values, Mapping):
+        raise TypeError("SOPAT coupled diagnostics are incomplete")
+    direction_losses = {
+        direction: float(value.detach())
+        for direction, value in direction_values.items()
+        if direction in DIRECTIONS and isinstance(value, Tensor)
+    }
+    if set(direction_losses) != set(DIRECTIONS):
+        raise TypeError("SOPAT coupled diagnostics omit a direction loss")
+    metrics = {
+        str(name): float(value.detach())
+        for name, value in metric_values.items()
+        if isinstance(value, Tensor)
+    }
+    trainable = [parameter for parameter in module.parameters() if parameter.requires_grad]
+    if not trainable:
+        raise RuntimeError("SOPAT stage has no trainable parameters")
+    gradient_norm = torch.nn.utils.clip_grad_norm_(trainable, config.gradient_clip)
+    if not bool(torch.isfinite(gradient_norm)):
+        raise FloatingPointError("non-finite SOPAT gradient")
+    optimizer.step()
+    if ema is not None:
+        ema.update(_unwrap_sopat_model(module))
+    return CoupledStepResult(
+        total_loss=float(total.detach()),
+        gradient_norm=float(gradient_norm),
+        direction_losses=direction_losses,
+        metrics=metrics,
+    )
+
+
+def evaluate_factorizer_loaders(
+    model: SOPATForwardProtocol | nn.Module,
+    loaders: Mapping[str, Iterable[Mapping[str, object]]],
+    config: SOPATTrainConfig,
+    *,
+    device: torch.device | None = None,
+    limit_batches: int | None = None,
+) -> FactorizerValidationResult:
+    """Evaluate the paired-anchor factorizer without rendering a query image.
+
+    The helper deliberately calls the same anchor shortcut and objective as
+    factorizer training.  Neither observations nor target labels are passed
+    through the model boundary, which keeps this stage inexpensive and avoids
+    selecting a factorizer based on an untrained physical renderer.
+    """
+
+    if config.stage != "factorizer":
+        raise ValueError("factorizer validation requires SOPAT stage=factorizer")
+    missing = set(DIRECTIONS).difference(loaders)
+    unexpected = set(loaders).difference(DIRECTIONS)
+    if missing or unexpected:
+        raise ValueError(
+            "factorizer validation requires exactly both directions; "
+            f"missing={sorted(missing)}, unexpected={sorted(unexpected)}"
+        )
+    if limit_batches is not None and limit_batches <= 0:
+        raise ValueError("factorizer validation limit_batches must be positive")
+    was_training = isinstance(model, nn.Module) and model.training
+    if isinstance(model, nn.Module):
+        model.eval()
+    direction_losses: dict[str, float] = {}
+    metrics: dict[str, float] = {}
+    batches: dict[str, int] = {}
+    try:
+        with torch.inference_mode():
+            for direction in DIRECTIONS:
+                total = 0.0
+                count = 0
+                sums: dict[str, float] = {}
+                for index, batch in enumerate(loaders[direction]):
+                    if limit_batches is not None and index >= limit_batches:
+                        break
+                    if not isinstance(batch, Mapping):
+                        raise TypeError("factorizer validation loader must yield mapping batches")
+                    inputs = forward_input_tensors(batch, device=device)
+                    output = factorize_sopat_anchors(model, batch, direction, device=device)
+                    loss, values = factorizer_objective(output, inputs, config)
+                    if not bool(torch.isfinite(loss)):
+                        raise FloatingPointError(f"non-finite factorizer validation loss: {direction}")
+                    total += float(loss.detach())
+                    count += 1
+                    for name, value in values.items():
+                        sums[name] = sums.get(name, 0.0) + float(value.detach())
+                if count <= 0:
+                    raise RuntimeError(f"factorizer validation loader is empty: {direction}")
+                direction_losses[direction] = total / count
+                batches[direction] = count
+                for name, value in sums.items():
+                    metrics[f"{direction}/{name}"] = value / count
+    finally:
+        if isinstance(model, nn.Module) and was_training:
+            model.train()
+    weighted_loss = sum(
+        float(config.direction_weights[direction]) * direction_losses[direction]
+        for direction in DIRECTIONS
+    )
+    if not math.isfinite(weighted_loss):
+        raise FloatingPointError("non-finite coupled factorizer validation loss")
+    return FactorizerValidationResult(
+        weighted_loss=weighted_loss,
+        direction_losses=direction_losses,
+        metrics=metrics,
+        batches=batches,
+    )
+
+
+def capture_rng_state() -> dict[str, object]:
+    """Capture all local RNGs so a checkpoint records reproducibility state."""
+
+    return {
+        "python": random.getstate(),
+        "numpy": np.random.get_state(),
+        "torch": torch.get_rng_state(),
+        "cuda": torch.cuda.get_rng_state_all() if torch.cuda.is_available() else [],
+    }
+
+
+def restore_rng_state(values: Mapping[str, object]) -> None:
+    required = {"python", "numpy", "torch", "cuda"}
+    if set(values) != required:
+        raise ValueError("SOPAT RNG checkpoint state is incomplete")
+    random.setstate(values["python"])  # type: ignore[arg-type]
+    np.random.set_state(values["numpy"])  # type: ignore[arg-type]
+    torch_state = values["torch"]
+    if not isinstance(torch_state, Tensor):
+        raise TypeError("SOPAT checkpoint torch RNG state is invalid")
+    torch.set_rng_state(torch_state)
+    cuda_state = values["cuda"]
+    if torch.cuda.is_available():
+        if not isinstance(cuda_state, list) or not all(isinstance(value, Tensor) for value in cuda_state):
+            raise TypeError("SOPAT checkpoint CUDA RNG state is invalid")
+        torch.cuda.set_rng_state_all(cuda_state)
+
+
+def gather_rng_states(local_state: Mapping[str, object]) -> Mapping[str, object]:
+    """Collect one RNG state per DDP rank for a rank-zero checkpoint payload."""
+
+    if not dist.is_available() or not dist.is_initialized():
+        return {"0": dict(local_state)}
+    values: list[object] = [None for _ in range(dist.get_world_size())]
+    dist.all_gather_object(values, dict(local_state))
+    return {str(index): value for index, value in enumerate(values)}
+
+
+def save_sopat_checkpoint(
+    path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    ema: ModelEMA,
+    model_config: Mapping[str, object] | object,
+    train_config: SOPATTrainConfig | Mapping[str, object],
+    protocol_hashes: Mapping[str, Mapping[str, str]],
+    global_step: int,
+    best_metrics: Mapping[str, object],
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    rng_state: Mapping[str, object] | None = None,
+    data_state: Mapping[str, object] | None = None,
+) -> Path:
+    """Atomically save the only SOPAT V4 checkpoint format.
+
+    One checkpoint always contains both directions.  There is deliberately no
+    direction-specific optimizer state that can be resumed into a shared V4
+    model by accident.
+    """
+
+    if global_step < 0:
+        raise ValueError("SOPAT global_step cannot be negative")
+    resolved_model = _unwrap_sopat_model(model)
+    normalized_model_config = _config_mapping(model_config)
+    normalized_train_config = _config_mapping(train_config)
+    normalized_protocol = _normalize_protocol_hashes(protocol_hashes)
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, object] = {
+        "sopat_v4_format": SOPAT_V4_FORMAT,
+        "family": SOPAT_V4_FAMILY,
+        "directions": list(DIRECTIONS),
+        "architecture": str(normalized_model_config.get("architecture", "sopat_v4")),
+        "model_config": normalized_model_config,
+        "train_config": normalized_train_config,
+        "protocol_hashes": normalized_protocol,
+        "model": resolved_model.state_dict(),
+        "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict() if scheduler is not None else None,
+        "ema": ema.state_dict(),
+        "rng": dict(rng_state if rng_state is not None else capture_rng_state()),
+        "global_step": int(global_step),
+        "best_metrics": _json_safe_mapping(best_metrics),
+        "data_state": _json_safe_mapping(data_state or {}),
+    }
+    temporary = destination.with_name(f".{destination.name}.{os.getpid()}.tmp")
+    torch.save(payload, temporary)
+    os.replace(temporary, destination)
+    return destination
+
+
+def load_sopat_checkpoint(
+    path: str | Path,
+    *,
+    model: nn.Module,
+    optimizer: torch.optim.Optimizer | None,
+    ema: ModelEMA | None,
+    model_config: Mapping[str, object] | object,
+    train_config: SOPATTrainConfig | Mapping[str, object],
+    protocol_hashes: Mapping[str, Mapping[str, str]],
+    scheduler: torch.optim.lr_scheduler.LRScheduler | None = None,
+    restore_rng: bool = False,
+) -> dict[str, object]:
+    """Strictly resume a compatible, bidirectional SOPAT V4 checkpoint."""
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, dict):
+        raise TypeError("SOPAT checkpoint payload must be a mapping")
+    if int(payload.get("sopat_v4_format", -1)) != SOPAT_V4_FORMAT:
+        raise RuntimeError("incompatible SOPAT V4 checkpoint format")
+    if payload.get("family") != SOPAT_V4_FAMILY:
+        raise RuntimeError("checkpoint does not belong to SOPAT V4")
+    if tuple(payload.get("directions", ())) != DIRECTIONS:
+        raise RuntimeError("SOPAT checkpoint does not contain exactly both directions")
+    expected_model_config = _config_mapping(model_config)
+    expected_train_config = _config_mapping(train_config)
+    expected_protocol = _normalize_protocol_hashes(protocol_hashes)
+    if payload.get("model_config") != expected_model_config:
+        raise RuntimeError("SOPAT checkpoint model configuration differs from this run")
+    if payload.get("train_config") != expected_train_config:
+        raise RuntimeError("SOPAT checkpoint training configuration differs from this run")
+    if payload.get("protocol_hashes") != expected_protocol:
+        raise RuntimeError("SOPAT checkpoint direction/cache protocol hashes differ from this run")
+    state = payload.get("model")
+    if not isinstance(state, Mapping):
+        raise TypeError("SOPAT checkpoint is missing model state")
+    _unwrap_sopat_model(model).load_state_dict(state, strict=True)
+    if optimizer is not None:
+        optimizer_state = payload.get("optimizer")
+        if not isinstance(optimizer_state, Mapping):
+            raise RuntimeError("SOPAT resume checkpoint is missing optimizer state")
+        optimizer.load_state_dict(optimizer_state)
+    if scheduler is not None:
+        scheduler_state = payload.get("scheduler")
+        if not isinstance(scheduler_state, Mapping):
+            raise RuntimeError("SOPAT resume checkpoint is missing scheduler state")
+        scheduler.load_state_dict(scheduler_state)
+    if ema is not None:
+        ema_state = payload.get("ema")
+        if not isinstance(ema_state, Mapping):
+            raise RuntimeError("SOPAT resume checkpoint is missing EMA state")
+        ema.load_state_dict(ema_state)
+    if restore_rng:
+        rng = payload.get("rng")
+        if not isinstance(rng, Mapping):
+            raise RuntimeError("SOPAT resume checkpoint is missing RNG state")
+        local = rng.get(str(dist.get_rank()) if dist.is_available() and dist.is_initialized() else "0")
+        if isinstance(local, Mapping):
+            restore_rng_state(local)
+        else:
+            # Single-rank historical saves may store the local state directly.
+            restore_rng_state(rng)
+    return payload
+
+
+def initialize_from_sopat_checkpoint(
+    model: nn.Module,
+    path: str | Path,
+    *,
+    model_config: Mapping[str, object] | object,
+    protocol_hashes: Mapping[str, Mapping[str, str]],
+) -> dict[str, object]:
+    """Initialize model weights from a compatible V4 stage without optimizer state.
+
+    This is the deliberate bridge from ``factorizer`` to ``physical``.  Unlike
+    ``load_sopat_checkpoint`` it does not require an identical train config,
+    and it never reads optimizer, scheduler, EMA, RNG, or best metrics into
+    the active process.
+    """
+
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    if not isinstance(payload, Mapping):
+        raise TypeError("SOPAT initialization checkpoint payload must be a mapping")
+    if int(payload.get("sopat_v4_format", -1)) != SOPAT_V4_FORMAT:
+        raise RuntimeError("SOPAT initialization checkpoint has incompatible format")
+    if payload.get("family") != SOPAT_V4_FAMILY or tuple(payload.get("directions", ())) != DIRECTIONS:
+        raise RuntimeError("SOPAT initialization checkpoint is not a bidirectional V4 checkpoint")
+    if payload.get("model_config") != _config_mapping(model_config):
+        raise RuntimeError("SOPAT initialization checkpoint model configuration differs")
+    if payload.get("protocol_hashes") != _normalize_protocol_hashes(protocol_hashes):
+        raise RuntimeError("SOPAT initialization checkpoint protocol hashes differ")
+    state = payload.get("model")
+    if not isinstance(state, Mapping):
+        raise TypeError("SOPAT initialization checkpoint has no model state")
+    _unwrap_sopat_model(model).load_state_dict(state, strict=True)
+    return {
+        "source": str(path),
+        "source_global_step": int(payload.get("global_step", 0)),
+        "source_train_stage": _checkpoint_stage(payload),
+    }
+
+
+def initialize_from_v3_checkpoint(
+    model: nn.Module,
+    path: str | Path,
+    *,
+    allowed_prefixes: Sequence[str] = DEFAULT_V3_INITIALIZATION_PREFIXES,
+    require_match: bool = True,
+    use_ema: bool = True,
+) -> dict[str, object]:
+    """Load only whitelisted exact-name/shape tensors from an older V3 checkpoint.
+
+    This intentionally never reads optimizer, scheduler, EMA, direction, or
+    release state from V3.  SOPAT physical validity must be established anew.
+    """
+
+    if not allowed_prefixes or any(not prefix for prefix in allowed_prefixes):
+        raise ValueError("SOPAT V3 initialization needs non-empty allowed prefixes")
+    payload = torch.load(path, map_location="cpu", weights_only=False, mmap=True)
+    if not isinstance(payload, Mapping):
+        raise TypeError("V3 initialization checkpoint must be a mapping")
+    source = payload.get("model", payload.get("model_state"))
+    if not isinstance(source, Mapping):
+        raise TypeError("V3 initialization checkpoint has no model state mapping")
+    resolved_source = dict(source)
+    ema_overlaid: list[str] = []
+    if use_ema:
+        ema = payload.get("ema")
+        ema_state = ema.get("state") if isinstance(ema, Mapping) else None
+        if isinstance(ema_state, Mapping):
+            for name, value in ema_state.items():
+                if isinstance(name, str) and isinstance(value, Tensor):
+                    resolved_source[name] = value
+                    ema_overlaid.append(name)
+    resolved = _unwrap_sopat_model(model)
+    target = resolved.state_dict()
+    loaded: list[str] = []
+    skipped_shape: list[str] = []
+    for name, target_value in target.items():
+        if not any(name.startswith(prefix) for prefix in allowed_prefixes):
+            continue
+        source_value = resolved_source.get(name)
+        if not isinstance(source_value, Tensor):
+            continue
+        if source_value.shape != target_value.shape:
+            skipped_shape.append(name)
+            continue
+        target[name] = source_value.detach().to(dtype=target_value.dtype).clone()
+        loaded.append(name)
+    if require_match and not loaded:
+        raise RuntimeError("V3 initialization found no allowed exact-name, shape-compatible tensors")
+    resolved.load_state_dict(target, strict=True)
+    return {
+        "source": str(path),
+        "allowed_prefixes": list(allowed_prefixes),
+        "use_ema": bool(use_ema),
+        "ema_overlaid": sorted(ema_overlaid),
+        "loaded": sorted(loaded),
+        "skipped_shape": sorted(skipped_shape),
+    }
+
+
+def _checkpoint_stage(payload: Mapping[str, object]) -> str | None:
+    config = payload.get("train_config")
+    if not isinstance(config, Mapping):
+        return None
+    stage = config.get("stage")
+    return str(stage) if isinstance(stage, str) else None
+
+
+def _sample_probability(
+    probability: float, device: torch.device, generator: torch.Generator | None
+) -> bool:
+    if probability <= 0.0:
+        return False
+    if probability >= 1.0:
+        return True
+    return bool(
+        torch.rand(
+            (),
+            device=device,
+            generator=_generator_for_device(generator, device),
+        )
+        < probability
+    )
+
+
+def _generator_for_device(
+    generator: torch.Generator | None, device: torch.device
+) -> torch.Generator | None:
+    """Return a generator only when its backend matches the sampled tensor.
+
+    PyTorch rejects a CPU generator for CUDA ``rand``/``randperm`` calls.  A
+    mismatched caller generator is intentionally ignored: the process-global
+    generator remains deterministic after the CLI seeds each DDP rank.
+    """
+
+    if generator is None:
+        return None
+    generator_device = torch.device(generator.device)
+    if generator_device.type != device.type:
+        return None
+    if generator_device.type == "cuda" and generator_device.index not in {None, device.index}:
+        return None
+    return generator
+
+
+def _per_example_rmse(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    mask = _resize_valid(valid, prediction).expand_as(prediction)
+    numerator = ((prediction - target).square() * mask).flatten(1).sum(dim=1)
+    denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
+    return (numerator / denominator).sqrt()
+
+
+def _per_example_stable_rmse(prediction: Tensor, target: Tensor, valid: Tensor) -> Tensor:
+    """Differentiable RMSE with a finite derivative at an exact identity."""
+
+    mask = _resize_valid(valid, prediction).expand_as(prediction)
+    numerator = ((prediction - target).square() * mask).flatten(1).sum(dim=1)
+    denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
+    return (numerator / denominator + 1e-8).sqrt()
+
+
+def _module_device(module: nn.Module) -> torch.device:
+    parameter = next(module.parameters(), None)
+    if parameter is not None:
+        return parameter.device
+    buffer = next(module.buffers(), None)
+    if buffer is not None:
+        return buffer.device
+    return torch.device("cpu")
+
+
+def _unwrap_sopat_model(model: nn.Module) -> nn.Module:
+    module = model
+    while hasattr(module, "module") and isinstance(module.module, nn.Module):
+        module = module.module
+    while isinstance(module, SOPATTrainingModule):
+        module = module.model
+        while hasattr(module, "module") and isinstance(module.module, nn.Module):
+            module = module.module
+    return module
+
+
+def _config_mapping(value: Mapping[str, object] | object) -> dict[str, object]:
+    if is_dataclass(value) and not isinstance(value, type):
+        value = asdict(value)
+    if not isinstance(value, Mapping):
+        raise TypeError("SOPAT configuration must be a mapping or dataclass instance")
+    return _json_safe_mapping(value)
+
+
+def _normalize_protocol_hashes(
+    values: Mapping[str, Mapping[str, str]]
+) -> dict[str, dict[str, str]]:
+    if set(values) != set(DIRECTIONS):
+        raise ValueError("SOPAT protocol hashes must contain both directions")
+    normalized: dict[str, dict[str, str]] = {}
+    for direction in DIRECTIONS:
+        artifacts = values[direction]
+        if not isinstance(artifacts, Mapping) or not artifacts:
+            raise TypeError(f"SOPAT protocol hashes for {direction} must be a non-empty mapping")
+        normalized[direction] = {}
+        for name, digest in sorted(artifacts.items()):
+            if not isinstance(name, str) or not isinstance(digest, str):
+                raise TypeError("SOPAT protocol hash names and values must be strings")
+            if len(digest) != 64 or any(character not in "0123456789abcdef" for character in digest.lower()):
+                raise ValueError(f"SOPAT protocol hash {direction}/{name} must be SHA-256 hex")
+            normalized[direction][name] = digest.lower()
+    return normalized
+
+
+def _json_safe_mapping(values: Mapping[str, object]) -> dict[str, object]:
+    """Canonicalize nested config/report mappings without serializing tensors."""
+
+    result: dict[str, object] = {}
+    for name, value in sorted(values.items(), key=lambda item: str(item[0])):
+        key = str(name)
+        if is_dataclass(value) and not isinstance(value, type):
+            value = asdict(value)
+        if isinstance(value, Mapping):
+            result[key] = _json_safe_mapping(value)
+        elif isinstance(value, tuple | list):
+            result[key] = [_json_safe_value(item) for item in value]
+        else:
+            result[key] = _json_safe_value(value)
+    return result
+
+
+def _json_safe_value(value: object) -> object:
+    if isinstance(value, Tensor):
+        if value.numel() != 1:
+            raise TypeError("SOPAT checkpoint metadata cannot contain non-scalar tensors")
+        return float(value.detach().cpu())
+    if is_dataclass(value) and not isinstance(value, type):
+        return _json_safe_mapping(asdict(value))
+    if isinstance(value, Mapping):
+        return _json_safe_mapping(value)
+    if isinstance(value, tuple):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, list):
+        return [_json_safe_value(item) for item in value]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    # Config values need deterministic JSON-compatible metadata.  Do not use
+    # ``repr`` for opaque runtime state because resume equality must be strict.
+    raise TypeError(f"SOPAT checkpoint metadata has unsupported type {type(value).__name__}")
+
+
+def canonical_json_sha256(values: Mapping[str, object]) -> str:
+    """Hash a canonical JSON-compatible mapping for protocol construction."""
+
+    import hashlib
+
+    encoded = json.dumps(_json_safe_mapping(values), sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()

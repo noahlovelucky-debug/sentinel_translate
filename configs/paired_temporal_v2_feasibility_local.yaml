@@ -1,0 +1,67 @@
+# Local-cache variant of paired_temporal_v2_feasibility.yaml.
+# The canonical feasibility YAML remains remote and rebuilds its indexes.  This
+# file is deliberately explicit: the runner only validates these prebuilt
+# files and never contacts the remote manifest or rebuilds an index.
+data:
+  manifest: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/manifests/pairs.jsonl
+  train_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes/{direction}/train.jsonl
+  validation_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes/{direction}/validation.jsonl
+  orbit: ascending
+  anchor_pair_max_delta_days: 1
+  maximum_anchors_per_query: 2
+  horizon_days: 180
+  translation_max_delta_days: 1
+  minimum_observations: 1
+  maximum_observations: 4
+  max_train_samples: 64
+  max_validation_samples: 64
+  crop_size: 64
+  minimum_valid_fraction: 0.80
+  registration_audit: true
+  maximum_registration_shift_px: 0.5
+  train_split: train
+  validation_split: validation_temporal
+  test_splits: [test_spatial, test_temporal, test_joint]
+  task_modes: [translation, forecast]
+model:
+  architecture: sparse_paired_anchor_transport_v2
+  width: 32
+  latent_channels: 8
+  attention_heads: 4
+  flow_steps: 1
+  deterministic_detail_limit: 0.15
+  visual_residual_limit: 0.20
+  texture_block_size: 4
+training:
+  precision: bfloat16
+  world_size: 8
+  observation_dropout: 0.35
+  query_observation_dropout: 0.50
+  observation_count_probabilities:
+    one: 0.50
+    two_to_three: 0.35
+    four_plus: 0.15
+  stages:
+    physical: {steps: 400, learning_rate: 0.0002}
+    detail: {steps: 300, learning_rate: 0.0001}
+    flow: {steps: 500, learning_rate: 0.0001}
+    balance: {steps: 100, learning_rate: 0.00001}
+  validate_every: 100
+  full_validate_every: 100
+  early_stop_full_validations: 5
+validation:
+  fixed_seed: 71
+  no_best_of_k: true
+  frame_count_bins: [one, two_to_three, four_plus]
+  report_task_modes_separately: true
+  visual_rmse_over_physical_maximum: 1.05
+  minimum_physical_anchor_improvement_percent: 5.0
+  minimum_source_evidence_improvement_percent: 1.0
+  pre_projection_violation_maximum: 0.001
+  minimum_scene_improvement_fraction: 0.70
+  maximum_scene_rmse_regression_fraction: 0.10
+release:
+  require_translation_and_forecast_gates: true
+  require_one_frame_gate: true
+  physical_checkpoint_frozen_before_detail: true
+  validation_selected_release_only: true

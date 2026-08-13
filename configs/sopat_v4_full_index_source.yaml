@@ -1,0 +1,26 @@
+# Index/cache construction contract for SOPAT V4. Pixel training knobs live in
+# sopat_v4_full_raw.yaml; this file binds the complete causal sample selector.
+data:
+  manifest: /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl
+  orbit: ascending
+  anchor_pair_max_delta_days: 1
+  maximum_anchors_per_query: 3
+  horizon_days: 180
+  translation_max_delta_days: 1
+  minimum_observations: 1
+  maximum_observations: 8
+  crop_size: 256
+  minimum_valid_fraction: 0.80
+  registration_audit: true
+  maximum_registration_shift_px: 0.5
+  train_split: train
+  validation_split: validation_temporal
+  test_splits: [test_spatial, test_temporal, test_joint]
+  task_modes: [translation, forecast]
+
+model:
+  architecture: sopat_v4
+
+training:
+  precision: bfloat16
+  world_size: 8

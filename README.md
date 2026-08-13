@@ -1,5 +1,16 @@
 # Sentinel Translate V3.2
 
+The next bidirectional paired-anchor research model is specified in
+[docs/SOPAT_V4_RESEARCH_AND_IMPLEMENTATION_ZH.md](docs/SOPAT_V4_RESEARCH_AND_IMPLEMENTATION_ZH.md).
+SOPAT V4 uses one shared checkpoint, a registered historical S1/S2 anchor pair,
+and an unordered set of 1--N causal source observations. Its first release is
+limited to Sentinel-1/Sentinel-2 on the canonical 10 m grid.
+
+The sparse registered-pair temporal image-to-image research track is documented in
+[docs/PAIRED_TEMPORAL_V2_DESIGN_ZH.md](docs/PAIRED_TEMPORAL_V2_DESIGN_ZH.md). It
+supports one-to-many causal source observations plus one registered SAR/Optical
+anchor pair without changing the released single-frame V3.2 API.
+
 Sentinel Translate V3.2 is a bidirectional Sentinel-1/Sentinel-2 conditional image generation
 model. It separates a deterministic, radiometrically constrained `physical` output from a
 perceptual `visual` output:
@@ -17,9 +28,12 @@ LPIPS by 3.71% rather than the required 5%. Consequently, the repository current
 
 ## Documentation
 
+- [SOPAT V4 research hypothesis, model, causal protocol, training, and acceptance](docs/SOPAT_V4_RESEARCH_AND_IMPLEMENTATION_ZH.md)
+- [Sparse registered-pair temporal V2 design, data contract, training, and feasibility](docs/PAIRED_TEMPORAL_V2_DESIGN_ZH.md)
 - [Current model, labels, bridge formulation, results, and visual interpretation](docs/V32_CURRENT_PIPELINE_ZH.md)
 - [Canonical 2017–2024 training and acceptance report](docs/V32_CANONICAL_2017_2024_TRAINING_REPORT_ZH.md)
 - [Acceptance criteria](docs/V32_ACCEPTANCE.md)
+- [Temporal V1 causal anchor-delta research track](docs/TEMPORAL_V1_CAUSAL_ANCHOR_DELTA_ZH.md)
 
 ## Canonical data
 

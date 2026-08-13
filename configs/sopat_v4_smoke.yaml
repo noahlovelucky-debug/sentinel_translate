@@ -1,0 +1,58 @@
+# Fast single-process/DDP runner smoke. It uses real local pixels and a tiny core.
+data:
+  manifest: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/manifests/pairs.jsonl
+  train_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes_v4_center_evaluable/{direction}/train.jsonl
+  validation_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes_v4_center_evaluable/{direction}/validation.jsonl
+  train_split: train
+  validation_split: validation_temporal
+  horizon_days: 180
+  translation_max_delta_days: 1
+  maximum_observations: 4
+  crop_size: 64
+  minimum_valid_fraction: 0.80
+  registration_audit: false
+  maximum_registration_shift_px: 0.5
+
+model:
+  architecture: sopat_v4
+  width: 8
+  hidden: 32
+  encoder_depth: 1
+  heads: 4
+  adapter_rank: 4
+  transport_heads: 4
+  max_horizon_days: 180
+  translation_tolerance_days: 1
+  anchor_window_size: 2
+
+training:
+  precision: bfloat16
+  batch_size: 1
+  num_workers: 0
+  activation_checkpointing: false
+  log_every: 1
+  weight_decay: 0.0001
+  gradient_clip: 1.0
+  ema_decay: 0.9
+  stages:
+    factorizer: {steps: 1, learning_rate: 0.0001, encoder_learning_rate: 0.0001}
+    physical: {steps: 1, learning_rate: 0.0001, encoder_learning_rate: 0.0001}
+  objective:
+    physical_null_change_probability: 1.0
+    physical_permutation_probability: 1.0
+  validate_every: 1
+  full_validate_every: 1
+  early_stop_full_validations: 2
+
+validation:
+  batch_size: 3
+  pilot_samples: 2
+  panel_samples: 1
+  selection_phase: feasibility
+  selection:
+    required_tasks: [translation, forecast]
+    required_observation_counts: [one]
+    feasibility_overall_anchor_ratio: 10.0
+    feasibility_bucket_anchor_ratio: 10.0
+    feasibility_source_shuffle_min_degradation: 0.0
+    full_source_shuffle_min_degradation: 0.0
