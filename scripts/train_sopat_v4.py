@@ -791,7 +791,6 @@ def _evaluate_validation(
             variant=SOPATVariantConfig("source_shuffle", seed=seed),
             device=device,
             limit_batches=limit_batches,
-            generator=_device_generator(device, seed + 17),
         )
     decision = select_sopat_candidate(
         sopat,

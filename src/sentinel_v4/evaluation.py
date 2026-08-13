@@ -8,6 +8,7 @@ available observation count, and target-anchor change.  This makes a reported
 
 from __future__ import annotations
 
+import hashlib
 import math
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -60,6 +61,7 @@ _SAR_HISTOGRAM_MINIMUM_DB = -60.0
 _SAR_HISTOGRAM_MAXIMUM_DB = 20.0
 _SAR_HISTOGRAM_BINS = 320
 _STRUCTURAL_BOX_SIZE = 9
+_SOURCE_SHUFFLE_PLANNER = "stable_cyclic_offset_v1"
 
 
 class NoSingletonBatchSampler(Sampler[list[int]]):
@@ -148,12 +150,21 @@ class SOPATVariantConfig:
         return "trained_sopat"
 
     def metadata(self) -> dict[str, object]:
-        return {
+        result: dict[str, object] = {
             "name": self.name,
             "seed": self.seed,
             "route_kind": self.route_kind,
             "external_reproduction": False,
         }
+        if self.name == "source_shuffle":
+            result.update(
+                {
+                    "shuffle_planner": _SOURCE_SHUFFLE_PLANNER,
+                    "shuffle_key": ("variant.seed", "direction", "batch_index"),
+                    "shuffle_generator": "ignored_for_reproducibility",
+                }
+            )
+        return result
 
 
 @dataclass(frozen=True)
@@ -501,6 +512,7 @@ def predict_sopat_variant(
     *,
     device: torch.device | None = None,
     generator: torch.Generator | None = None,
+    batch_index: int = 0,
 ) -> _Prediction:
     """Produce one physical prediction through a named, auditable route."""
 
@@ -514,7 +526,13 @@ def predict_sopat_variant(
     if resolved.name == "latest_only":
         routed_batch = latest_only_batch(batch)
     elif resolved.name == "source_shuffle":
-        routed_batch = _source_shuffle_batch(batch, generator=generator)
+        routed_batch = _source_shuffle_batch(
+            batch,
+            seed=resolved.seed,
+            direction=direction,
+            batch_index=batch_index,
+            generator=generator,
+        )
     elif resolved.name == "source_null":
         routed_batch = null_change_batch(batch)
     else:
@@ -608,7 +626,7 @@ def export_sopat_prediction_samples(
     try:
         for direction in DIRECTIONS:
             written = 0
-            for batch in loaders[direction]:
+            for batch_index, batch in enumerate(loaders[direction]):
                 if not isinstance(batch, Mapping):
                     raise TypeError("SOPAT panel loader must yield mapping batches")
                 with torch.inference_mode():
@@ -619,6 +637,7 @@ def export_sopat_prediction_samples(
                         resolved,
                         device=device,
                         generator=generator,
+                        batch_index=batch_index,
                     )
                     inputs = forward_input_tensors(batch, device=device)
                     labels = supervision_tensors(batch, device=device)
@@ -801,6 +820,7 @@ def _evaluate_direction_loader(
                 variant,
                 device=device,
                 generator=generator,
+                batch_index=batch_index,
             )
             inputs = forward_input_tensors(batch, device=device)
             labels = supervision_tensors(batch, device=device)
@@ -923,14 +943,23 @@ def _coerce_variant(value: SOPATVariantConfig | str) -> SOPATVariantConfig:
 
 
 def _source_shuffle_batch(
-    batch: Mapping[str, object], *, generator: torch.Generator | None = None
+    batch: Mapping[str, object],
+    *,
+    seed: int = _DEFAULT_VARIANT.seed,
+    direction: Direction = "sar_to_optical",
+    batch_index: int = 0,
+    generator: torch.Generator | None = None,
 ) -> dict[str, object]:
     """Counterfactually exchange source histories with a derangement.
 
     A batch of one cannot establish source dependence.  Returning it unchanged
     would falsely make the counterfactual look valid, so the route fails
-    closed.  For every larger batch, cyclic shifts of a randomized order give
-    a derangement by construction: no sample retains its own history.
+    closed.  For every larger batch, a deterministic cyclic shift gives a
+    derangement by construction: no sample retains its own history.  The
+    shift is a stable function of variant seed, direction, and loader batch
+    ordinal.  ``generator`` remains accepted for public-call compatibility,
+    but is intentionally ignored: using a CUDA generator for CPU batches used
+    to fall back to global RNG and made reports irreproducible.
     """
 
     inputs = forward_input_tensors(batch)
@@ -940,15 +969,19 @@ def _source_shuffle_batch(
             "source_shuffle evaluation requires batch_size >= 2; "
             "configure validation.batch_size accordingly"
         )
+    if direction not in DIRECTIONS:
+        raise ValueError(f"unsupported SOPAT source-shuffle direction: {direction}")
+    if batch_index < 0:
+        raise ValueError("source_shuffle batch_index must be non-negative")
     device = inputs["observations"].device
     # A non-zero cyclic offset is a derangement by construction.  In contrast,
     # rolling an arbitrary ``randperm`` can reintroduce fixed points.
-    offset = torch.randint(
-        1,
-        batch_size,
-        (),
-        device=device,
-        generator=_shuffle_generator_for_device(generator, device),
+    del generator
+    offset = _source_shuffle_offset(
+        seed=seed,
+        direction=direction,
+        batch_index=batch_index,
+        batch_size=batch_size,
     )
     order = (torch.arange(batch_size, device=device) + offset) % batch_size
     if bool((order == torch.arange(batch_size, device=device)).any()):
@@ -959,19 +992,16 @@ def _source_shuffle_batch(
     return result
 
 
-def _shuffle_generator_for_device(
-    generator: torch.Generator | None, device: torch.device
-) -> torch.Generator | None:
-    """Avoid passing a CPU generator to CUDA counterfactual sampling."""
+def _source_shuffle_offset(
+    *, seed: int, direction: Direction, batch_index: int, batch_size: int
+) -> int:
+    """Return a non-zero reproducible cyclic source-history offset."""
 
-    if generator is None:
-        return None
-    generator_device = torch.device(generator.device)
-    if generator_device.type != device.type:
-        return None
-    if generator_device.type == "cuda" and generator_device.index not in {None, device.index}:
-        return None
-    return generator
+    if batch_size < 2:
+        raise ValueError("source_shuffle batch_size must be at least 2")
+    key = f"{_SOURCE_SHUFFLE_PLANNER}|{int(seed)}|{direction}|{int(batch_index)}"
+    value = int.from_bytes(hashlib.sha256(key.encode("ascii")).digest()[:8], "big")
+    return 1 + value % (batch_size - 1)
 
 
 def _sar_normalized_to_db(values: Tensor) -> Tensor:

@@ -8,23 +8,31 @@ from sentinel_v4.evaluation import (
     SOPATSelectionConfig,
     SOPATVariantConfig,
     _masked_box_lowpass,
+    _source_shuffle_batch,
     evaluate_sopat_loaders,
     select_sopat_candidate,
 )
 
 
-def _batch(direction: str) -> dict[str, object]:
+def _batch(direction: str, *, batch_size: int = 2) -> dict[str, object]:
     source_channels, target_channels = (2, 10) if direction == "sar_to_optical" else (10, 2)
-    batch_size, frames, height, width = 2, 2, 12, 12
+    frames, height, width = 2, 12, 12
     source_anchor = torch.full((batch_size, source_channels, height, width), -0.2)
     target_anchor = torch.full((batch_size, target_channels, height, width), 0.1)
     target = target_anchor.clone()
     target[0] += 0.2
-    present = torch.tensor([[True, False], [True, True]])
+    present = torch.ones(batch_size, frames, dtype=torch.bool)
+    present[0, -1] = False
     return {
         "observations": source_anchor[:, None].expand(-1, frames, -1, -1, -1).clone(),
         "observation_valid": torch.ones(batch_size, frames, 1, height, width),
-        "observation_days": torch.tensor([[-1.0, 999.0], [-3.0, -1.0]]),
+        "observation_days": torch.stack(
+            (
+                torch.full((batch_size,), -1.0),
+                torch.full((batch_size,), -3.0),
+            ),
+            dim=1,
+        ),
         "observation_present": present,
         "source_anchor": source_anchor,
         "source_anchor_valid": torch.ones(batch_size, 1, height, width),
@@ -34,8 +42,38 @@ def _batch(direction: str) -> dict[str, object]:
         "target_anchor_days": torch.full((batch_size,), -4.0),
         "target": target,
         "target_valid": torch.ones(batch_size, 1, height, width),
-        "task_mode": ["translation", "forecast"],
+        "task_mode": ["translation" if index % 2 == 0 else "forecast" for index in range(batch_size)],
     }
+
+
+def _tagged_source_shuffle_batch(*, batch_size: int = 5) -> tuple[dict[str, object], torch.Tensor]:
+    batch = _batch("sar_to_optical", batch_size=batch_size)
+    observations = batch["observations"]
+    assert isinstance(observations, torch.Tensor)
+    tagged = observations.clone()
+    tags = torch.arange(batch_size, dtype=tagged.dtype)
+    tagged[:, :, 0, 0, 0] = tags[:, None]
+    return {**batch, "observations": tagged}, tags
+
+
+def _source_shuffle_mapping(
+    batch: dict[str, object],
+    *,
+    seed: int,
+    direction: str = "sar_to_optical",
+    batch_index: int = 0,
+    generator: torch.Generator | None = None,
+) -> torch.Tensor:
+    shuffled = _source_shuffle_batch(
+        batch,
+        seed=seed,
+        direction=direction,  # type: ignore[arg-type]
+        batch_index=batch_index,
+        generator=generator,
+    )
+    observations = shuffled["observations"]
+    assert isinstance(observations, torch.Tensor)
+    return observations[:, 0, 0, 0, 0].clone()
 
 
 def _selection_report(
@@ -135,6 +173,58 @@ def test_structural_metrics_exist_for_all_change_task_and_observation_buckets() 
         assert isinstance(overall, dict)
         assert math.isfinite(float(overall["structural_rmse"]))
         assert math.isfinite(float(overall["anchor_structural_rmse"]))
+
+
+def test_source_shuffle_is_seeded_by_variant_direction_and_batch_ordinal() -> None:
+    batch, tags = _tagged_source_shuffle_batch()
+
+    first = _source_shuffle_mapping(batch, seed=71, batch_index=3)
+    repeated = _source_shuffle_mapping(batch, seed=71, batch_index=3)
+    different_seed = _source_shuffle_mapping(batch, seed=72, batch_index=3)
+    different_direction = _source_shuffle_mapping(
+        batch,
+        seed=71,
+        direction="optical_to_sar",
+        batch_index=3,
+    )
+    different_batch = _source_shuffle_mapping(batch, seed=71, batch_index=4)
+
+    assert torch.equal(first, repeated)
+    assert not torch.equal(first, different_seed)
+    assert not torch.equal(first, different_direction)
+    assert not torch.equal(first, different_batch)
+    assert not torch.equal(first, tags)
+
+
+def test_source_shuffle_does_not_depend_on_global_torch_rng_or_generator_device() -> None:
+    batch, _ = _tagged_source_shuffle_batch()
+    torch.manual_seed(1)
+    _ = torch.rand(31)
+    first = _source_shuffle_mapping(batch, seed=71, batch_index=2)
+    torch.manual_seed(999)
+    _ = torch.rand(127)
+    second = _source_shuffle_mapping(batch, seed=71, batch_index=2)
+
+    assert torch.equal(first, second)
+
+    if torch.cuda.is_available():
+        cuda_generator = torch.Generator(device="cuda").manual_seed(123)
+        cuda_generator_mapping = _source_shuffle_mapping(
+            batch,
+            seed=71,
+            batch_index=2,
+            generator=cuda_generator,
+        )
+        assert torch.equal(first, cuda_generator_mapping)
+
+
+def test_source_shuffle_metadata_records_reproducible_planner() -> None:
+    metadata = SOPATVariantConfig("source_shuffle", seed=71).metadata()
+
+    assert metadata["seed"] == 71
+    assert metadata["shuffle_planner"] == "stable_cyclic_offset_v1"
+    assert metadata["shuffle_key"] == ("variant.seed", "direction", "batch_index")
+    assert metadata["shuffle_generator"] == "ignored_for_reproducibility"
 
 
 def test_source_shuffle_gate_uses_structural_degradation_in_both_directions() -> None:
