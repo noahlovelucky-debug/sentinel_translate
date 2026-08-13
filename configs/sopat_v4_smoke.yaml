@@ -42,6 +42,7 @@ training:
     physical_null_change_probability: 1.0
     physical_permutation_probability: 1.0
     source_shuffle_probability: 1.0
+    counterfactual_confidence_weight: 0.10
   validate_every: 1
   full_validate_every: 1
   early_stop_full_validations: 2

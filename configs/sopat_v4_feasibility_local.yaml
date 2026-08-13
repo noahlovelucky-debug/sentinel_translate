@@ -68,6 +68,7 @@ training:
     source_shuffle_weight: 0.25
     source_shuffle_probability: 1.0
     source_shuffle_margin: 0.005
+    counterfactual_confidence_weight: 0.10
     structural_pool_kernel: 5
   validate_every: 100
   full_validate_every: 500

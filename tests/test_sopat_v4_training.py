@@ -3,12 +3,14 @@ from __future__ import annotations
 import math
 import os
 from dataclasses import asdict
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+import yaml
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
@@ -318,6 +320,215 @@ class _GatedToyModel(nn.Module):
         )
 
 
+class _CounterfactualConfidenceToyModel(nn.Module):
+    """Emit a learnable open gate only for a shuffled source history."""
+
+    def __init__(self, *, wrong_logit: float, evidence: float = 1.0, logits: bool = True) -> None:
+        super().__init__()
+        self.wrong_logit = nn.Parameter(torch.tensor(wrong_logit))
+        self.evidence = float(evidence)
+        self.logits = bool(logits)
+
+    def forward(self, **inputs: object) -> SimpleNamespace:
+        observations = inputs["observations"]
+        source_anchor = inputs["source_anchor"]
+        target_anchor = inputs["target_anchor"]
+        assert isinstance(observations, torch.Tensor)
+        assert isinstance(source_anchor, torch.Tensor)
+        assert isinstance(target_anchor, torch.Tensor)
+        # ``source_shuffle_batch`` exchanges observations but leaves this
+        # recipient's anchor in place.  Correct histories are an exact anchor
+        # copy in this toy, while shuffled histories activate the parameter.
+        matches_recipient = (observations[:, 0] - source_anchor).abs().flatten(1).amax(dim=1) == 0.0
+        wrong_mask = (~matches_recipient).to(target_anchor).view(-1, 1, 1, 1)
+        confidence_logits = (
+            wrong_mask * self.wrong_logit + (1.0 - wrong_mask) * -20.0
+        ) * torch.ones_like(target_anchor[:, :1])
+        confidence = torch.sigmoid(confidence_logits)
+        output = SimpleNamespace(
+            physical=target_anchor,
+            candidate_physical=target_anchor,
+            transport_confidence=confidence,
+            transport_evidence=torch.full_like(confidence, self.evidence),
+            log_variance=torch.zeros_like(target_anchor),
+        )
+        if self.logits:
+            output.transport_confidence_logits = confidence_logits
+        return output
+
+
+def _counterfactual_confidence_batch(*, batch_size: int = 2) -> dict[str, object]:
+    batch = _batch(2, 10, batch_size=batch_size, changed=False)
+    source_anchor = batch["source_anchor"]
+    observations = batch["observations"]
+    assert isinstance(source_anchor, torch.Tensor)
+    assert isinstance(observations, torch.Tensor)
+    source_anchor[:, 0] = torch.arange(batch_size, dtype=source_anchor.dtype).view(-1, 1, 1)
+    source_anchor[:, 1] = -source_anchor[:, 0]
+    batch["observations"] = source_anchor[:, None].expand_as(observations).clone()
+    return batch
+
+
+def _counterfactual_confidence_config(*, autocast_bfloat16: bool = False) -> SOPATTrainConfig:
+    return SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=autocast_bfloat16,
+        physical_charbonnier_weight=1e-12,
+        physical_gradient_weight=0.0,
+        physical_optical_spectral_weight=0.0,
+        physical_optical_ndvi_weight=0.0,
+        physical_sar_statistics_weight=0.0,
+        physical_anchor_delta_weight=0.0,
+        physical_null_change_weight=0.0,
+        physical_null_change_probability=0.0,
+        physical_nll_weight=0.0,
+        physical_permutation_weight=0.0,
+        physical_permutation_probability=0.0,
+        physical_anchor_regret_weight=0.0,
+        candidate_weight=0.0,
+        utility_weight=0.0,
+        source_shuffle_weight=0.0,
+        source_shuffle_probability=1.0,
+        counterfactual_confidence_weight=1.0,
+    )
+
+
+def test_counterfactual_confidence_closes_high_wrong_logit_with_gradient() -> None:
+    model = _CounterfactualConfidenceToyModel(wrong_logit=4.0)
+    loss, metrics = sopat_direction_objective(
+        model,
+        _counterfactual_confidence_batch(),
+        "sar_to_optical",
+        _counterfactual_confidence_config(),
+        generator=torch.Generator().manual_seed(3),
+    )
+    loss.backward()
+
+    assert metrics["physical_counterfactual_confidence"].item() > 3.0
+    assert model.wrong_logit.grad is not None
+    assert model.wrong_logit.grad.item() > 0.0
+
+
+def test_counterfactual_confidence_vanishes_for_closed_wrong_logit() -> None:
+    model = _CounterfactualConfidenceToyModel(wrong_logit=-20.0)
+    _loss, metrics = sopat_direction_objective(
+        model,
+        _counterfactual_confidence_batch(),
+        "sar_to_optical",
+        _counterfactual_confidence_config(),
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    assert metrics["physical_counterfactual_confidence"].item() < 1.0e-7
+
+
+def test_counterfactual_confidence_skips_legacy_wrong_route_without_gate_fields() -> None:
+    model = _TwoHeadPhysicalModel()
+    _loss, metrics = sopat_direction_objective(
+        model,
+        _counterfactual_confidence_batch(),
+        "sar_to_optical",
+        _counterfactual_confidence_config(),
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    assert metrics["physical_counterfactual_confidence"].item() == 0.0
+
+
+@pytest.mark.parametrize("zero_support", ("evidence", "target_valid", "source_anchor_valid"))
+def test_counterfactual_confidence_zero_support_has_exact_zero_loss(zero_support: str) -> None:
+    model = _CounterfactualConfidenceToyModel(
+        wrong_logit=4.0, evidence=0.0 if zero_support == "evidence" else 1.0
+    )
+    batch = _counterfactual_confidence_batch()
+    if zero_support != "evidence":
+        support = batch[zero_support]
+        assert isinstance(support, torch.Tensor)
+        support.zero_()
+    loss, metrics = sopat_direction_objective(
+        model,
+        batch,
+        "sar_to_optical",
+        _counterfactual_confidence_config(),
+        generator=torch.Generator().manual_seed(3),
+    )
+    loss.backward()
+
+    assert metrics["physical_counterfactual_confidence"].item() == 0.0
+    assert model.wrong_logit.grad is not None
+    assert model.wrong_logit.grad.item() == 0.0
+
+
+def test_counterfactual_confidence_probability_fallback_is_cpu_bf16_safe() -> None:
+    model = _CounterfactualConfidenceToyModel(wrong_logit=4.0, logits=False)
+    with torch.autocast(device_type="cpu", dtype=torch.bfloat16):
+        loss, metrics = sopat_direction_objective(
+            model,
+            _counterfactual_confidence_batch(),
+            "sar_to_optical",
+            _counterfactual_confidence_config(autocast_bfloat16=True),
+            generator=torch.Generator().manual_seed(3),
+        )
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["physical_counterfactual_confidence"])
+    assert model.wrong_logit.grad is not None and torch.isfinite(model.wrong_logit.grad)
+
+
+def test_counterfactual_confidence_rejects_wrong_output_shapes() -> None:
+    class _MalformedEvidenceModel(_CounterfactualConfidenceToyModel):
+        def forward(self, **inputs: object) -> SimpleNamespace:
+            output = super().forward(**inputs)
+            observations = inputs["observations"]
+            assert isinstance(observations, torch.Tensor)
+            if not torch.equal(observations, inputs["source_anchor"][:, None].expand_as(observations)):
+                output.transport_evidence = output.transport_evidence[:, :, :-1, :]
+            return output
+
+    with pytest.raises(ValueError, match="source-shuffle transport_evidence"):
+        sopat_direction_objective(
+            _MalformedEvidenceModel(wrong_logit=4.0),
+            _counterfactual_confidence_batch(),
+            "sar_to_optical",
+            _counterfactual_confidence_config(),
+            generator=torch.Generator().manual_seed(3),
+        )
+
+
+@pytest.mark.parametrize(
+    "config_name",
+    (
+        "sopat_v4_feasibility_local.yaml",
+        "sopat_v4_full_chunk.yaml",
+        "sopat_v4_full_raw.yaml",
+        "sopat_v4_smoke.yaml",
+    ),
+)
+def test_counterfactual_confidence_weight_is_explicit_in_all_sopat_configs(config_name: str) -> None:
+    path = Path(__file__).parents[1] / "configs" / config_name
+    values = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(values, dict)
+    training = values["training"]
+    assert isinstance(training, dict)
+    objective = training["objective"]
+    stages = training["stages"]
+    assert isinstance(objective, dict)
+    assert isinstance(stages, dict)
+    physical_stage = stages["physical"]
+    assert isinstance(physical_stage, dict)
+    payload = {**objective, **physical_stage, "stage": "physical"}
+    payload.pop("steps")
+    config = SOPATTrainConfig.from_mapping(payload)
+    assert config.counterfactual_confidence_weight == pytest.approx(0.10)
+
+
+@pytest.mark.parametrize("value", (-1.0, float("inf"), float("nan")))
+def test_counterfactual_confidence_weight_requires_a_finite_nonnegative_value(value: float) -> None:
+    with pytest.raises(ValueError, match="counterfactual_confidence_weight|loss weights"):
+        SOPATTrainConfig(counterfactual_confidence_weight=value)
+
+
 def test_candidate_auxiliary_and_utility_are_finite_with_closed_gate() -> None:
     config = SOPATTrainConfig(
         stage="physical",
@@ -553,6 +764,7 @@ def test_source_shuffle_batch_is_a_local_derangement_and_singleton_counterfactua
     model = _GatedToyModel()
     _loss, metrics = sopat_direction_objective(model, singleton, "sar_to_optical", config)
     assert metrics["physical_source_shuffle"].item() == 0.0
+    assert metrics["physical_counterfactual_confidence"].item() == 0.0
 
 
 class _FactorizerSpy(nn.Module):

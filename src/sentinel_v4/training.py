@@ -101,6 +101,7 @@ class SOPATTrainConfig:
     source_shuffle_weight: float = 0.25
     source_shuffle_probability: float = 0.5
     source_shuffle_margin: float = 0.005
+    counterfactual_confidence_weight: float = 0.10
     structural_pool_kernel: int = 5
     autocast_bfloat16: bool = True
 
@@ -144,9 +145,12 @@ class SOPATTrainConfig:
             "utility_weight",
             "source_shuffle_weight",
             "source_shuffle_margin",
+            "counterfactual_confidence_weight",
         )
         if any(float(getattr(self, name)) < 0.0 for name in nonnegative):
             raise ValueError("SOPAT loss weights and margins must be non-negative")
+        if not np.isfinite(float(self.counterfactual_confidence_weight)):
+            raise ValueError("counterfactual_confidence_weight must be finite and non-negative")
         for name in (
             "physical_null_change_probability",
             "physical_permutation_probability",
@@ -1016,6 +1020,7 @@ def physical_objective(
         assert permuted_physical is not None
         permutation = masked_mean((physical - permuted_physical).abs(), valid)
     source_shuffle = physical.new_zeros(())
+    counterfactual_confidence = physical.new_zeros(())
     source_shuffle_enabled = _rank_synchronized_probability(
         config.source_shuffle_probability, physical.device, generator
     )
@@ -1044,6 +1049,78 @@ def physical_objective(
             source_shuffle = torch.relu(
                 correct_error - wrong_error + config.source_shuffle_margin
             ).mean()
+            # A shuffled history is a deliberately wrong causal source.  Its
+            # transport route must close rather than merely compete on a
+            # target-labelled ranking loss.  This target is intentionally
+            # source-counterfactual only: it never reads the query label.
+            wrong_confidence_shape = (wrong_physical.shape[0], 1, *wrong_physical.shape[-2:])
+            wrong_transport_confidence_logits = output_tensor(
+                wrong_output, "transport_confidence_logits", required=False
+            )
+            wrong_transport_confidence = output_tensor(
+                wrong_output, "transport_confidence", required=False
+            )
+            wrong_transport_evidence = output_tensor(
+                wrong_output, "transport_evidence", required=False
+            )
+            if wrong_transport_confidence_logits is not None and (
+                wrong_transport_confidence_logits.shape != wrong_confidence_shape
+            ):
+                raise ValueError(
+                    "SOPAT source-shuffle transport_confidence_logits must have shape Bx1xHxW"
+                )
+            if wrong_transport_confidence is not None and (
+                wrong_transport_confidence.shape != wrong_confidence_shape
+            ):
+                raise ValueError(
+                    "SOPAT source-shuffle transport_confidence must have shape Bx1xHxW"
+                )
+            if wrong_transport_evidence is not None and (
+                wrong_transport_evidence.shape != wrong_confidence_shape
+            ):
+                raise ValueError(
+                    "SOPAT source-shuffle transport_evidence must have shape Bx1xHxW"
+                )
+            if wrong_transport_confidence_logits is not None or wrong_transport_confidence is not None:
+                if wrong_transport_evidence is None:
+                    # Pre-evidence V4 checkpoints and compact probability-only
+                    # toys have no explicit evidence map.  Their counterfactual
+                    # route remains valid over the recipient's valid support.
+                    wrong_transport_evidence = torch.ones(
+                        wrong_confidence_shape,
+                        device=wrong_physical.device,
+                        dtype=wrong_physical.dtype,
+                    )
+                recipient_source_anchor_valid = inputs["source_anchor_valid"]
+                if recipient_source_anchor_valid.shape != wrong_confidence_shape:
+                    raise ValueError(
+                        "SOPAT source_anchor_valid must match source-shuffle confidence shape"
+                    )
+                counterfactual_valid = (
+                    valid
+                    * recipient_source_anchor_valid.to(valid)
+                    * (wrong_transport_evidence > 0.0).to(valid)
+                )
+                # BCE and logits stay FP32 regardless of the enclosing BF16
+                # autocast context.  The native renderer exposes logits; the
+                # probability branch exists only for old focused-test models.
+                with torch.autocast(device_type=physical.device.type, enabled=False):
+                    if wrong_transport_confidence_logits is not None:
+                        counterfactual_confidence_map = F.binary_cross_entropy_with_logits(
+                            wrong_transport_confidence_logits.float(),
+                            torch.zeros_like(wrong_transport_confidence_logits.float()),
+                            reduction="none",
+                        )
+                    else:
+                        assert wrong_transport_confidence is not None
+                        counterfactual_confidence_map = F.binary_cross_entropy(
+                            wrong_transport_confidence.float().clamp(1e-5, 1.0 - 1e-5),
+                            torch.zeros_like(wrong_transport_confidence.float()),
+                            reduction="none",
+                        )
+                    counterfactual_confidence = _masked_single_channel_mean(
+                        counterfactual_confidence_map, counterfactual_valid
+                    )
     total = (
         config.physical_charbonnier_weight * charbonnier
         + config.physical_gradient_weight * gradient
@@ -1058,6 +1135,7 @@ def physical_objective(
         + config.candidate_weight * candidate
         + config.utility_weight * utility
         + config.source_shuffle_weight * source_shuffle
+        + config.counterfactual_confidence_weight * counterfactual_confidence
     )
     return total, {
         "physical_charbonnier": charbonnier.detach(),
@@ -1073,6 +1151,7 @@ def physical_objective(
         "physical_nll": nll.detach(),
         "physical_permutation": permutation.detach(),
         "physical_source_shuffle": source_shuffle.detach(),
+        "physical_counterfactual_confidence": counterfactual_confidence.detach(),
         "physical_anchor_regret": anchor_regret.detach(),
         "physical_rmse": per_example_error.mean().detach(),
         "anchor_rmse": anchor_error.mean().detach(),
