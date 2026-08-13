@@ -95,6 +95,13 @@ class SOPATTrainConfig:
     physical_permutation_probability: float = 0.25
     physical_anchor_regret_weight: float = 0.25
     physical_anchor_regret_margin: float = 0.0
+    candidate_weight: float = 0.5
+    utility_weight: float = 0.1
+    utility_temperature: float = 0.02
+    source_shuffle_weight: float = 0.25
+    source_shuffle_probability: float = 0.5
+    source_shuffle_margin: float = 0.005
+    structural_pool_kernel: int = 5
     autocast_bfloat16: bool = True
 
     def __post_init__(self) -> None:
@@ -133,12 +140,24 @@ class SOPATTrainConfig:
             "physical_permutation_weight",
             "physical_anchor_regret_weight",
             "physical_anchor_regret_margin",
+            "candidate_weight",
+            "utility_weight",
+            "source_shuffle_weight",
+            "source_shuffle_margin",
         )
         if any(float(getattr(self, name)) < 0.0 for name in nonnegative):
             raise ValueError("SOPAT loss weights and margins must be non-negative")
-        for name in ("physical_null_change_probability", "physical_permutation_probability"):
+        for name in (
+            "physical_null_change_probability",
+            "physical_permutation_probability",
+            "source_shuffle_probability",
+        ):
             if not 0.0 <= float(getattr(self, name)) <= 1.0:
                 raise ValueError(f"{name} must be in [0, 1]")
+        if self.utility_temperature <= 0.0 or not np.isfinite(self.utility_temperature):
+            raise ValueError("utility_temperature must be finite and positive")
+        if self.structural_pool_kernel <= 0 or self.structural_pool_kernel % 2 == 0:
+            raise ValueError("structural_pool_kernel must be a positive odd integer")
         if self.stage == "factorizer" and (
             self.factorizer_anchor_cross_weight
             + self.factorizer_common_alignment_weight
@@ -663,21 +682,199 @@ def latest_only_batch(batch: Mapping[str, object]) -> dict[str, object]:
 def source_shuffle_batch(
     batch: Mapping[str, object], *, generator: torch.Generator | None = None
 ) -> dict[str, object]:
-    """Shuffle source observations across scenes for a counterfactual baseline."""
+    """Counterfactually exchange source histories with a local derangement.
+
+    A random permutation can retain a scene's own source history, making the
+    counterfactual silently invalid.  A non-zero cyclic shift is a derangement
+    by construction.  The singleton case is intentionally left unchanged here;
+    ``physical_objective`` either uses a cross-rank donor or records a zero
+    counterfactual term when no donor exists.
+    """
 
     inputs = forward_input_tensors(batch)
     batch_size = inputs["observations"].shape[0]
     if batch_size < 2:
         return dict(batch)
-    order = torch.randperm(
+    device = inputs["observations"].device
+    offset = torch.randint(
+        1,
         batch_size,
-        device=inputs["observations"].device,
-        generator=_generator_for_device(generator, inputs["observations"].device),
+        (),
+        device=device,
+        generator=_generator_for_device(generator, device),
     )
+    order = (torch.arange(batch_size, device=device) + offset) % batch_size
+    if bool((order == torch.arange(batch_size, device=device)).any()):
+        raise RuntimeError("SOPAT source-shuffle derangement construction failed")
     result = dict(batch)
     for name in ("observations", "observation_valid", "observation_days", "observation_present"):
         result[name] = inputs[name].index_select(0, order)
     return result
+
+
+def _distributed_world_size() -> int:
+    return dist.get_world_size() if dist.is_available() and dist.is_initialized() else 1
+
+
+def _rank_synchronized_probability(
+    probability: float, device: torch.device, generator: torch.Generator | None
+) -> bool:
+    """Sample one Bernoulli decision per global step, never per DDP rank."""
+
+    if probability <= 0.0:
+        return False
+    if probability >= 1.0:
+        return True
+    if _distributed_world_size() == 1:
+        return _sample_probability(probability, device, generator)
+    flag = torch.zeros((), device=device, dtype=torch.int64)
+    if dist.get_rank() == 0:
+        flag.fill_(int(_sample_probability(probability, device, generator)))
+    dist.broadcast(flag, src=0)
+    return bool(flag.item())
+
+
+def _padded_cross_rank_source_histories(inputs: Mapping[str, Tensor]) -> dict[str, Tensor]:
+    """Gather one singleton history per rank and select a non-self donor.
+
+    The gathered tensors are detached source inputs.  Their subsequent wrong
+    forward remains fully differentiable with respect to model parameters.
+    Every rank enters the same collectives, and variable observation counts are
+    padded to the global maximum before gathering.
+    """
+
+    if _distributed_world_size() < 2:
+        raise RuntimeError("cross-rank source shuffle requires initialized world_size >= 2")
+    observations = inputs["observations"]
+    if observations.shape[0] != 1:
+        raise ValueError("cross-rank source shuffle is only needed for local batch_size == 1")
+    device = observations.device
+    local_frames = torch.tensor([observations.shape[1]], device=device, dtype=torch.int64)
+    maximum_frames = local_frames.clone()
+    dist.all_reduce(maximum_frames, op=dist.ReduceOp.MAX)
+    frames = int(maximum_frames.item())
+
+    def pad_frames(values: Tensor, *, fill: float = 0.0) -> Tensor:
+        if values.shape[1] == frames:
+            return values.detach()
+        padded_shape = (values.shape[0], frames, *values.shape[2:])
+        padded = torch.full(padded_shape, fill, dtype=values.dtype, device=values.device)
+        padded[:, : values.shape[1]] = values.detach()
+        return padded
+
+    padded = {
+        "observations": pad_frames(inputs["observations"]),
+        "observation_valid": pad_frames(inputs["observation_valid"]),
+        "observation_days": pad_frames(inputs["observation_days"]),
+        "observation_present": pad_frames(inputs["observation_present"].to(torch.uint8)).bool(),
+    }
+    gathered: dict[str, list[Tensor]] = {}
+    for name, values in padded.items():
+        destination = [torch.empty_like(values) for _ in range(_distributed_world_size())]
+        # bool NCCL collective support is backend-dependent; use uint8 for the
+        # actual gather and restore the public boolean mask afterwards.
+        source = values.to(torch.uint8) if name == "observation_present" else values
+        if name == "observation_present":
+            destination = [torch.empty_like(source) for _ in range(_distributed_world_size())]
+        dist.all_gather(destination, source)
+        gathered[name] = destination
+    donor_rank = (dist.get_rank() + 1) % _distributed_world_size()
+    return {
+        "observations": gathered["observations"][donor_rank],
+        "observation_valid": gathered["observation_valid"][donor_rank],
+        "observation_days": gathered["observation_days"][donor_rank],
+        "observation_present": gathered["observation_present"][donor_rank].bool(),
+    }
+
+
+def _source_counterfactual_batch(
+    batch: Mapping[str, object],
+    *,
+    generator: torch.Generator | None = None,
+) -> dict[str, object] | None:
+    """Build a guaranteed non-self source-history counterfactual, if possible."""
+
+    inputs = forward_input_tensors(batch)
+    batch_size = inputs["observations"].shape[0]
+    world_size = _distributed_world_size()
+    if batch_size >= 2:
+        return source_shuffle_batch(batch, generator=generator)
+    if world_size == 1:
+        return None
+
+    local_size = torch.tensor([batch_size], device=inputs["observations"].device, dtype=torch.int64)
+    sizes = [torch.empty_like(local_size) for _ in range(world_size)]
+    dist.all_gather(sizes, local_size)
+    gathered_sizes = [int(item.item()) for item in sizes]
+    if any(size != 1 for size in gathered_sizes):
+        raise RuntimeError(
+            "SOPAT cross-rank source shuffle requires every rank to use local batch_size == 1; "
+            f"got {gathered_sizes}"
+        )
+    result = dict(batch)
+    result.update(_padded_cross_rank_source_histories(inputs))
+    return result
+
+
+def _local_masked_mean(values: Tensor, valid: Tensor, *, kernel_size: int) -> tuple[Tensor, Tensor]:
+    """Return a local mean and local support without invalid-value leakage."""
+
+    mask = _resize_valid(valid, values).to(values)
+    safe_values = torch.where(mask.bool(), values, torch.zeros_like(values))
+    if kernel_size <= 1:
+        support = mask.expand_as(values)
+        return safe_values * support / support.clamp_min(1e-6), support
+    padding = kernel_size // 2
+    numerator = F.avg_pool2d(
+        (safe_values.float() * mask.float()),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    )
+    denominator = F.avg_pool2d(
+        mask.float(),
+        kernel_size=kernel_size,
+        stride=1,
+        padding=padding,
+        count_include_pad=False,
+    )
+    return (numerator / denominator.clamp_min(1e-6)).to(values), denominator.to(values)
+
+
+def _structural_error(
+    prediction: Tensor, target: Tensor, valid: Tensor, *, kernel_size: int
+) -> Tensor:
+    local_error, support = _local_masked_mean((prediction - target).square(), valid, kernel_size=kernel_size)
+    local_valid = (support > 0.0).to(valid)
+    mask = local_valid.expand_as(local_error)
+    numerator = (local_error * mask).flatten(1).sum(dim=1)
+    denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
+    return (numerator / denominator + 1e-8).sqrt()
+
+
+def _utility_oracle(
+    candidate: Tensor,
+    anchor: Tensor,
+    target: Tensor,
+    valid: Tensor,
+    *,
+    temperature: float,
+    kernel_size: int,
+) -> Tensor:
+    """Detached per-pixel probability that the candidate beats anchor locally."""
+
+    candidate_error, support = _local_masked_mean(
+        (candidate - target).abs(), valid, kernel_size=kernel_size
+    )
+    anchor_error, _ = _local_masked_mean((anchor - target).abs(), valid, kernel_size=kernel_size)
+    candidate_error = candidate_error.mean(dim=1, keepdim=True)
+    anchor_error = anchor_error.mean(dim=1, keepdim=True)
+    support = (support > 0.0).to(candidate_error)
+    support = support[:, :1]
+    neutral = torch.full_like(candidate_error, 0.5)
+    oracle = torch.sigmoid((anchor_error - candidate_error) / temperature)
+    return torch.where(support > 0.0, oracle, neutral).detach()
 
 
 def physical_objective(
@@ -712,6 +909,35 @@ def physical_objective(
     target_delta = target - inputs["target_anchor"]
     predicted_delta = physical - inputs["target_anchor"]
     anchor_delta = masked_charbonnier(predicted_delta, target_delta, valid)
+    candidate_physical = output_tensor(output, "candidate_physical", required=False)
+    if candidate_physical is None:
+        # Compatibility for focused unit models and pre-gated experimental
+        # checkpoints.  Native V4 renderers always expose this field.
+        candidate_physical = physical
+    if candidate_physical.shape != target.shape:
+        raise ValueError("SOPAT candidate_physical must match the target label shape")
+    candidate = masked_charbonnier(candidate_physical, target, valid)
+    transport_confidence = output_tensor(output, "transport_confidence", required=False)
+    if transport_confidence is None:
+        transport_confidence = torch.ones(
+            (physical.shape[0], 1, *physical.shape[-2:]), device=physical.device, dtype=physical.dtype
+        )
+    if transport_confidence.shape != (physical.shape[0], 1, *physical.shape[-2:]):
+        raise ValueError("SOPAT transport_confidence must have shape Bx1xHxW")
+    utility_target = _utility_oracle(
+        candidate_physical,
+        inputs["target_anchor"],
+        target,
+        valid,
+        temperature=config.utility_temperature,
+        kernel_size=config.structural_pool_kernel,
+    )
+    utility = F.binary_cross_entropy(
+        transport_confidence.clamp(1e-5, 1.0 - 1e-5),
+        utility_target,
+        reduction="none",
+    )
+    utility = masked_mean(utility, valid)
     squared_error = (physical - target).square()
     log_variance = output_tensor(output, "log_variance", "physical_log_variance", required=False)
     if log_variance is None:
@@ -755,6 +981,35 @@ def physical_objective(
         permuted_physical = output_tensor(permuted_output, "physical")
         assert permuted_physical is not None
         permutation = masked_mean((physical - permuted_physical).abs(), valid)
+    source_shuffle = physical.new_zeros(())
+    source_shuffle_enabled = _rank_synchronized_probability(
+        config.source_shuffle_probability, physical.device, generator
+    )
+    if source_shuffle_enabled:
+        counterfactual_batch = _source_counterfactual_batch(batch, generator=generator)
+        if counterfactual_batch is not None:
+            wrong_output = forward_direction(
+                model, counterfactual_batch, direction, device=physical.device
+            )
+            wrong_physical = output_tensor(wrong_output, "physical")
+            assert wrong_physical is not None
+            if wrong_physical.shape != physical.shape:
+                raise ValueError("SOPAT source-shuffle physical output must match target labels")
+            correct_error = _structural_error(
+                physical,
+                target,
+                valid,
+                kernel_size=config.structural_pool_kernel,
+            )
+            wrong_error = _structural_error(
+                wrong_physical,
+                target,
+                valid,
+                kernel_size=config.structural_pool_kernel,
+            )
+            source_shuffle = torch.relu(
+                correct_error - wrong_error + config.source_shuffle_margin
+            ).mean()
     total = (
         config.physical_charbonnier_weight * charbonnier
         + config.physical_gradient_weight * gradient
@@ -766,6 +1021,9 @@ def physical_objective(
         + config.physical_nll_weight * nll
         + config.physical_permutation_weight * permutation
         + config.physical_anchor_regret_weight * anchor_regret
+        + config.candidate_weight * candidate
+        + config.utility_weight * utility
+        + config.source_shuffle_weight * source_shuffle
     )
     return total, {
         "physical_charbonnier": charbonnier.detach(),
@@ -774,10 +1032,13 @@ def physical_objective(
         "physical_ndvi": ndvi.detach(),
         "physical_sar_statistics": sar_statistics.detach(),
         "physical_anchor_delta": anchor_delta.detach(),
+        "physical_candidate": candidate.detach(),
+        "physical_utility": utility.detach(),
         "physical_null_change": null_change.detach(),
         "physical_source_evidence": source_evidence.detach(),
         "physical_nll": nll.detach(),
         "physical_permutation": permutation.detach(),
+        "physical_source_shuffle": source_shuffle.detach(),
         "physical_anchor_regret": anchor_regret.detach(),
         "physical_rmse": per_example_error.mean().detach(),
         "anchor_rmse": anchor_error.mean().detach(),
@@ -1304,11 +1565,29 @@ def initialize_from_sopat_checkpoint(
     state = payload.get("model")
     if not isinstance(state, Mapping):
         raise TypeError("SOPAT initialization checkpoint has no model state")
-    _unwrap_sopat_model(model).load_state_dict(state, strict=True)
+    incompatible = _unwrap_sopat_model(model).load_state_dict(state, strict=False)
+    # V4.1 adds only the conservative evidence gates.  Missing these tensors
+    # is a valid initialization path: their constructor bias keeps the model
+    # close to anchor-copy until the new utility objective calibrates them.
+    allowed_missing = {
+        "renderers.optical.confidence.weight",
+        "renderers.optical.confidence.bias",
+        "renderers.sar.confidence.weight",
+        "renderers.sar.confidence.bias",
+    }
+    missing = set(incompatible.missing_keys)
+    unexpected = set(incompatible.unexpected_keys)
+    if missing.difference(allowed_missing) or unexpected:
+        raise RuntimeError(
+            "SOPAT initialization checkpoint has incompatible model tensors: "
+            f"missing={sorted(missing.difference(allowed_missing))}, "
+            f"unexpected={sorted(unexpected)}"
+        )
     return {
         "source": str(path),
         "source_global_step": int(payload.get("global_step", 0)),
         "source_train_stage": _checkpoint_stage(payload),
+        "initialized_missing_keys": sorted(missing),
     }
 
 

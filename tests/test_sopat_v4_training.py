@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from dataclasses import asdict
 from types import SimpleNamespace
 
 import pytest
@@ -12,15 +13,20 @@ from torch.nn.parallel import DistributedDataParallel
 
 from sentinel_v4 import evaluation as sopat_evaluation
 from sentinel_v4.evaluation import SOPATVariantConfig, evaluate_sopat_loaders
+from sentinel_v4.model import SOPAT, SOPATConfig
 from sentinel_v4.training import (
     ModelEMA,
     SOPATTrainConfig,
     SOPATTrainingModule,
+    _structural_error,
+    _utility_oracle,
     evaluate_factorizer_loaders,
+    initialize_from_sopat_checkpoint,
     initialize_from_v3_checkpoint,
     load_sopat_checkpoint,
     save_sopat_checkpoint,
     sopat_direction_objective,
+    source_shuffle_batch,
     train_coupled_step,
 )
 
@@ -165,6 +171,91 @@ def test_two_rank_gloo_keeps_both_direction_heads_synchronized(tmp_path) -> None
     assert values[0][2] != pytest.approx(-0.10)
 
 
+class _SourceAwareToyModel(nn.Module):
+    """A minimal source-dependent physical route for cross-rank ranking tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.scale = nn.Parameter(torch.tensor(0.0))
+
+    def forward(self, **inputs: object) -> SimpleNamespace:
+        observations = inputs["observations"]
+        anchor = inputs["target_anchor"]
+        assert isinstance(observations, torch.Tensor)
+        assert isinstance(anchor, torch.Tensor)
+        source_code = observations.mean(dim=(1, 2), keepdim=False)[:, None]
+        source_code = source_code.expand(-1, anchor.shape[1], -1, -1)
+        candidate = anchor + self.scale * source_code
+        return SimpleNamespace(
+            physical=candidate,
+            candidate_physical=candidate,
+            transport_confidence=torch.ones_like(anchor[:, :1]),
+            log_variance=torch.zeros_like(anchor),
+        )
+
+
+def _ddp_singleton_source_shuffle_worker(
+    rank: int, world_size: int, init_method: str, queue: object
+) -> None:
+    assert hasattr(queue, "put")
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
+    try:
+        config = SOPATTrainConfig(
+            stage="physical",
+            autocast_bfloat16=False,
+            physical_charbonnier_weight=1e-12,
+            physical_gradient_weight=0.0,
+            physical_optical_spectral_weight=0.0,
+            physical_optical_ndvi_weight=0.0,
+            physical_sar_statistics_weight=0.0,
+            physical_anchor_delta_weight=0.0,
+            physical_null_change_weight=0.0,
+            physical_null_change_probability=0.0,
+            physical_nll_weight=0.0,
+            physical_permutation_weight=0.0,
+            physical_permutation_probability=0.0,
+            physical_anchor_regret_weight=0.0,
+            candidate_weight=0.0,
+            utility_weight=0.0,
+            source_shuffle_weight=1.0,
+            source_shuffle_probability=1.0,
+            source_shuffle_margin=0.005,
+        )
+        batch = _batch(2, 10, batch_size=1)
+        code = 0.1 if rank == 0 else 0.5
+        observations = batch["observations"]
+        target = batch["target"]
+        anchor = batch["target_anchor"]
+        assert isinstance(observations, torch.Tensor)
+        assert isinstance(target, torch.Tensor)
+        assert isinstance(anchor, torch.Tensor)
+        observations.fill_(code)
+        target.copy_(anchor + code)
+        model = _SourceAwareToyModel()
+        loss, metrics = sopat_direction_objective(model, batch, "sar_to_optical", config)
+        loss.backward()
+        assert model.scale.grad is not None
+        queue.put((rank, float(metrics["physical_source_shuffle"]), float(model.scale.grad)))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_two_rank_singleton_source_shuffle_has_counterfactual_loss_and_gradient(tmp_path) -> None:
+    rendezvous = tmp_path / f"sopat-source-shuffle-{os.getpid()}"
+    context = mp.get_context("spawn")
+    queue = context.SimpleQueue()
+    mp.spawn(
+        _ddp_singleton_source_shuffle_worker,
+        args=(2, f"file://{rendezvous}", queue),
+        nprocs=2,
+        join=True,
+    )
+    values = sorted(queue.get() for _ in range(2))
+    assert all(counterfactual > 0.0 for _rank, counterfactual, _gradient in values)
+    assert all(abs(gradient) > 1e-6 for _rank, _counterfactual, gradient in values)
+
+
 class _ExactNullModel(nn.Module):
     """Returns an exact target anchor on the null-change causal route."""
 
@@ -199,6 +290,94 @@ def test_exact_null_identity_has_finite_backward() -> None:
     assert torch.isfinite(loss)
     assert torch.isfinite(metrics["physical_null_change"])
     assert model.scale.grad is not None and torch.isfinite(model.scale.grad)
+
+
+class _GatedToyModel(nn.Module):
+    """Expose independent candidate/gate parameters for objective tests."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.candidate = nn.Parameter(torch.tensor(0.25))
+        self.confidence = nn.Parameter(torch.tensor(-4.0))
+
+    def forward(self, **inputs: object) -> SimpleNamespace:
+        anchor = inputs["target_anchor"]
+        assert isinstance(anchor, torch.Tensor)
+        candidate = anchor + self.candidate * torch.ones_like(anchor)
+        confidence = torch.sigmoid(self.confidence) * torch.ones_like(anchor[:, :1])
+        physical = anchor + confidence * (candidate - anchor)
+        return SimpleNamespace(
+            physical=physical,
+            candidate_physical=candidate,
+            transport_confidence=confidence,
+            log_variance=torch.zeros_like(anchor),
+        )
+
+
+def test_candidate_auxiliary_and_utility_are_finite_with_closed_gate() -> None:
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=False,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=0.0,
+    )
+    model = _GatedToyModel()
+    batch = _batch(2, 10, batch_size=2)
+    loss, metrics = sopat_direction_objective(model, batch, "sar_to_optical", config)
+    loss.backward()
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(metrics["physical_candidate"])
+    assert torch.isfinite(metrics["physical_utility"])
+    assert model.candidate.grad is not None and model.candidate.grad.abs().item() > 0.0
+    assert model.confidence.grad is not None and torch.isfinite(model.confidence.grad)
+
+
+def test_structural_losses_ignore_invalid_nan_and_extreme_pixels() -> None:
+    valid = torch.ones(1, 1, 9, 9)
+    valid[..., 4, 4] = 0.0
+    valid[..., 0, 0] = 0.0
+    target = torch.zeros(1, 2, 9, 9)
+    prediction = target.clone()
+    candidate = target.clone()
+    anchor = target.clone()
+    prediction[..., 4, 4] = float("nan")
+    candidate[..., 4, 4] = float("nan")
+    anchor[..., 4, 4] = float("nan")
+    prediction[..., 0, 0] = 1.0e30
+    candidate[..., 0, 0] = -1.0e30
+    anchor[..., 0, 0] = 1.0e30
+
+    structural = _structural_error(prediction, target, valid, kernel_size=5)
+    oracle = _utility_oracle(candidate, anchor, target, valid, temperature=0.02, kernel_size=5)
+
+    assert torch.isfinite(structural).all()
+    assert torch.isfinite(oracle).all()
+    torch.testing.assert_close(structural, torch.full_like(structural, 1.0e-4), atol=1.0e-7, rtol=0.0)
+
+
+def test_source_shuffle_batch_is_a_local_derangement_and_singleton_counterfactual_is_zero() -> None:
+    batch = _batch(2, 10, batch_size=4)
+    values = batch["observations"]
+    assert isinstance(values, torch.Tensor)
+    values[:, :, :, 0, 0] = torch.arange(4)[:, None, None]
+    shuffled = source_shuffle_batch(batch, generator=torch.Generator().manual_seed(3))
+    shuffled_values = shuffled["observations"]
+    assert isinstance(shuffled_values, torch.Tensor)
+    assert not torch.equal(shuffled_values[:, 0, 0, 0, 0], values[:, 0, 0, 0, 0])
+
+    config = SOPATTrainConfig(
+        stage="physical",
+        autocast_bfloat16=False,
+        physical_null_change_probability=0.0,
+        physical_permutation_probability=0.0,
+        source_shuffle_probability=1.0,
+    )
+    singleton = _batch(2, 10, batch_size=1)
+    model = _GatedToyModel()
+    _loss, metrics = sopat_direction_objective(model, singleton, "sar_to_optical", config)
+    assert metrics["physical_source_shuffle"].item() == 0.0
 
 
 class _FactorizerSpy(nn.Module):
@@ -331,6 +510,51 @@ def test_checkpoint_is_bidirectional_strict_and_v3_encoder_initialization(tmp_pa
     assert not torch.equal(initialized.head.weight, source.head.weight)
 
 
+def test_legacy_v4_initialization_allows_only_new_confidence_heads(tmp_path) -> None:
+    config = SOPATConfig(
+        width=8,
+        hidden=32,
+        encoder_depth=1,
+        heads=4,
+        adapter_rank=8,
+        transport_heads=4,
+        anchor_window_size=2,
+    )
+    source = SOPAT(config)
+    legacy_state = {
+        name: value
+        for name, value in source.state_dict().items()
+        if ".confidence." not in name
+    }
+    path = tmp_path / "legacy-v4.pt"
+    torch.save(
+        {
+            "sopat_v4_format": 1,
+            "family": "sopat_v4",
+            "directions": ["sar_to_optical", "optical_to_sar"],
+            "model_config": asdict(config),
+            "protocol_hashes": _protocol(),
+            "model": legacy_state,
+        },
+        path,
+    )
+    restored = SOPAT(config)
+    summary = initialize_from_sopat_checkpoint(
+        restored,
+        path,
+        model_config=asdict(config),
+        protocol_hashes=_protocol(),
+    )
+
+    assert summary["initialized_missing_keys"] == [
+        "renderers.optical.confidence.bias",
+        "renderers.optical.confidence.weight",
+        "renderers.sar.confidence.bias",
+        "renderers.sar.confidence.weight",
+    ]
+    assert restored.renderers["optical"].confidence.bias.item() == pytest.approx(-2.0)
+
+
 def test_evaluation_is_stratified_and_has_both_direction_schemas() -> None:
     optical = _batch(2, 10, batch_size=2, observations=2, changed=True)
     optical["target"][0] = optical["target_anchor"][0]  # type: ignore[index]
@@ -381,19 +605,26 @@ def test_source_shuffle_rejects_singleton_and_has_no_fixed_points() -> None:
 
 
 def _selection_report(
-    *, optical_rmse: float, sar_rmse: float, variant: str | None = None
+    *,
+    optical_rmse: float,
+    sar_rmse: float,
+    optical_structural: float = 0.1,
+    sar_structural: float = 0.2,
+    variant: str | None = None,
 ) -> dict[str, object]:
     optical = {
         "rmse": optical_rmse,
         "anchor_rmse": 1.0,
         "sam_deg": 1.0,
         "scene_improved_fraction": 1.0,
+        "structural_rmse": optical_structural,
     }
     sar = {
         "sar_db_rmse": sar_rmse,
         "sar_db_anchor_rmse": 10.0,
         "sar_db_bias": 0.0,
         "scene_improved_fraction": 1.0,
+        "structural_rmse": sar_structural,
     }
     report: dict[str, object] = {
         "directions": {
@@ -425,6 +656,8 @@ def test_source_shuffle_selection_gate_requires_both_direction_degradation() -> 
     passing_shuffle = _selection_report(
         optical_rmse=0.51,
         sar_rmse=2.03,
+        optical_structural=0.102,
+        sar_structural=0.205,
         variant="source_shuffle",
     )
     passing = sopat_evaluation.select_sopat_candidate(
@@ -437,6 +670,8 @@ def test_source_shuffle_selection_gate_requires_both_direction_degradation() -> 
     failing_shuffle = _selection_report(
         optical_rmse=0.51,
         sar_rmse=2.0,
+        optical_structural=0.102,
+        sar_structural=0.2,
         variant="source_shuffle",
     )
     failing = sopat_evaluation.select_sopat_candidate(
@@ -445,11 +680,14 @@ def test_source_shuffle_selection_gate_requires_both_direction_degradation() -> 
         source_shuffle_report=failing_shuffle,
     )
     assert not failing.eligible
-    assert any("source_shuffle_insufficient:optical_to_sar" in item for item in failing.failures)
+    assert any(
+        "source_shuffle_insufficient_structural_degradation:optical_to_sar" in item
+        for item in failing.failures
+    )
 
     missing = sopat_evaluation.select_sopat_candidate(candidate, config)
     assert not missing.eligible
-    assert any("missing_source_shuffle_metrics" in item for item in missing.failures)
+    assert any("missing_source_shuffle_structural_metrics" in item for item in missing.failures)
 
     invalid = sopat_evaluation.select_sopat_candidate(
         candidate,
@@ -461,4 +699,4 @@ def test_source_shuffle_selection_gate_requires_both_direction_degradation() -> 
         ),
     )
     assert not invalid.eligible
-    assert any("missing_source_shuffle_metrics" in item for item in invalid.failures)
+    assert any("missing_source_shuffle_structural_metrics" in item for item in invalid.failures)

@@ -1,0 +1,10 @@
+# Explicit V3 cache contract projected from the immutable SOPAT V4 role index.
+# This configuration is used only by build_paired_temporal_chunk_cache.py.
+data:
+  manifest: /data/datasets/sentinel_translate_v32_2017_2024/manifests/pairs.jsonl
+  train_index: /data/datasets/sopat_v4_2017_2024/paired_indexes/{direction}/train.jsonl
+  validation_index: /data/datasets/sopat_v4_2017_2024/paired_indexes/{direction}/validation_temporal.jsonl
+  train_split: train
+  validation_split: validation_temporal
+  crop_size: 256
+  maximum_observations: 8

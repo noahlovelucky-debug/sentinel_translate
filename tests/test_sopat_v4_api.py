@@ -64,6 +64,9 @@ def test_translate_single_scene_preserves_batch_and_never_accepts_target_label()
     result = translate(model, pair, observations, request)
 
     assert result.physical.shape == (1, 10, 16, 16)
+    assert result.candidate_physical.shape == result.physical.shape
+    assert result.transport_confidence.shape == (1, 1, 16, 16)
+    assert bool(((result.transport_confidence >= 0.0) & (result.transport_confidence <= 1.0)).all())
     assert result.log_variance.shape == (1, 1, 16, 16)
     assert result.target is request
     assert result.task_is_translation.tolist() == [True]

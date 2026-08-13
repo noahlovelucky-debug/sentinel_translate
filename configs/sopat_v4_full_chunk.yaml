@@ -1,14 +1,16 @@
-# SOPAT V4 bilateral 64-sample mechanism feasibility protocol.
+# Full SOPAT V4 deterministic physical training through the local-only mmap cache.
+# The V4 role index and paired_indexes are atomically published by
+# scripts/build_sopat_v4_index.py; no runtime selection or raw TIFF fallback is allowed.
 data:
-  manifest: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/manifests/pairs.jsonl
-  train_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes_v4_center_evaluable/{direction}/train.jsonl
-  validation_index: /home/noah/datasets/sentinel_translate_paired_v2_feasibility/indexes_v4_center_evaluable/{direction}/validation.jsonl
+  chunk_cache_root: /data/datasets/sopat_v4_2017_2024/chunk_cache
+  verify_chunk_cache: false
+  sopat_v4_index: /data/datasets/sopat_v4_2017_2024/index.jsonl
   train_split: train
   validation_split: validation_temporal
   horizon_days: 180
   translation_max_delta_days: 1
-  maximum_observations: 4
-  crop_size: 64
+  maximum_observations: 8
+  crop_size: 256
   minimum_valid_fraction: 0.80
   registration_audit: true
   maximum_registration_shift_px: 0.5
@@ -29,21 +31,21 @@ training:
   precision: bfloat16
   world_size: 8
   batch_size: 1
-  num_workers: 2
-  activation_checkpointing: false
+  num_workers: 4
+  activation_checkpointing: true
   log_every: 10
   weight_decay: 0.0001
   gradient_clip: 1.0
-  ema_decay: 0.999
+  ema_decay: 0.9995
   stages:
     factorizer:
-      steps: 500
-      learning_rate: 0.0001
+      steps: 10000
+      learning_rate: 0.00005
       encoder_learning_rate: 0.000002
     physical:
-      steps: 1500
-      learning_rate: 0.0002
-      encoder_learning_rate: 0.00001
+      steps: 30000
+      learning_rate: 0.0001
+      encoder_learning_rate: 0.000002
   objective:
     factorizer_anchor_cross_weight: 1.0
     factorizer_common_alignment_weight: 0.25
@@ -65,24 +67,29 @@ training:
     utility_weight: 0.10
     utility_temperature: 0.02
     source_shuffle_weight: 0.25
-    source_shuffle_probability: 1.0
+    source_shuffle_probability: 0.5
     source_shuffle_margin: 0.005
     structural_pool_kernel: 5
-  validate_every: 100
-  full_validate_every: 500
+  validate_every: 1000
+  full_validate_every: 5000
   early_stop_full_validations: 5
 
 validation:
-  batch_size: 4
+  batch_size: 3
   pilot_samples: 32
-  panel_samples: 16
-  selection_phase: feasibility
+  panel_samples: 32
+  selection_phase: full
   selection:
     required_tasks: [translation, forecast]
     required_observation_counts: [one, two_to_three, four_plus]
     feasibility_overall_anchor_ratio: 1.02
     feasibility_bucket_anchor_ratio: 1.10
-    feasibility_source_shuffle_min_degradation: 0.01
-    full_source_shuffle_min_degradation: 0.02
     full_overall_anchor_ratio: 1.0
     full_bucket_anchor_ratio: 1.0
+    full_optical_rmse_max: 0.03909
+    full_optical_sam_deg_max: 5.716
+    full_sar_db_rmse_max: 5.0
+    full_sar_db_bias_abs_max: 0.5
+    full_scene_improved_fraction_min: 0.70
+    feasibility_source_shuffle_min_degradation: 0.01
+    full_source_shuffle_min_degradation: 0.02

@@ -61,6 +61,13 @@ training:
     physical_permutation_probability: 0.25
     physical_anchor_regret_weight: 0.50
     physical_anchor_regret_margin: 0.0
+    candidate_weight: 0.50
+    utility_weight: 0.10
+    utility_temperature: 0.02
+    source_shuffle_weight: 0.25
+    source_shuffle_probability: 0.5
+    source_shuffle_margin: 0.005
+    structural_pool_kernel: 5
   validate_every: 1000
   full_validate_every: 5000
   early_stop_full_validations: 5

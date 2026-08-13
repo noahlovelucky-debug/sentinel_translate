@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Literal
 
 import torch
+import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.utils.data import Sampler
 
@@ -58,6 +59,7 @@ _SAR_DB_MAXIMUM = (5.0, -5.0)
 _SAR_HISTOGRAM_MINIMUM_DB = -60.0
 _SAR_HISTOGRAM_MAXIMUM_DB = 20.0
 _SAR_HISTOGRAM_BINS = 320
+_STRUCTURAL_BOX_SIZE = 9
 
 
 class NoSingletonBatchSampler(Sampler[list[int]]):
@@ -252,6 +254,9 @@ class _MetricAccumulator:
         self.anchor_squared_error = 0.0
         self.anchor_absolute_error = 0.0
         self.anchor_error_sum = 0.0
+        self.structural_squared_error = 0.0
+        self.anchor_structural_squared_error = 0.0
+        self.structural_pixels = 0.0
         self.sam_sum = 0.0
         self.sam_pixels = 0.0
         self.ndvi_absolute_error = 0.0
@@ -308,6 +313,27 @@ class _MetricAccumulator:
         self.anchor_squared_error += float((anchor_error.square() * mask).sum().detach().cpu())
         self.anchor_absolute_error += float((anchor_error.abs() * mask).sum().detach().cpu())
         self.anchor_error_sum += float((anchor_error * mask).sum().detach().cpu())
+        structural_prediction, structural_support = _masked_box_lowpass(prediction, valid)
+        structural_target, _ = _masked_box_lowpass(target, valid)
+        structural_anchor, _ = _masked_box_lowpass(anchor, valid)
+        structural_mask = (
+            (valid.to(prediction) > 0.0).to(prediction) * structural_support
+        ).expand_as(prediction)
+        structural_count = float(structural_mask.sum().detach().cpu())
+        if structural_count > 0.0:
+            self.structural_squared_error += float(
+                ((structural_prediction - structural_target).square() * structural_mask)
+                .sum()
+                .detach()
+                .cpu()
+            )
+            self.anchor_structural_squared_error += float(
+                ((structural_anchor - structural_target).square() * structural_mask)
+                .sum()
+                .detach()
+                .cpu()
+            )
+            self.structural_pixels += structural_count
         prediction_scene = _scene_rmse(prediction, target, valid)
         anchor_scene = _scene_rmse(anchor, target, valid)
         self.scene_improved += int(prediction_scene < anchor_scene)
@@ -402,6 +428,16 @@ class _MetricAccumulator:
             "anchor_rmse": math.sqrt(self.anchor_squared_error / self.pixels),
             "anchor_mae": self.anchor_absolute_error / self.pixels,
             "anchor_bias": self.anchor_error_sum / self.pixels,
+            "structural_rmse": (
+                math.sqrt(self.structural_squared_error / self.structural_pixels)
+                if self.structural_pixels > 0.0
+                else None
+            ),
+            "anchor_structural_rmse": (
+                math.sqrt(self.anchor_structural_squared_error / self.structural_pixels)
+                if self.structural_pixels > 0.0
+                else None
+            ),
             "pre_projection_violation": (
                 self.pre_projection_sum / self.pre_projection_samples
                 if self.pre_projection_samples
@@ -660,8 +696,8 @@ def select_sopat_candidate(
 
     The source-shuffle counterfactual is a causal-input dependence check.  A
     candidate can only become best when replacing each scene's source history
-    with a different scene's history measurably degrades primary RMSE in both
-    directions.  Missing or invalid shuffle evidence fails closed.
+    with a different scene's history measurably degrades mask-aware structural
+    RMSE in both directions.  Missing or invalid shuffle evidence fails closed.
     """
 
     directions = report.get("directions")
@@ -855,6 +891,8 @@ def _empty_report(direction: Direction) -> dict[str, float | int | None]:
         "anchor_rmse": None,
         "anchor_mae": None,
         "anchor_bias": None,
+        "structural_rmse": None,
+        "anchor_structural_rmse": None,
         "pre_projection_violation": None,
         "edge_f1": None,
         "psd_log_l1": None,
@@ -964,6 +1002,47 @@ def _scene_rmse(prediction: Tensor, target: Tensor, valid: Tensor) -> float:
     mask = valid.to(prediction).expand_as(prediction)
     denominator = mask.sum().clamp_min(1.0)
     return float((((prediction - target).square() * mask).sum() / denominator).sqrt().detach().cpu())
+
+
+def _masked_box_lowpass(values: Tensor, valid: Tensor) -> tuple[Tensor, Tensor]:
+    """Apply a strictly masked 9x9 box lowpass in normalized image units.
+
+    A source-shuffle counterfactual must measure coherent scene degradation,
+    not pixel-scale SAR speckle.  Values outside the mask are replaced before
+    multiplication, so even non-finite or extreme invalid pixels cannot enter
+    the pooled numerator.  Pooling the numerator and mask denominator with
+    identical geometry keeps borders and irregular masks unbiased.
+    """
+
+    if values.ndim != 4:
+        raise ValueError("SOPAT structural metric values must have shape BxCxHxW")
+    if valid.shape != (values.shape[0], 1, *values.shape[-2:]):
+        raise ValueError("SOPAT structural metric valid mask must have shape Bx1xHxW")
+    mask = (valid.to(values) > 0.0).to(values)
+    masked_values = torch.where(mask.bool(), values, torch.zeros_like(values))
+    padding = _STRUCTURAL_BOX_SIZE // 2
+    numerator = F.avg_pool2d(
+        masked_values * mask,
+        _STRUCTURAL_BOX_SIZE,
+        stride=1,
+        padding=padding,
+        count_include_pad=True,
+    )
+    denominator = F.avg_pool2d(
+        mask,
+        _STRUCTURAL_BOX_SIZE,
+        stride=1,
+        padding=padding,
+        count_include_pad=True,
+    )
+    support = denominator > 0.0
+    epsilon = torch.finfo(values.dtype).eps
+    lowpass = torch.where(
+        support,
+        numerator / denominator.clamp_min(epsilon),
+        torch.zeros_like(numerator),
+    )
+    return lowpass, support.to(values)
 
 
 def _interior_valid(valid: Tensor) -> Tensor:
@@ -1126,10 +1205,6 @@ def _anchor_ratio(metrics: Mapping[str, object] | None, direction: Direction) ->
     return candidate / anchor
 
 
-def _primary_rmse(metrics: Mapping[str, object] | None, direction: Direction) -> float | None:
-    return _metric_float(metrics, "sar_db_rmse" if direction == "optical_to_sar" else "rmse")
-
-
 def _source_shuffle_gate(
     candidate: Mapping[str, object] | None,
     shuffle: Mapping[str, object] | None,
@@ -1137,13 +1212,15 @@ def _source_shuffle_gate(
     config: SOPATSelectionConfig,
     failures: list[str],
 ) -> None:
-    candidate_rmse = _primary_rmse(candidate, direction)
-    shuffle_rmse = _primary_rmse(shuffle, direction)
+    candidate_rmse = _metric_float(candidate, "structural_rmse")
+    shuffle_rmse = _metric_float(shuffle, "structural_rmse")
     if candidate_rmse is None or shuffle_rmse is None:
-        failures.append(f"missing_source_shuffle_metrics:{direction}")
+        failures.append(f"missing_source_shuffle_structural_metrics:{direction}")
         return
     if candidate_rmse <= 0.0:
-        failures.append(f"invalid_source_shuffle_candidate_rmse:{direction}:{candidate_rmse}")
+        failures.append(
+            f"invalid_source_shuffle_structural_rmse:{direction}:{candidate_rmse}"
+        )
         return
     degradation = shuffle_rmse / candidate_rmse - 1.0
     threshold = (
@@ -1153,7 +1230,8 @@ def _source_shuffle_gate(
     )
     if degradation < threshold:
         failures.append(
-            f"source_shuffle_insufficient:{direction}:{degradation:.6f}<{threshold:.6f}"
+            "source_shuffle_insufficient_structural_degradation:"
+            f"{direction}:{degradation:.6f}<{threshold:.6f}"
         )
 
 

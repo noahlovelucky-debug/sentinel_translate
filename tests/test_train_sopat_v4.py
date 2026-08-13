@@ -59,6 +59,20 @@ def test_chunk_route_requires_v4_role_index_before_raw_fallback(tmp_path: Path, 
         )
 
 
+def test_full_chunk_configuration_loads_with_eight_rank_contract(runner_module) -> None:
+    config = runner_module._load_config(
+        Path(__file__).parents[1] / "configs" / "sopat_v4_full_chunk.yaml"
+    )
+
+    runner_module._validate_run_config(config, world_size=8)
+    model = runner_module._model_config(config)
+    physical = runner_module._train_config(config, stage="physical")
+
+    assert model.architecture == "sopat_v4"
+    assert physical.source_shuffle_weight == 0.25
+    assert physical.structural_pool_kernel == 5
+
+
 def test_chunk_preflight_missing_cache_is_clear_and_fail_closed(tmp_path: Path, runner_module) -> None:
     config = _minimal_config(tmp_path, cache_root="chunks")
     index_path = tmp_path / "route.jsonl"

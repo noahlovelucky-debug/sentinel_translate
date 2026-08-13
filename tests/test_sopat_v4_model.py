@@ -76,6 +76,9 @@ def test_one_model_supports_both_directions_and_initially_copies_anchor(
     assert output.source_anchor_cross.shape == inputs["source_anchor"].shape
     assert output.target_anchor_cross.shape == inputs["target_anchor"].shape
     assert torch.equal(output.physical, inputs["target_anchor"])
+    assert torch.equal(output.candidate_physical, inputs["target_anchor"])
+    assert bool(((output.transport_confidence > 0.0) & (output.transport_confidence < 0.2)).all())
+    assert torch.equal(output.pre_projection_violation, torch.zeros_like(output.pre_projection_violation))
     assert torch.equal(output.raw_delta, torch.zeros_like(output.raw_delta))
 
 
@@ -129,6 +132,52 @@ def test_target_renderers_keep_independent_channel_updates() -> None:
     assert model.renderers["sar"].delta.out_channels == 2
     assert not torch.allclose(output.raw_delta[:, 0], output.raw_delta[:, 1])
     assert not torch.allclose(output.raw_delta[:, 1], output.raw_delta[:, -1])
+
+
+def test_anchor_room_renderer_stays_bounded_under_huge_logits_and_zero_confidence_falls_back() -> None:
+    model = _tiny_model().eval()
+    inputs = _inputs()
+    renderer = model.renderers["optical"]
+    with torch.no_grad():
+        renderer.delta.bias.fill_(1.0e6)
+        renderer.confidence.bias.fill_(-1.0e6)
+
+    output = model(**inputs)  # type: ignore[arg-type]
+
+    assert bool(((output.candidate_physical >= -1.0) & (output.candidate_physical <= 1.0)).all())
+    assert bool(((output.physical >= -1.0) & (output.physical <= 1.0)).all())
+    assert torch.equal(output.pre_projection_violation, torch.zeros_like(output.pre_projection_violation))
+    torch.testing.assert_close(output.physical, inputs["target_anchor"], atol=0.0, rtol=0.0)  # type: ignore[arg-type]
+
+
+def test_anchor_room_update_reports_only_malformed_anchor_range() -> None:
+    legal_anchor = torch.full((1, 2, 4, 4), 0.2)
+    legal_output, legal_violation = SOPAT.bounded_anchor_update(legal_anchor, torch.full_like(legal_anchor, 1e6))
+    assert bool(((legal_output >= -1.0) & (legal_output <= 1.0)).all())
+    assert legal_violation.item() == 0.0
+
+    malformed_anchor = torch.full((1, 2, 4, 4), 1.2)
+    _malformed_output, malformed_violation = SOPAT.bounded_anchor_update(
+        malformed_anchor, torch.zeros_like(malformed_anchor)
+    )
+    assert malformed_violation.item() == 1.0
+
+
+def test_candidate_branch_has_gradient_when_confidence_is_conservatively_closed() -> None:
+    model = _tiny_model()
+    model.set_training_stage("physical")
+    inputs = _inputs()
+    renderer = model.renderers["optical"]
+    with torch.no_grad():
+        renderer.confidence.bias.fill_(-30.0)
+
+    output = model(**inputs)  # type: ignore[arg-type]
+    loss = (output.candidate_physical - 0.3).square().mean()
+    loss.backward()
+
+    assert renderer.delta.bias.grad is not None
+    assert renderer.delta.bias.grad.abs().sum().item() > 0.0
+    assert renderer.confidence.bias.grad is None or renderer.confidence.bias.grad.abs().sum().item() == 0.0
 
 
 def test_set_transport_is_permutation_invariant() -> None:

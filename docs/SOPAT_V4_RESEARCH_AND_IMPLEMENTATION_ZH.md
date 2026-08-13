@@ -230,7 +230,8 @@ V4 保持独立命名空间，不覆盖 V3.2 checkpoint：
 - `src/sentinel_v4/cache.py`：只读 chunk cache preflight，任何协议不一致均 fail closed；
 - `src/sentinel_v4/training.py`：双方向单图 DDP objective、EMA 与 v4 checkpoint；
 - `src/sentinel_v4/evaluation.py`：anchor、source-shuffle、task/N/change-region 分层评价；
-- `scripts/build_sopat_v4_index.py`：构建一次性、内容哈希绑定的全量 V4 索引；
+- `scripts/build_sopat_v4_index.py`：原子发布 V4 role index 与四个精确投影的 V3 cache
+  index；validation 在迁移前按 fixed-center 最小可评估支持筛选，train 绝不按标签像素筛选；
 - `scripts/train_sopat_v4.py`：factorizer/physical 两阶段 8 卡训练；
 - `scripts/evaluate_sopat_v4.py`：固定验证协议评估与可视化样本导出。
 
@@ -260,8 +261,34 @@ torchrun --standalone --nproc_per_node=8 scripts/train_sopat_v4.py \
 等价的串联启动器为 `scripts/launch_sopat_v4_feasibility_8gpu.sh`。它只在 factorizer
 产生非空 `best_factorizer.pt` 后启动 physical，随后自动生成同裁剪 V2/V4/anchor 比较和
 固定色标 PNG。通过 feasibility 后，全量链使用
-`scripts/launch_sopat_v4_full_8gpu.sh`；若全量 V4 index 不存在，该脚本会先构建并绑定其
-内容哈希。
+`scripts/launch_sopat_v4_full_chunk_8gpu.sh`（旧的
+`scripts/launch_sopat_v4_full_8gpu.sh` 是兼容入口）。全量链严格按以下顺序执行：
+
+```bash
+tmux new-session -d -s sopat-v4-full \
+  'cd /data/code/sentinel_translat/v3.2 && bash scripts/launch_sopat_v4_full_chunk_8gpu.sh'
+```
+
+开始任何数据写入前，启动器读取 `FEASIBILITY_REPORT`（默认第二轮 feasibility 目录）的
+`.validation.selection.eligible`，值不是布尔 `true` 就直接退出；不会构建 cache 或启动
+`torchrun`。通过后，它在 `/data/datasets/sopat_v4_2017_2024` 发布：
+
+- `index.jsonl` 与 `paired_indexes/{direction}/{split}.jsonl`，二者逐 sample projection
+  完全相等，并由 `index_publication.json` 的内容 hash 绑定；
+- `chunk_cache`，只通过显式的两个方向 train/validation V3 indexes 选取 role 所需
+  acquisition，预算 `200 GiB`、预留可用空间 `80 GiB`，默认 8 个 cache workers；
+- `configs/sopat_v4_full_chunk.yaml`，只读已完成 `.npy` mmap cache；cache publication 与
+  V4 role index 不一致时 training preflight 必须失败，不能退回 TIFF/NFS。
+
+全量训练固定为 crop `256`、最多 8 observations、8 GPU。启动器要求
+`CUDA_VISIBLE_DEVICES` 恰好包含 8 个不同的物理 GPU，且与 YAML 的 `world_size=8` 一致。
+启动前它查询每张卡的已用显存；默认超过 `8192 MiB` 则拒绝运行且不终止任何其他进程。
+轻量服务可通过 `GPU_USED_MIB_LIMIT` 调整，重训练占用则需要先由资源所有者释放。该数值是
+启动前的保守冲突检查，不代表训练所需的显存上限。
+
+这条链不包含训练监控循环。以 64-patch feasibility 的实际速度为基准，256 patch 的像素量约为
+16 倍；全量 cache 首次物化预计数小时，10k factorizer 加 30k physical 预计数日。实际首个完整
+阶段结束后再记录吞吐和最终 wall-clock，不以此估计替代报告。
 
 当前 feasibility 固定中心筛选保留 SAR->Optical `61/64` 个验证序列、
 Optical->SAR `64/64` 个验证序列；被排除的 3 个序列在 query target 与历史 target anchor
@@ -269,9 +296,9 @@ Optical->SAR `64/64` 个验证序列；被排除的 3 个序列在 query target 
 `center_filter_report.json`，不是训练期间动态挑选。
 
 只有两个方向的 feasibility gate 均通过，才允许按相同顺序运行
-`configs/sopat_v4_full_raw.yaml`。全量数据优先读取现有 canonical raster；只有完成态、协议匹配
-且磁盘预算允许时才使用 chunk cache。训练启动后只检查首个有限 step 和 8-rank 存活，不以
-人工监测改变选模或超参数。
+`configs/sopat_v4_full_chunk.yaml`。`publication_is_valid` 的 reusable fast path 是 full-only，
+故明确固定 `validation_temporal`；feasibility 或其他 split 必须生成独立 publication，不能复用
+此全量 marker。训练启动后不以人工监测改变选模或超参数。
 
 ## 10. 当前状态
 

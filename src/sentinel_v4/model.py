@@ -306,7 +306,13 @@ class _SharedTransportTrunk(nn.Module):
 
 
 class _TargetRenderer(nn.Module):
-    """Target-modality specific deterministic physical and variance head."""
+    """Target-modality candidate, evidence gate, and variance heads.
+
+    ``delta`` deliberately retains its historical name.  It now produces a
+    bounded candidate fraction rather than an unconstrained image-space delta,
+    which lets an older V4 checkpoint initialize this head while the newly
+    added confidence head starts from a conservative anchor-copy prior.
+    """
 
     def __init__(self, width: int, channels: int) -> None:
         super().__init__()
@@ -315,17 +321,21 @@ class _TargetRenderer(nn.Module):
             _ResidualBlock(width),
         )
         self.delta = nn.Conv2d(width, channels, 1)
+        self.confidence = nn.Conv2d(width, 1, 1)
         self.variance = nn.Conv2d(width, 1, 1)
         nn.init.zeros_(self.delta.weight)
         nn.init.zeros_(self.delta.bias)
+        nn.init.zeros_(self.confidence.weight)
+        nn.init.constant_(self.confidence.bias, -2.0)
         nn.init.zeros_(self.variance.weight)
         nn.init.zeros_(self.variance.bias)
 
-    def forward(self, features: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(self, features: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         features = self.features(features)
-        delta = self.delta(features)
+        candidate_fraction = torch.tanh(self.delta(features))
+        confidence = torch.sigmoid(self.confidence(features))
         log_variance = self.variance(features).clamp(-8.0, 4.0)
-        return delta, log_variance
+        return candidate_fraction, confidence, log_variance
 
 
 @dataclass
@@ -359,6 +369,8 @@ class SOPATConfig:
 @dataclass
 class SOPATOutput:
     physical: Tensor
+    candidate_physical: Tensor
+    transport_confidence: Tensor
     log_variance: Tensor
     transported_change: Pyramid
     common_anchor: Tensor
@@ -435,17 +447,25 @@ class SOPAT(nn.Module):
         )
 
     @staticmethod
-    def bounded_anchor_update(anchor: Tensor, delta: Tensor) -> tuple[Tensor, Tensor]:
-        """Apply an anchor-relative bounded update in normalized [-1, 1] units."""
+    def bounded_anchor_update(anchor: Tensor, fraction: Tensor) -> tuple[Tensor, Tensor]:
+        """Apply an anchor-room fraction without a post-hoc projection.
 
-        if anchor.shape != delta.shape:
-            raise ValueError("anchor and delta must have the same shape")
-        raw = anchor + delta
-        signed = torch.tanh(delta)
+        ``fraction`` is clipped defensively for direct callers, while the
+        renderer emits it through ``tanh``.  The resulting proposal is in the
+        normalized radiometric range whenever the registered anchor is in that
+        range, so a later ``clamp`` cannot hide an amplitude failure.
+        """
+
+        if anchor.shape != fraction.shape:
+            raise ValueError("anchor and fraction must have the same shape")
+        signed = fraction.clamp(-1.0, 1.0)
         positive_room = (1.0 - anchor).clamp_min(0.0)
         negative_room = (1.0 + anchor).clamp_min(0.0)
         bounded = anchor + torch.where(signed >= 0, positive_room * signed, negative_room * signed)
-        violation = (raw.abs() > 1.0).to(raw).mean(dim=(1, 2, 3))
+        # The proposal itself is parameterized inside the available room.  For
+        # valid normalized anchors this is exactly zero, while malformed
+        # out-of-range anchor input remains observable to diagnostics.
+        violation = (bounded.abs() > 1.0).to(bounded).mean(dim=(1, 2, 3))
         return bounded, violation
 
     @staticmethod
@@ -777,12 +797,19 @@ class SOPAT(nn.Module):
 
         transported_change: Pyramid = tuple(transported)  # type: ignore[assignment]
         shared_transport = self.transport(transported_change, (height, width))
-        raw_delta, log_variance = self.renderers[target_sensor.modality](shared_transport)
-        # A renderer can learn biases, so retain an explicit evidence gate at
-        # the final physical projection.  It is computed from transported
-        # anchor-relative change, not an absolute source image or time prior.
-        raw_delta = raw_delta * raw_change_gate.to(raw_delta)
-        physical, pre_projection_violation = self.bounded_anchor_update(target_anchor, raw_delta)
+        candidate_fraction, confidence, log_variance = self.renderers[target_sensor.modality](shared_transport)
+        # Structural source evidence preserves exact identity for null source
+        # change.  The learned confidence is separate: it decides whether a
+        # non-null, transported candidate is useful for this target location.
+        source_evidence = raw_change_gate.to(candidate_fraction)
+        candidate_fraction = candidate_fraction * source_evidence
+        transport_confidence = confidence * source_evidence
+        candidate_physical, _candidate_violation = self.bounded_anchor_update(
+            target_anchor, candidate_fraction
+        )
+        physical_fraction = candidate_fraction * transport_confidence
+        physical, pre_projection_violation = self.bounded_anchor_update(target_anchor, physical_fraction)
+        raw_delta = physical - target_anchor
         latest_days = torch.where(
             observation_present,
             observation_days,
@@ -791,6 +818,8 @@ class SOPAT(nn.Module):
         task_is_translation = latest_days.abs() <= float(self.config.translation_tolerance_days)
         return SOPATOutput(
             physical=physical,
+            candidate_physical=candidate_physical,
+            transport_confidence=transport_confidence,
             log_variance=log_variance,
             transported_change=transported_change,
             common_anchor=common_anchor,

@@ -109,6 +109,8 @@ class SOPATResult:
     """Physical SOPAT output and input request metadata, always batched."""
 
     physical: Tensor
+    candidate_physical: Tensor
+    transport_confidence: Tensor
     log_variance: Tensor
     transported_change: Pyramid
     common_anchor: Tensor
@@ -135,6 +137,8 @@ class SOPATResult:
     ) -> SOPATResult:
         return cls(
             physical=output.physical,
+            candidate_physical=output.candidate_physical,
+            transport_confidence=output.transport_confidence,
             log_variance=output.log_variance,
             transported_change=output.transported_change,
             common_anchor=output.common_anchor,
