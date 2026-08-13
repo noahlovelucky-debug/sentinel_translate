@@ -1,0 +1,192 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-14",
+  "family": "sopat_v4_feasibility_evidence_gate_64",
+  "protocol": {
+    "checkpoint": "/dev/shm/sopat_v4_feasibility_second/physical/latest.pt",
+    "checkpoint_global_step": 1500,
+    "validation_samples": {
+      "sar_to_optical": 61,
+      "optical_to_sar": 64
+    },
+    "comparison_crop": "fixed_center",
+    "changed_threshold_normalized": 0.05,
+    "canonical_grid": "10m"
+  },
+  "overall_metrics": {
+    "sar_to_optical": {
+      "anchor_copy": {
+        "rmse": 0.09169303523864618,
+        "structural_rmse": 0.08490947655628277,
+        "scene_improved_fraction": 0.0,
+        "optical": {
+          "sam_deg": 4.283515414115791,
+          "ndvi_mae": 0.10272439425630991,
+          "edge_f1": 0.46593535020850485,
+          "psd_log_l1": 0.0024527825432310462
+        },
+        "sar": null,
+        "pre_projection_violation": null
+      },
+      "v4_ema": {
+        "rmse": 0.09091690338794524,
+        "structural_rmse": 0.08431619113650493,
+        "scene_improved_fraction": 0.5245901639344263,
+        "optical": {
+          "sam_deg": 4.118257532532214,
+          "ndvi_mae": 0.09752816102847667,
+          "edge_f1": 0.47115998778083257,
+          "psd_log_l1": 0.002400878566836358
+        },
+        "sar": null,
+        "pre_projection_violation": 0.0
+      },
+      "source_shuffle": {
+        "rmse": 0.09117469172726911,
+        "structural_rmse": 0.08459159207692128,
+        "scene_improved_fraction": 0.47540983606557374,
+        "optical": {
+          "sam_deg": 4.135589197497558,
+          "ndvi_mae": 0.09783027452600963,
+          "edge_f1": 0.4711436982725101,
+          "psd_log_l1": 0.002401614584578354
+        },
+        "sar": null,
+        "pre_projection_violation": 0.0
+      },
+      "v2_latest_checkpoint": {
+        "rmse": 0.09621654980214575,
+        "structural_rmse": 0.09016293782110724,
+        "scene_improved_fraction": 0.19672131147540983,
+        "optical": {
+          "sam_deg": 4.521244671334427,
+          "ndvi_mae": 0.10389616417042874,
+          "edge_f1": 0.4717493354448278,
+          "psd_log_l1": 0.0024112865188517835
+        },
+        "sar": null,
+        "pre_projection_violation": 0.010428807318766914
+      }
+    },
+    "optical_to_sar": {
+      "anchor_copy": {
+        "rmse": 0.2785550524616474,
+        "structural_rmse": 0.1236538554672444,
+        "scene_improved_fraction": 0.0,
+        "optical": null,
+        "sar": {
+          "db_rmse": 5.571101052182246,
+          "db_bias": -0.588211486243909,
+          "db_corr": 0.8274377134199681,
+          "edge_f1": 0.9190563541032744,
+          "psd_log_l1": 0.026515030884183943
+        },
+        "pre_projection_violation": null
+      },
+      "v4_ema": {
+        "rmse": 0.26832745813849795,
+        "structural_rmse": 0.11483078925898638,
+        "scene_improved_fraction": 0.96875,
+        "optical": null,
+        "sar": {
+          "db_rmse": 5.366549127778948,
+          "db_bias": -0.2137964714126667,
+          "db_corr": 0.8338443080851874,
+          "edge_f1": 0.9123808526238609,
+          "psd_log_l1": 0.025081997242523357
+        },
+        "pre_projection_violation": 0.0
+      },
+      "source_shuffle": {
+        "rmse": 0.26800748231983224,
+        "structural_rmse": 0.11391714138762397,
+        "scene_improved_fraction": 0.921875,
+        "optical": null,
+        "sar": {
+          "db_rmse": 5.360149624325989,
+          "db_bias": -0.044176212658728634,
+          "db_corr": 0.8336094101292463,
+          "edge_f1": 0.9126756630585114,
+          "psd_log_l1": 0.025091134157264605
+        },
+        "pre_projection_violation": 0.0
+      },
+      "v2_latest_checkpoint": {
+        "rmse": 0.3111520912868573,
+        "structural_rmse": 0.14137221861560423,
+        "scene_improved_fraction": 0.078125,
+        "optical": null,
+        "sar": {
+          "db_rmse": 6.223041810196964,
+          "db_bias": 0.5428784796923583,
+          "db_corr": 0.7810074079922394,
+          "edge_f1": 0.9188756825934877,
+          "psd_log_l1": 0.03334371297387406
+        },
+        "pre_projection_violation": 0.023221969604492188
+      }
+    }
+  },
+  "relative_improvement": {
+    "definition": "Copied from comparison.json; positive means better for the metric orientation used by the evaluator.",
+    "sar_to_optical": {
+      "v4_vs_anchor_copy": {
+        "rmse": 0.008464458054866753,
+        "sam_deg": 0.03857996659449164,
+        "ndvi_mae": 0.050584218728688825,
+        "edge_f1": 0.011213224259523785,
+        "psd_log_l1": 0.021161262965576647
+      },
+      "v4_vs_source_shuffle": {
+        "rmse": 0.0028274111427214017,
+        "sam_deg": 0.00419085749035033,
+        "ndvi_mae": 0.0030881391164106825,
+        "edge_f1": 0.00003457439499280002,
+        "psd_log_l1": 0.0003064678848645927
+      },
+      "v4_vs_v2": {
+        "rmse": 0.0550804037881051,
+        "sam_deg": 0.08913190240670467,
+        "ndvi_mae": 0.06129199468332781,
+        "edge_f1": -0.001249281386776083,
+        "psd_log_l1": 0.004316348112949016
+      }
+    },
+    "optical_to_sar": {
+      "v4_vs_anchor_copy": {
+        "rmse": 0.03671659958333599,
+        "db_rmse": 0.03671660637409776,
+        "db_bias": 0.636531287789213,
+        "db_corr": 0.007742691155252708,
+        "edge_f1": -0.007263429984036974,
+        "psd_log_l1": 0.05404608608302176
+      },
+      "v4_vs_source_shuffle": {
+        "rmse": -0.0011939062890933356,
+        "db_rmse": -0.0011939038835625916,
+        "db_bias": -3.8396288080260166,
+        "db_corr": 0.0002817841942363585,
+        "edge_f1": -0.0003230177450580451,
+        "psd_log_l1": 0.0003641491326769098
+      },
+      "v4_vs_v2": {
+        "rmse": 0.1376324773240185,
+        "db_rmse": 0.1376324807933288,
+        "db_bias": 0.6061798737466584,
+        "db_corr": 0.06765223934146469,
+        "edge_f1": -0.0070682357718896425,
+        "psd_log_l1": 0.24777431768993577
+      }
+    }
+  },
+  "selection": {
+    "phase": "feasibility",
+    "eligible": false,
+    "failures": [
+      "source_shuffle_insufficient_structural_degradation:sar_to_optical:0.004174<0.010000",
+      "source_shuffle_insufficient_structural_degradation:optical_to_sar:-0.000821<0.010000"
+    ],
+    "full_training_released": false,
+    "reason": "The evidence-gated source-shuffle structural-degradation checks failed in both directions; the feasibility checkpoint was not released for full training."
+  }
+}
