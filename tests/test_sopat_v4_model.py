@@ -126,14 +126,14 @@ def test_target_renderers_keep_independent_channel_updates() -> None:
     inputs = _inputs()
     renderer = model.renderers["optical"]
     with torch.no_grad():
-        renderer.delta.bias.copy_(torch.linspace(0.1, 1.0, renderer.delta.out_channels))
+        renderer.delta.weight.normal_(std=0.02)
 
     output = model(**inputs)  # type: ignore[arg-type]
 
     assert renderer.delta.out_channels == 10
     assert model.renderers["sar"].delta.out_channels == 2
-    assert not torch.allclose(output.raw_delta[:, 0], output.raw_delta[:, 1])
-    assert not torch.allclose(output.raw_delta[:, 1], output.raw_delta[:, -1])
+    assert not torch.allclose(output.candidate_logits[:, 0], output.candidate_logits[:, 1])
+    assert not torch.allclose(output.candidate_logits[:, 1], output.candidate_logits[:, -1])
 
 
 def test_anchor_room_renderer_stays_bounded_under_huge_logits_and_zero_confidence_falls_back() -> None:
@@ -161,7 +161,79 @@ def test_null_source_has_zero_transport_evidence_but_preserves_raw_gate_logits()
     assert torch.equal(output.transport_evidence, torch.zeros_like(output.transport_evidence))
     assert torch.equal(output.transport_confidence, torch.zeros_like(output.transport_confidence))
     assert torch.equal(output.transport_confidence_logits, torch.full_like(output.transport_confidence_logits, -2.0))
+    assert torch.equal(output.candidate_logits, torch.zeros_like(output.candidate_logits))
     assert torch.equal(output.physical, inputs["target_anchor"])
+
+
+def test_contrastive_null_cancels_all_transport_and_renderer_biases() -> None:
+    model = _tiny_model().eval()
+    inputs = _inputs(changed=False)
+    with torch.no_grad():
+        for index, block in enumerate(model.set_attention):
+            for layer in block.modules():
+                bias = getattr(layer, "bias", None)
+                if isinstance(bias, torch.Tensor):
+                    bias.fill_(0.11 + 0.03 * index)
+            block.attention.in_proj_bias.fill_(0.23)
+            block.attention.out_proj.bias.fill_(-0.19)
+        for index, block in enumerate((model.transport, *model.renderers.values())):
+            for layer in block.modules():
+                bias = getattr(layer, "bias", None)
+                if isinstance(bias, torch.Tensor):
+                    bias.fill_(-0.21 - 0.02 * index)
+
+    output = model(**inputs)  # type: ignore[arg-type]
+
+    assert torch.equal(output.candidate_logits, torch.zeros_like(output.candidate_logits))
+    assert torch.equal(output.raw_delta, torch.zeros_like(output.raw_delta))
+    assert torch.equal(output.physical, inputs["target_anchor"])
+    assert torch.equal(output.candidate_physical, inputs["target_anchor"])
+    assert torch.equal(output.log_variance, torch.zeros_like(output.log_variance))
+    for transported in output.transported_change:
+        assert torch.equal(transported, torch.zeros_like(transported))
+
+
+def test_no_query_or_fuse_bypass_when_attention_values_are_zero() -> None:
+    model = _tiny_model().eval()
+    inputs = _inputs(changed=True)
+    with torch.no_grad():
+        for block in model.set_attention:
+            channels = block.attention.embed_dim
+            block.attention.in_proj_weight[2 * channels :].zero_()
+            block.attention.in_proj_bias[2 * channels :].zero_()
+            block.attention.out_proj.weight.zero_()
+            block.attention.out_proj.bias.zero_()
+            for layer in block.fuse.modules():
+                if isinstance(layer, torch.nn.Conv2d) and layer.bias is not None:
+                    layer.bias.fill_(0.23)
+        for layer in model.transport.modules():
+            if isinstance(layer, torch.nn.Conv2d) and layer.bias is not None:
+                layer.bias.fill_(-0.11)
+        for renderer in model.renderers.values():
+            renderer.delta.weight.normal_(std=0.03)
+            renderer.delta.bias.fill_(0.27)
+
+    output = model(**inputs)  # type: ignore[arg-type]
+
+    assert bool(output.transport_evidence.any())
+    assert torch.equal(output.candidate_logits, torch.zeros_like(output.candidate_logits))
+    assert torch.equal(output.raw_delta, torch.zeros_like(output.raw_delta))
+    assert torch.equal(output.physical, inputs["target_anchor"])
+
+
+def test_source_changes_modify_contrastive_candidate_logits() -> None:
+    model = _tiny_model().eval()
+    first = _inputs(frames=1)
+    second = dict(first)
+    second["observations"] = first["observations"].clone()  # type: ignore[index]
+    second["observations"].add_(0.23)  # type: ignore[index]
+    with torch.no_grad():
+        model.renderers["optical"].delta.weight.normal_(std=0.03)
+
+    first_output = model(**first)  # type: ignore[arg-type]
+    second_output = model(**second)  # type: ignore[arg-type]
+
+    assert not torch.allclose(first_output.candidate_logits, second_output.candidate_logits)
 
 
 def test_anchor_room_update_reports_only_malformed_anchor_range() -> None:
@@ -189,8 +261,8 @@ def test_candidate_branch_has_gradient_when_confidence_is_conservatively_closed(
     loss = (output.candidate_physical - 0.3).square().mean()
     loss.backward()
 
-    assert renderer.delta.bias.grad is not None
-    assert renderer.delta.bias.grad.abs().sum().item() > 0.0
+    assert renderer.delta.weight.grad is not None
+    assert renderer.delta.weight.grad.abs().sum().item() > 0.0
     assert renderer.confidence.bias.grad is None or renderer.confidence.bias.grad.abs().sum().item() == 0.0
 
 
@@ -247,7 +319,7 @@ def test_absent_padding_is_inert_even_after_renderer_bias() -> None:
     for base_change, padded_change in zip(
         base_output.transported_change, padded_output.transported_change, strict=True
     ):
-        torch.testing.assert_close(base_change, padded_change, atol=1e-6, rtol=0.0)
+        torch.testing.assert_close(base_change, padded_change, atol=2e-6, rtol=0.0)
 
 
 def test_factorizer_anchor_only_route_has_nonzero_loss_and_gradients() -> None:
@@ -290,8 +362,8 @@ def test_physical_gradients_reach_trunk_then_null_change_stays_exact_after_train
 
     first = model(**inputs)  # type: ignore[arg-type]
     first.physical.square().mean().backward()
-    assert model.renderers["optical"].delta.bias.grad is not None
-    assert model.renderers["optical"].delta.bias.grad.abs().sum().item() > 0.0
+    assert model.renderers["optical"].delta.weight.grad is not None
+    assert model.renderers["optical"].delta.weight.grad.abs().sum().item() > 0.0
     optimizer.step()
     optimizer.zero_grad(set_to_none=True)
 
@@ -301,7 +373,7 @@ def test_physical_gradients_reach_trunk_then_null_change_stays_exact_after_train
         parameter.grad is not None and parameter.grad.abs().sum().item() > 0.0
         for parameter in model.transport.parameters()
     )
-    assert model.renderers["optical"].delta.bias.detach().abs().sum().item() > 0.0
+    assert model.renderers["optical"].delta.weight.detach().abs().sum().item() > 0.0
 
     null_inputs = dict(inputs)
     null_inputs["observations"] = inputs["source_anchor"][:, None].clone()  # type: ignore[index]

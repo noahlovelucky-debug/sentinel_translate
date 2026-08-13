@@ -1592,7 +1592,21 @@ def initialize_from_sopat_checkpoint(
         raise RuntimeError("SOPAT initialization checkpoint has incompatible format")
     if payload.get("family") != SOPAT_V4_FAMILY or tuple(payload.get("directions", ())) != DIRECTIONS:
         raise RuntimeError("SOPAT initialization checkpoint is not a bidirectional V4 checkpoint")
-    if payload.get("model_config") != _config_mapping(model_config):
+    expected_model_config = _config_mapping(model_config)
+    stored_model_config = payload.get("model_config")
+    compatible_factorizer_pre_contrast = (
+        _checkpoint_stage(payload) == "factorizer"
+        and isinstance(stored_model_config, Mapping)
+        and expected_model_config.get("transport_parameterization") == "contrastive_null_v1"
+        and "transport_parameterization" not in stored_model_config
+        and {
+            name: value
+            for name, value in expected_model_config.items()
+            if name != "transport_parameterization"
+        }
+        == _json_safe_mapping(stored_model_config)
+    )
+    if stored_model_config != expected_model_config and not compatible_factorizer_pre_contrast:
         raise RuntimeError("SOPAT initialization checkpoint model configuration differs")
     if payload.get("protocol_hashes") != _normalize_protocol_hashes(protocol_hashes):
         raise RuntimeError("SOPAT initialization checkpoint protocol hashes differ")

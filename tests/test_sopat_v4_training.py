@@ -730,6 +730,76 @@ def test_legacy_v4_initialization_allows_only_new_confidence_heads(tmp_path) -> 
     assert restored.renderers["optical"].confidence.bias.item() == pytest.approx(-2.0)
 
 
+def test_factorizer_initialization_allows_only_pre_contrast_model_config(tmp_path) -> None:
+    config = SOPATConfig(
+        width=8,
+        hidden=32,
+        encoder_depth=1,
+        heads=4,
+        adapter_rank=8,
+        transport_heads=4,
+        anchor_window_size=2,
+    )
+    old_config = asdict(config)
+    old_config.pop("transport_parameterization")
+
+    def write_checkpoint(path, *, stage: str, model_config: dict[str, object]) -> None:
+        torch.save(
+            {
+                "sopat_v4_format": 1,
+                "family": "sopat_v4",
+                "directions": ["sar_to_optical", "optical_to_sar"],
+                "model_config": model_config,
+                "train_config": {"stage": stage},
+                "protocol_hashes": _protocol(),
+                "model": SOPAT(config).state_dict(),
+            },
+            path,
+        )
+
+    factorizer_path = tmp_path / "pre-contrast-factorizer.pt"
+    write_checkpoint(factorizer_path, stage="factorizer", model_config=old_config)
+    initialized = SOPAT(config)
+    summary = initialize_from_sopat_checkpoint(
+        initialized,
+        factorizer_path,
+        model_config=asdict(config),
+        protocol_hashes=_protocol(),
+    )
+    assert summary["source_train_stage"] == "factorizer"
+    assert summary["initialized_missing_keys"] == []
+
+    physical_path = tmp_path / "pre-contrast-physical.pt"
+    write_checkpoint(physical_path, stage="physical", model_config=old_config)
+    with pytest.raises(RuntimeError, match="model configuration"):
+        initialize_from_sopat_checkpoint(
+            SOPAT(config),
+            physical_path,
+            model_config=asdict(config),
+            protocol_hashes=_protocol(),
+        )
+    with pytest.raises(RuntimeError, match="model configuration"):
+        load_sopat_checkpoint(
+            physical_path,
+            model=SOPAT(config),
+            optimizer=None,
+            ema=None,
+            model_config=asdict(config),
+            train_config=SOPATTrainConfig(stage="physical", autocast_bfloat16=False),
+            protocol_hashes=_protocol(),
+        )
+
+    exact_path = tmp_path / "contrastive-factorizer.pt"
+    write_checkpoint(exact_path, stage="factorizer", model_config=asdict(config))
+    exact_summary = initialize_from_sopat_checkpoint(
+        SOPAT(config),
+        exact_path,
+        model_config=asdict(config),
+        protocol_hashes=_protocol(),
+    )
+    assert exact_summary["initialized_missing_keys"] == []
+
+
 def test_evaluation_is_stratified_and_has_both_direction_schemas() -> None:
     optical = _batch(2, 10, batch_size=2, observations=2, changed=True)
     optical["target"][0] = optical["target_anchor"][0]  # type: ignore[index]

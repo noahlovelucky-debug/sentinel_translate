@@ -26,6 +26,7 @@ model:
   max_horizon_days: 180
   translation_tolerance_days: 1
   anchor_window_size: 8
+  transport_parameterization: contrastive_null_v1
 
 training:
   precision: bfloat16

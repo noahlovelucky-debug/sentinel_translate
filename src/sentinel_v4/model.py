@@ -159,7 +159,14 @@ class _SymmetricAnchorFactorizer(nn.Module):
 
 
 class _ScaleSetAttention(nn.Module):
-    """Point-wise masked, unordered set attention for one pyramid scale."""
+    """Point-wise masked, unordered set attention for one pyramid scale.
+
+    This block intentionally returns its *unguarded* fused branch feature.
+    SOPAT evaluates it once for a real history and once for its matched null
+    history, then subtracts the two complete branches.  Applying a
+    change-magnitude gate here would make the branches asymmetric and would
+    let target-query/fuse biases masquerade as source evidence.
+    """
 
     def __init__(self, channels: int, heads: int, max_horizon_days: int) -> None:
         super().__init__()
@@ -263,23 +270,11 @@ class _ScaleSetAttention(nn.Module):
         support = usable.to(changes).sum(dim=1, keepdim=True) / observation_present.to(changes).sum(
             dim=1, keepdim=True
         )[:, :, None, None].clamp_min(1.0)
-        # This multiplicative gate is structural rather than learned.  It masks
-        # attention/output-projection biases and preserves an exact null-change
-        # identity even after optimizer updates.
-        usable_changes = torch.where(
-            usable[:, :, None], changes.abs(), torch.zeros_like(changes)
-        )
-        evidence_numerator = usable_changes.sum(dim=(1, 2), keepdim=False)
-        evidence_denominator = usable.to(changes).sum(dim=1) * float(channels)
-        # Normalize by the usable observations at each pixel, rather than by
-        # the padded sequence length.  This makes an absent slot exactly
-        # observationally inert, including after the renderer learns a bias.
-        evidence = torch.where(
-            evidence_denominator > 0.0,
-            evidence_numerator / evidence_denominator.clamp_min(1.0),
-            torch.zeros_like(evidence_numerator),
-        ).unsqueeze(1)
-        fused = self.fuse(torch.cat((query, attended), dim=1)) * evidence
+        # Do not multiply by a per-branch change amplitude here.  The caller
+        # subtracts a real and null invocation with identical masks/times,
+        # which cancels query, attention, and convolution biases before the
+        # hard source-validity guard is applied.
+        fused = self.fuse(torch.cat((query, attended), dim=1))
         return fused, attention, support
 
 
@@ -306,13 +301,16 @@ class _SharedTransportTrunk(nn.Module):
 
 
 class _TargetRenderer(nn.Module):
-    """Target-modality candidate, evidence gate, and variance heads.
+    """Render pre-activation heads for one source-conditioned transport arm.
 
-    ``delta`` deliberately retains its historical name.  It now produces a
-    bounded candidate fraction rather than an unconstrained image-space delta,
-    which lets an older V4 checkpoint initialize this head while the newly
-    added confidence head starts from a conservative anchor-copy prior.
+    SOPAT invokes this renderer on matched real and null transport features.
+    The public candidate is ``tanh(real_logits - null_logits)``; consequently
+    every renderer bias cancels before it can update the target anchor.  The
+    module names and parameter shapes deliberately stay stable so an anchor
+    factorizer checkpoint can initialize the contrastive physical stage.
     """
+
+    confidence_prior_logit = -2.0
 
     def __init__(self, width: int, channels: int) -> None:
         super().__init__()
@@ -330,13 +328,11 @@ class _TargetRenderer(nn.Module):
         nn.init.zeros_(self.variance.weight)
         nn.init.zeros_(self.variance.bias)
 
-    def forward(self, features: Tensor) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    def forward(self, features: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """Return pre-tanh candidate, confidence, and variance logits."""
+
         features = self.features(features)
-        candidate_fraction = torch.tanh(self.delta(features))
-        confidence_logits = self.confidence(features)
-        confidence = torch.sigmoid(confidence_logits)
-        log_variance = self.variance(features).clamp(-8.0, 4.0)
-        return candidate_fraction, confidence_logits, confidence, log_variance
+        return self.delta(features), self.confidence(features), self.variance(features)
 
 
 @dataclass
@@ -351,6 +347,7 @@ class SOPATConfig:
     translation_tolerance_days: int = 1
     anchor_window_size: int = 8
     architecture: str = "sopat_v4"
+    transport_parameterization: str = "contrastive_null_v1"
 
     def __post_init__(self) -> None:
         if self.width <= 0 or self.hidden <= 0 or self.encoder_depth <= 0:
@@ -365,12 +362,17 @@ class SOPATConfig:
             raise ValueError("translation_tolerance_days must be non-negative")
         if self.anchor_window_size <= 0:
             raise ValueError("anchor_window_size must be positive")
+        if self.transport_parameterization != "contrastive_null_v1":
+            raise ValueError(
+                "SOPAT requires transport_parameterization='contrastive_null_v1'"
+            )
 
 
 @dataclass
 class SOPATOutput:
     physical: Tensor
     candidate_physical: Tensor
+    candidate_logits: Tensor
     transport_confidence: Tensor
     transport_confidence_logits: Tensor
     transport_evidence: Tensor
@@ -719,31 +721,54 @@ class SOPAT(nn.Module):
         target_anchor_features = self._encode(target_anchor, target_anchor_valid, target_sensor)
         # Padded observation slots are ignored before entering the encoder.  In
         # particular, a slot may contain arbitrary values/days/valid masks.
+        # The real and matched-null histories must use *exactly* the same
+        # source-valid support.  The null history replaces every present
+        # observation by the registered source anchor; it retains its original
+        # timestamps and slots so all learned time/query/fuse biases cancel
+        # only through a true source-conditioned contrast.
         present_image = observation_present[:, :, None, None, None]
         safe_observations = torch.where(present_image, observations, torch.zeros_like(observations))
-        safe_observation_valid = torch.where(
-            present_image, observation_valid, torch.zeros_like(observation_valid)
+        shared_observation_valid = torch.where(
+            present_image,
+            observation_valid * source_anchor_valid[:, None].to(observation_valid),
+            torch.zeros_like(observation_valid),
         )
-        # This gate is only a structural no-change guard, not a transport
-        # value.  The learned path below still receives changes exclusively as
-        # E(observation)-E(source_anchor).  Computing the guard before the
-        # separately batched encoder calls makes exact identity independent of
-        # hardware-specific convolution rounding.
+        null_observations = torch.where(
+            present_image,
+            source_anchor[:, None].expand_as(observations),
+            torch.zeros_like(observations),
+        )
+        # This is a structural guard, never a learned transport value.  It is
+        # deliberately derived in pixel space before encoding, then combined
+        # with the shared valid support below.  Thus a source-invalid or
+        # source-identical history can never manufacture an update through a
+        # temporal/query/fuse bias.
         raw_change_evidence = (
             (safe_observations - source_anchor[:, None]).abs().mean(dim=2, keepdim=True)
-            * safe_observation_valid.to(observations)
-            * source_anchor_valid[:, None].to(observations)
+            * shared_observation_valid.to(observations)
         ).sum(dim=1)
-        raw_change_gate = raw_change_evidence > 0.0
-        flattened_observations = safe_observations.reshape(
-            batch * frames, observations.shape[2], height, width
+        shared_valid = shared_observation_valid.sum(dim=1) > 0.0
+        raw_change_gate = (raw_change_evidence > 0.0) & shared_valid
+        # Encode matched real/null source histories in one shared call.  This
+        # keeps their encoder arithmetic identical when observation == anchor
+        # while avoiding an anchor-copy bypass around set attention.
+        paired_observations = torch.cat((safe_observations, null_observations), dim=0)
+        paired_valid = torch.cat((shared_observation_valid, shared_observation_valid), dim=0)
+        flattened_observations = paired_observations.reshape(
+            2 * batch * frames, observations.shape[2], height, width
         )
-        flattened_valid = safe_observation_valid.reshape(batch * frames, 1, height, width)
-        observation_features = self._encode(flattened_observations, flattened_valid, source_sensor)
-        observation_features = tuple(
-            level.reshape(batch, frames, level.shape[1], level.shape[2], level.shape[3])
-            for level in observation_features
+        flattened_valid = paired_valid.reshape(2 * batch * frames, 1, height, width)
+        paired_observation_features = self._encode(
+            flattened_observations, flattened_valid, source_sensor
         )
+        real_observation_features: list[Tensor] = []
+        null_observation_features: list[Tensor] = []
+        for level in paired_observation_features:
+            paired_level = level.reshape(
+                2, batch, frames, level.shape[1], level.shape[2], level.shape[3]
+            )
+            real_observation_features.append(paired_level[0])
+            null_observation_features.append(paired_level[1])
 
         (
             common_source,
@@ -773,45 +798,72 @@ class SOPAT(nn.Module):
         target_anchor_reconstruction = target_anchor_cross
 
         target_queries = self._add_common_to_target(target_anchor_features, common_anchor)
+        real_transport_features: list[Tensor] = []
+        null_transport_features: list[Tensor] = []
         transported: list[Tensor] = []
         attention: list[Tensor] = []
         support: list[Tensor] = []
-        for source_feature, anchor_feature, query, set_attention in zip(
-            observation_features, source_anchor_features, target_queries, self.set_attention, strict=True
+        for real_feature, null_feature, anchor_feature, query, set_attention in zip(
+            real_observation_features,
+            null_observation_features,
+            source_anchor_features,
+            target_queries,
+            self.set_attention,
+            strict=True,
         ):
-            # This is the only source observation signal passed to transport.
-            explicit_change = source_feature - anchor_feature[:, None]
-            fused, scale_attention, scale_support = set_attention(
-                explicit_change,
+            # The two branches receive the same anchor, query, validity,
+            # timestamps and slot mask.  Differencing their complete fused
+            # outputs cancels all non-source biases without weakening the
+            # source-dependent set-attention route.
+            real_change = real_feature - anchor_feature[:, None]
+            null_change = null_feature - anchor_feature[:, None]
+            real_fused, scale_attention, scale_support = set_attention(
+                real_change,
                 query,
-                safe_observation_valid,
+                shared_observation_valid,
                 observation_days,
                 observation_present,
                 source_anchor_days,
                 target_anchor_days,
             )
-            scale_gate = F.interpolate(
-                raw_change_gate.to(fused), size=fused.shape[-2:], mode="area"
-            ) > 0.0
-            fused = fused * scale_gate.to(fused)
-            transported.append(fused)
+            null_fused, _null_attention, _null_support = set_attention(
+                null_change,
+                query,
+                shared_observation_valid,
+                observation_days,
+                observation_present,
+                source_anchor_days,
+                target_anchor_days,
+            )
+            real_transport_features.append(real_fused)
+            null_transport_features.append(null_fused)
+            transported.append(real_fused - null_fused)
             attention.append(scale_attention)
             support.append(scale_support)
 
         transported_change: Pyramid = tuple(transported)  # type: ignore[assignment]
-        shared_transport = self.transport(transported_change, (height, width))
-        (
-            candidate_fraction,
-            confidence_logits,
-            confidence,
-            log_variance,
-        ) = self.renderers[target_sensor.modality](shared_transport)
+        # Do not feed ``real_fused - null_fused`` through one trunk: its
+        # convolution bias would reintroduce a null update.  Complete both
+        # branches through the shared trunk and renderer, then difference the
+        # pre-activation heads so every internal bias cancels.
+        real_transport = self.transport(tuple(real_transport_features), (height, width))
+        null_transport = self.transport(tuple(null_transport_features), (height, width))
+        renderer = self.renderers[target_sensor.modality]
+        real_candidate_logits, real_confidence_logits, real_variance_logits = renderer(real_transport)
+        null_candidate_logits, null_confidence_logits, null_variance_logits = renderer(null_transport)
+        candidate_logits = real_candidate_logits - null_candidate_logits
+        confidence_logits = (
+            torch.full_like(real_confidence_logits, renderer.confidence_prior_logit)
+            + real_confidence_logits
+            - null_confidence_logits
+        )
+        log_variance = (real_variance_logits - null_variance_logits).clamp(-8.0, 4.0)
         # Structural source evidence preserves exact identity for null source
         # change.  The learned confidence is separate: it decides whether a
         # non-null, transported candidate is useful for this target location.
-        source_evidence = raw_change_gate.to(candidate_fraction)
-        candidate_fraction = candidate_fraction * source_evidence
-        transport_confidence = confidence * source_evidence
+        source_evidence = raw_change_gate.to(candidate_logits)
+        candidate_fraction = torch.tanh(candidate_logits) * source_evidence
+        transport_confidence = torch.sigmoid(confidence_logits) * source_evidence
         candidate_physical, _candidate_violation = self.bounded_anchor_update(
             target_anchor, candidate_fraction
         )
@@ -827,6 +879,7 @@ class SOPAT(nn.Module):
         return SOPATOutput(
             physical=physical,
             candidate_physical=candidate_physical,
+            candidate_logits=candidate_logits,
             transport_confidence=transport_confidence,
             # Keep the learned logit independent of structural evidence.  A
             # caller can inspect calibration separately from the hard causal
