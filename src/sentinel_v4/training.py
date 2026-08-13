@@ -104,6 +104,7 @@ class SOPATTrainConfig:
     source_shuffle_probability: float = 0.5
     source_shuffle_margin: float = 0.005
     counterfactual_confidence_weight: float = 0.10
+    counterfactual_confidence_binary_weight: float = 1.0
     counterfactual_confidence_margin: float = 0.10
     structural_pool_kernel: int = 5
     autocast_bfloat16: bool = True
@@ -153,12 +154,17 @@ class SOPATTrainConfig:
             "source_shuffle_weight",
             "source_shuffle_margin",
             "counterfactual_confidence_weight",
+            "counterfactual_confidence_binary_weight",
             "counterfactual_confidence_margin",
         )
         if any(float(getattr(self, name)) < 0.0 for name in nonnegative):
             raise ValueError("SOPAT loss weights and margins must be non-negative")
-        if not np.isfinite(float(self.counterfactual_confidence_weight)):
-            raise ValueError("counterfactual_confidence_weight must be finite and non-negative")
+        for name in (
+            "counterfactual_confidence_weight",
+            "counterfactual_confidence_binary_weight",
+        ):
+            if not np.isfinite(float(getattr(self, name))):
+                raise ValueError(f"{name} must be finite and non-negative")
         for name in (
             "physical_null_change_probability",
             "physical_permutation_probability",
@@ -939,7 +945,10 @@ def physical_objective(
         raise ValueError("SOPAT candidate_physical must match the target label shape")
     candidate = masked_charbonnier(candidate_physical, target, valid)
     confidence_shape = (physical.shape[0], 1, *physical.shape[-2:])
-    transport_confidence = output_tensor(output, "transport_confidence", required=False)
+    matched_transport_confidence = output_tensor(
+        output, "transport_confidence", required=False
+    )
+    transport_confidence = matched_transport_confidence
     if transport_confidence is None:
         transport_confidence = torch.ones(confidence_shape, device=physical.device, dtype=physical.dtype)
     if transport_confidence.shape != confidence_shape:
@@ -1029,6 +1038,8 @@ def physical_objective(
         permutation = masked_mean((physical - permuted_physical).abs(), valid)
     source_shuffle = physical.new_zeros(())
     counterfactual_confidence = physical.new_zeros(())
+    counterfactual_confidence_binary = physical.new_zeros(())
+    counterfactual_confidence_margin = physical.new_zeros(())
     source_shuffle_enabled = _rank_synchronized_probability(
         config.source_shuffle_probability, physical.device, generator
     )
@@ -1059,8 +1070,8 @@ def physical_objective(
             ).mean()
             # A shuffled history is a deliberately wrong causal source.  Its
             # confidence must be lower than the matched route by a margin.
-            # This relative constraint cannot be satisfied by collapsing both
-            # routes to zero and never reads the query label.
+            # The binary source-authenticity term below additionally prevents
+            # a collapsed pair of closed gates from satisfying that ranking.
             wrong_confidence_shape = (wrong_physical.shape[0], 1, *wrong_physical.shape[-2:])
             wrong_transport_confidence_logits = output_tensor(
                 wrong_output, "transport_confidence_logits", required=False
@@ -1089,8 +1100,13 @@ def physical_objective(
                 raise ValueError(
                     "SOPAT source-shuffle transport_evidence must have shape Bx1xHxW"
                 )
+            # ``transport_confidence`` above has a ones fallback for the
+            # historical utility objective.  Counterfactual calibration needs
+            # a real matched gate, otherwise legacy outputs must remain a
+            # strict no-op.
             matched_has_confidence = (
-                transport_confidence_logits is not None or transport_confidence is not None
+                transport_confidence_logits is not None
+                or matched_transport_confidence is not None
             )
             wrong_has_confidence = (
                 wrong_transport_confidence_logits is not None
@@ -1117,32 +1133,64 @@ def physical_objective(
                     * (transport_evidence > 0.0).to(valid)
                     * (wrong_transport_evidence > 0.0).to(valid)
                 )
-                # Keep the comparison in FP32 regardless of the enclosing
-                # BF16 autocast context. Native SOPAT exposes logits; the
-                # probability branches retain old focused-test compatibility.
+                # Source authenticity has exactly two labels: this unshuffled
+                # forward received the recipient's matched input history, and
+                # this counterfactual forward received a non-self history.
+                # No query target values participate in this calibration.
+                # Keep BCE and the probability margin in FP32 regardless of
+                # the enclosing BF16 autocast context. Native SOPAT exposes
+                # logits; probability branches retain focused-test and legacy
+                # checkpoint compatibility.
                 with torch.autocast(device_type=physical.device.type, enabled=False):
                     if transport_confidence_logits is not None:
-                        matched_probability = torch.sigmoid(
-                            transport_confidence_logits.float()
+                        matched_logits = transport_confidence_logits.float()
+                        matched_probability = torch.sigmoid(matched_logits)
+                        matched_binary_map = F.binary_cross_entropy_with_logits(
+                            matched_logits,
+                            torch.ones_like(matched_logits),
+                            reduction="none",
                         )
                     else:
                         matched_probability = transport_confidence.float().clamp(0.0, 1.0)
+                        matched_binary_map = F.binary_cross_entropy(
+                            matched_probability.clamp(1e-5, 1.0 - 1e-5),
+                            torch.ones_like(matched_probability),
+                            reduction="none",
+                        )
                     if wrong_transport_confidence_logits is not None:
-                        wrong_probability = torch.sigmoid(
-                            wrong_transport_confidence_logits.float()
+                        wrong_logits = wrong_transport_confidence_logits.float()
+                        wrong_probability = torch.sigmoid(wrong_logits)
+                        wrong_binary_map = F.binary_cross_entropy_with_logits(
+                            wrong_logits,
+                            torch.zeros_like(wrong_logits),
+                            reduction="none",
                         )
                     else:
                         assert wrong_transport_confidence is not None
                         wrong_probability = wrong_transport_confidence.float().clamp(
                             0.0, 1.0
                         )
-                    counterfactual_confidence_map = torch.relu(
-                        wrong_probability
-                        - matched_probability
-                        + float(config.counterfactual_confidence_margin)
+                        wrong_binary_map = F.binary_cross_entropy(
+                            wrong_probability.clamp(1e-5, 1.0 - 1e-5),
+                            torch.zeros_like(wrong_probability),
+                            reduction="none",
+                        )
+                    counterfactual_confidence_binary = _masked_single_channel_mean(
+                        0.5 * (matched_binary_map + wrong_binary_map),
+                        counterfactual_valid,
                     )
-                    counterfactual_confidence = _masked_single_channel_mean(
-                        counterfactual_confidence_map, counterfactual_valid
+                    counterfactual_confidence_margin = _masked_single_channel_mean(
+                        torch.relu(
+                            wrong_probability
+                            - matched_probability
+                            + float(config.counterfactual_confidence_margin)
+                        ),
+                        counterfactual_valid,
+                    )
+                    counterfactual_confidence = (
+                        float(config.counterfactual_confidence_binary_weight)
+                        * counterfactual_confidence_binary
+                        + counterfactual_confidence_margin
                     )
     total = (
         config.physical_charbonnier_weight * charbonnier
@@ -1175,6 +1223,8 @@ def physical_objective(
         "physical_permutation": permutation.detach(),
         "physical_source_shuffle": source_shuffle.detach(),
         "physical_counterfactual_confidence": counterfactual_confidence.detach(),
+        "physical_counterfactual_confidence_binary": counterfactual_confidence_binary.detach(),
+        "physical_counterfactual_confidence_margin": counterfactual_confidence_margin.detach(),
         "physical_anchor_regret": anchor_regret.detach(),
         "physical_rmse": per_example_error.mean().detach(),
         "anchor_rmse": anchor_error.mean().detach(),

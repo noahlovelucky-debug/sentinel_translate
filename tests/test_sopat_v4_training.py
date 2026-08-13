@@ -402,7 +402,7 @@ def _counterfactual_confidence_config(*, autocast_bfloat16: bool = False) -> SOP
     )
 
 
-def test_counterfactual_confidence_ranks_correct_above_wrong_with_gradient() -> None:
+def test_counterfactual_confidence_has_symmetric_authenticity_gradients() -> None:
     model = _CounterfactualConfidenceToyModel(wrong_logit=4.0)
     loss, metrics = sopat_direction_objective(
         model,
@@ -413,15 +413,38 @@ def test_counterfactual_confidence_ranks_correct_above_wrong_with_gradient() -> 
     )
     loss.backward()
 
-    assert metrics["physical_counterfactual_confidence"].item() > 0.19
+    assert metrics["physical_counterfactual_confidence_binary"].item() > 2.0
+    assert metrics["physical_counterfactual_confidence_margin"].item() > 0.19
+    assert metrics["physical_counterfactual_confidence"].item() == pytest.approx(
+        metrics["physical_counterfactual_confidence_binary"].item()
+        + metrics["physical_counterfactual_confidence_margin"].item()
+    )
     assert model.wrong_logit.grad is not None
     assert model.wrong_logit.grad.item() > 0.0
     assert model.correct_logit.grad is not None
     assert model.correct_logit.grad.item() < 0.0
 
 
-def test_counterfactual_confidence_vanishes_for_closed_wrong_logit() -> None:
-    model = _CounterfactualConfidenceToyModel(wrong_logit=-20.0)
+def test_counterfactual_confidence_rejects_both_closed_logits() -> None:
+    model = _CounterfactualConfidenceToyModel(wrong_logit=-20.0, correct_logit=-20.0)
+    loss, metrics = sopat_direction_objective(
+        model,
+        _counterfactual_confidence_batch(),
+        "sar_to_optical",
+        _counterfactual_confidence_config(),
+        generator=torch.Generator().manual_seed(3),
+    )
+    loss.backward()
+
+    assert metrics["physical_counterfactual_confidence_binary"].item() > 9.9
+    assert metrics["physical_counterfactual_confidence_margin"].item() == pytest.approx(0.10)
+    assert metrics["physical_counterfactual_confidence"].item() > 10.0
+    assert model.correct_logit.grad is not None and model.correct_logit.grad.item() < 0.0
+    assert model.wrong_logit.grad is not None and model.wrong_logit.grad.item() > 0.0
+
+
+def test_counterfactual_confidence_is_near_zero_for_well_separated_logits() -> None:
+    model = _CounterfactualConfidenceToyModel(wrong_logit=-20.0, correct_logit=20.0)
     _loss, metrics = sopat_direction_objective(
         model,
         _counterfactual_confidence_batch(),
@@ -430,7 +453,9 @@ def test_counterfactual_confidence_vanishes_for_closed_wrong_logit() -> None:
         generator=torch.Generator().manual_seed(3),
     )
 
-    assert metrics["physical_counterfactual_confidence"].item() == 0.0
+    assert metrics["physical_counterfactual_confidence_binary"].item() < 1.0e-7
+    assert metrics["physical_counterfactual_confidence_margin"].item() == 0.0
+    assert metrics["physical_counterfactual_confidence"].item() < 1.0e-7
 
 
 def test_counterfactual_confidence_skips_legacy_wrong_route_without_gate_fields() -> None:
@@ -466,8 +491,12 @@ def test_counterfactual_confidence_zero_support_has_exact_zero_loss(zero_support
     loss.backward()
 
     assert metrics["physical_counterfactual_confidence"].item() == 0.0
+    assert metrics["physical_counterfactual_confidence_binary"].item() == 0.0
+    assert metrics["physical_counterfactual_confidence_margin"].item() == 0.0
     assert model.wrong_logit.grad is not None
     assert model.wrong_logit.grad.item() == 0.0
+    assert model.correct_logit.grad is not None
+    assert model.correct_logit.grad.item() == 0.0
 
 
 def test_counterfactual_confidence_probability_fallback_is_cpu_bf16_safe() -> None:
@@ -532,6 +561,7 @@ def test_counterfactual_confidence_weight_is_explicit_in_all_sopat_configs(confi
     payload.pop("steps")
     config = SOPATTrainConfig.from_mapping(payload)
     assert config.counterfactual_confidence_weight == pytest.approx(0.10)
+    assert config.counterfactual_confidence_binary_weight == pytest.approx(1.0)
     assert config.counterfactual_confidence_margin == pytest.approx(0.10)
 
 
@@ -539,6 +569,14 @@ def test_counterfactual_confidence_weight_is_explicit_in_all_sopat_configs(confi
 def test_counterfactual_confidence_weight_requires_a_finite_nonnegative_value(value: float) -> None:
     with pytest.raises(ValueError, match="counterfactual_confidence_weight|loss weights"):
         SOPATTrainConfig(counterfactual_confidence_weight=value)
+
+
+@pytest.mark.parametrize("value", (-1.0, float("inf"), float("nan")))
+def test_counterfactual_confidence_binary_weight_requires_a_finite_nonnegative_value(
+    value: float,
+) -> None:
+    with pytest.raises(ValueError, match="counterfactual_confidence_binary_weight|loss weights"):
+        SOPATTrainConfig(counterfactual_confidence_binary_weight=value)
 
 
 def test_confidence_only_scope_freezes_everything_except_two_confidence_heads() -> None:

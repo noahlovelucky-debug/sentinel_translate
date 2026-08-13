@@ -43,6 +43,7 @@ training:
     physical_permutation_probability: 1.0
     source_shuffle_probability: 1.0
     counterfactual_confidence_weight: 0.10
+    counterfactual_confidence_binary_weight: 1.0
     counterfactual_confidence_margin: 0.10
   validate_every: 1
   full_validate_every: 1

@@ -70,6 +70,7 @@ training:
     source_shuffle_probability: 0.5
     source_shuffle_margin: 0.005
     counterfactual_confidence_weight: 0.10
+    counterfactual_confidence_binary_weight: 1.0
     counterfactual_confidence_margin: 0.10
     structural_pool_kernel: 5
   validate_every: 1000
