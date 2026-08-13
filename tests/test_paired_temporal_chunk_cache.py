@@ -22,7 +22,11 @@ from sentinel_v3.paired_temporal_chunk_cache import (
     materialize_paired_temporal_chunk_cache,
     verify_paired_temporal_chunk_cache,
 )
-from sentinel_v3.paired_temporal_data import PairedTemporalRasterDataset, write_pair_records
+from sentinel_v3.paired_temporal_data import (
+    PairedTemporalRasterDataset,
+    write_pair_records,
+    write_paired_temporal_index,
+)
 from sentinel_v3.schema import S2_CHANNEL_ORDER, SAR_CHANNEL_ORDER
 
 
@@ -173,6 +177,60 @@ def _resume_capacity_plan(config: Path, root: Path):
     )
 
 
+def _update_data_config(config: Path, **updates: object) -> None:
+    values = yaml.safe_load(config.read_text(encoding="utf-8"))
+    assert isinstance(values, dict)
+    data = values["data"]
+    assert isinstance(data, dict)
+    data.update(updates)
+    config.write_text(yaml.safe_dump(values, sort_keys=True), encoding="utf-8")
+
+
+def _write_explicit_indexes(config: Path, root: Path) -> dict[tuple[str, str], tuple[str, ...]]:
+    source_plan = _plan(config, root / "source-cache")
+    expected: dict[tuple[str, str], tuple[str, ...]] = {}
+    for entry in source_plan.indexes:
+        label = "train" if entry.split == "train" else "validation"
+        selected = entry.index.subset(limit=2 if label == "train" else 3)
+        path = root / entry.direction / f"{label}.jsonl"
+        write_paired_temporal_index(path, selected)
+        expected[(entry.direction, entry.split)] = tuple(sample.sample_id for sample in selected)
+    return expected
+
+
+def _write_role_specific_explicit_indexes(config: Path, root: Path) -> PairRecord:
+    source_plan = _plan(config, root / "source-cache")
+    query_record: PairRecord | None = None
+    for entry in source_plan.indexes:
+        if entry.direction == "optical_to_sar":
+            selected_index = next(
+                index
+                for index, sample in enumerate(entry.index)
+                if sample.task_mode == "forecast"
+            )
+        else:
+            selected_index = 0
+        selected = entry.index.subset(start=selected_index, limit=1)
+        sample = selected.samples[0]
+        if entry.direction == "optical_to_sar" and entry.split == "train":
+            assert sample.query_pair_id not in sample.observation_pair_ids
+            query_record = source_plan.records[sample.query_pair_id]
+        label = "train" if entry.split == "train" else "validation"
+        write_paired_temporal_index(root / entry.direction / f"{label}.jsonl", selected)
+    assert query_record is not None
+    _update_data_config(
+        config,
+        train_index="explicit-indexes/{direction}/train.jsonl",
+        validation_index="explicit-indexes/{direction}/validation.jsonl",
+    )
+    return query_record
+
+
+def _record_asset_path(manifest: Path, value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else manifest.parent / path
+
+
 def _metadata_bytes(root: Path, plan: object) -> dict[Path, bytes]:
     assert hasattr(plan, "indexes")
     index_paths = [root / entry.relative_path for entry in plan.indexes]  # type: ignore[union-attr]
@@ -214,6 +272,182 @@ def test_plan_deduplicates_acquisitions_and_excludes_test(chunk_inputs: tuple[Pa
     assert all("test_temporal" not in path for acquisition in plan.acquisitions for path in acquisition.source_paths)
     assert len({acquisition.acquisition_id for acquisition in plan.acquisitions}) == len(plan.acquisitions)
     assert plan.report()["acquisitions"]["total"] == len(plan.acquisitions)  # type: ignore[index]
+
+
+def test_plan_applies_configured_sample_limits_per_split_and_direction(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    config, _ = chunk_inputs
+    _update_data_config(config, max_train_samples=2, max_validation_samples=3)
+
+    plan = _plan(config, tmp_path / "cache")
+
+    assert {
+        (entry.direction, entry.split): (len(entry.index), entry.index.config.max_samples)
+        for entry in plan.indexes
+    } == {
+        ("sar_to_optical", "train"): (2, 2),
+        ("sar_to_optical", "validation_temporal"): (3, 3),
+        ("optical_to_sar", "train"): (2, 2),
+        ("optical_to_sar", "validation_temporal"): (3, 3),
+    }
+
+
+def test_plan_without_sample_limit_keys_keeps_full_indexes(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    config, _ = chunk_inputs
+
+    plan = _plan(config, tmp_path / "cache")
+
+    assert all(entry.index.config.max_samples is None for entry in plan.indexes)
+    assert all(len(entry.index) > 3 for entry in plan.indexes)
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    (
+        ("max_train_samples", 0),
+        ("max_train_samples", -1),
+        ("max_train_samples", True),
+        ("max_train_samples", 1.0),
+        ("max_train_samples", "1"),
+        ("max_train_samples", None),
+        ("max_validation_samples", 0),
+        ("max_validation_samples", -1),
+        ("max_validation_samples", True),
+        ("max_validation_samples", 1.0),
+        ("max_validation_samples", "1"),
+        ("max_validation_samples", None),
+    ),
+)
+def test_plan_rejects_invalid_configured_sample_limits(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path, key: str, value: object
+) -> None:
+    config, _ = chunk_inputs
+    _update_data_config(config, **{key: value})
+
+    with pytest.raises(ValueError, match=rf"data\.{key} must be a positive integer"):
+        _plan(config, tmp_path / "cache")
+
+
+@pytest.mark.parametrize("direction_mapping", (False, True))
+def test_plan_uses_explicit_indexes_exactly_without_rebuild_or_second_limits(
+    chunk_inputs: tuple[Path, Path],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    direction_mapping: bool,
+) -> None:
+    config, _ = chunk_inputs
+    index_root = tmp_path / "explicit-indexes"
+    expected = _write_explicit_indexes(config, index_root)
+    if direction_mapping:
+        train_index: object = {
+            direction: f"explicit-indexes/{direction}/train.jsonl"
+            for direction in ("sar_to_optical", "optical_to_sar")
+        }
+        validation_index: object = {
+            direction: f"explicit-indexes/{direction}/validation.jsonl"
+            for direction in ("sar_to_optical", "optical_to_sar")
+        }
+    else:
+        train_index = "explicit-indexes/{direction}/train.jsonl"
+        validation_index = "explicit-indexes/{direction}/validation.jsonl"
+    _update_data_config(
+        config,
+        train_index=train_index,
+        validation_index=validation_index,
+        max_train_samples=1,
+        max_validation_samples=1,
+    )
+
+    def no_rebuild(*args: object, **kwargs: object) -> object:
+        raise AssertionError("explicit indexes must not invoke the index builder")
+
+    monkeypatch.setattr(chunk_cache, "build_paired_temporal_index", no_rebuild)
+    plan = _plan(config, tmp_path / "cache")
+
+    assert {
+        (entry.direction, entry.split): tuple(sample.sample_id for sample in entry.index)
+        for entry in plan.indexes
+    } == expected
+    assert all(len(entry.index) > 1 for entry in plan.indexes)
+
+
+def test_plan_rejects_only_one_explicit_index_key(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    config, _ = chunk_inputs
+    _update_data_config(config, train_index="explicit-indexes/{direction}/train.jsonl")
+
+    with pytest.raises(ValueError, match="must be supplied together"):
+        _plan(config, tmp_path / "cache")
+
+
+def test_plan_rejects_explicit_direction_or_split_mismatch(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    config, _ = chunk_inputs
+    index_root = tmp_path / "explicit-indexes"
+    _write_explicit_indexes(config, index_root)
+    _update_data_config(
+        config,
+        train_index={
+            "sar_to_optical": "explicit-indexes/optical_to_sar/train.jsonl",
+            "optical_to_sar": "explicit-indexes/optical_to_sar/train.jsonl",
+        },
+        validation_index="explicit-indexes/{direction}/validation.jsonl",
+    )
+
+    with pytest.raises(ValueError, match="requested direction differs"):
+        _plan(config, tmp_path / "cache")
+
+    _update_data_config(
+        config,
+        train_index="explicit-indexes/{direction}/train.jsonl",
+        validation_index={
+            "sar_to_optical": "explicit-indexes/sar_to_optical/train.jsonl",
+            "optical_to_sar": "explicit-indexes/optical_to_sar/validation.jsonl",
+        },
+    )
+    with pytest.raises(ValueError, match="split"):
+        _plan(config, tmp_path / "cache")
+
+
+def test_role_aware_plan_ignores_missing_unused_query_side(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    config, manifest = chunk_inputs
+    query = _write_role_specific_explicit_indexes(config, tmp_path / "explicit-indexes")
+    unused_optical = _record_asset_path(manifest, query.s2[S2_CHANNEL_ORDER[0]])
+    unused_optical.unlink()
+
+    plan = _plan(config, tmp_path / "cache")
+    assert all(str(unused_optical) not in acquisition.source_paths for acquisition in plan.acquisitions)
+    materialize_paired_temporal_chunk_cache(plan, workers=1)
+
+    assert verify_paired_temporal_chunk_cache(plan.destination_root)["valid"] is True
+    dataset = PairedTemporalChunkDataset(
+        plan.destination_root,
+        direction="optical_to_sar",
+        split="train",
+        registration_audit=False,
+    )
+    assert dataset[0]["target_values"].shape == (2, 256, 256)
+
+
+def test_role_aware_plan_fails_when_an_actual_role_asset_is_missing(
+    chunk_inputs: tuple[Path, Path], tmp_path: Path
+) -> None:
+    config, manifest = chunk_inputs
+    query = _write_role_specific_explicit_indexes(config, tmp_path / "explicit-indexes")
+    required_sar = _record_asset_path(manifest, query.sar[SAR_CHANNEL_ORDER[0]])
+    required_sar.unlink()
+
+    plan = _plan(config, tmp_path / "cache")
+
+    with pytest.raises(OSError):
+        materialize_paired_temporal_chunk_cache(plan, workers=1)
 
 
 def test_plan_enforces_budget_and_reserve(chunk_inputs: tuple[Path, Path], tmp_path: Path) -> None:

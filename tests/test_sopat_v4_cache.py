@@ -470,6 +470,61 @@ def test_preflight_rejects_protocol_route_and_target_leakage(tmp_path: Path) -> 
         preflight_sopat_v4_chunk_cache(root, bad_index)
 
 
+def test_preflight_only_requires_materialized_sopat_roles(tmp_path: Path) -> None:
+    index = _sopat_index()
+    example = next(example for example in index.examples if example.task_mode == "forecast")
+    single_example_index = SOPATIndexV4(config=index.config, examples=(example,))
+    root = tmp_path / "cache"
+    _complete_cache(root, index)
+
+    routes = json.loads((root / "routing.json").read_text(encoding="utf-8"))["routes"]
+    source_key = (
+        "sar_acquisition_id" if example.source_modality == "sar" else "optical_acquisition_id"
+    )
+    target_key = (
+        "optical_acquisition_id" if example.target_modality == "optical" else "sar_acquisition_id"
+    )
+    query_route = routes[example.target.record_id]
+    anchor_route = routes[example.anchor_pair.registration_id]
+    observation_routes = [
+        routes[observation.measurement.record_id] for observation in example.observations
+    ]
+    input_ids = {
+        anchor_route[source_key],
+        anchor_route[target_key],
+        *(route[source_key] for route in observation_routes),
+    }
+    target_id = query_route[target_key]
+    required_ids = input_ids | {target_id}
+    unused_query_source_id = query_route[source_key]
+    unused_observation_target_ids = {route[target_key] for route in observation_routes}
+    unused_ids = {unused_query_source_id, *unused_observation_target_ids}.difference(required_ids)
+    assert unused_query_source_id not in required_ids
+    assert unused_observation_target_ids.isdisjoint(required_ids)
+
+    cache_index_path = root / "cache_index.json"
+    cache_index = json.loads(cache_index_path.read_text(encoding="utf-8"))
+    cache_index["acquisitions"] = [
+        acquisition
+        for acquisition in cache_index["acquisitions"]
+        if acquisition["acquisition_id"] not in unused_ids
+    ]
+    _write_json(cache_index_path, cache_index)
+    preflight_sopat_v4_chunk_cache(root, single_example_index)
+
+    for missing_id in sorted(required_ids):
+        _complete_cache(root, index)
+        cache_index = json.loads(cache_index_path.read_text(encoding="utf-8"))
+        cache_index["acquisitions"] = [
+            acquisition
+            for acquisition in cache_index["acquisitions"]
+            if acquisition["acquisition_id"] != missing_id
+        ]
+        _write_json(cache_index_path, cache_index)
+        with pytest.raises(SOPATChunkCachePreflightError, match="acquisition metadata is missing"):
+            preflight_sopat_v4_chunk_cache(root, single_example_index)
+
+
 def test_cache_wrapper_has_no_raw_source_fallback(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     index = _sopat_index()
     root = tmp_path / "cache"

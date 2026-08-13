@@ -430,12 +430,12 @@ def _validate_example_routes(
         raise SOPATChunkCachePreflightError(
             f"cached target acquisition leaks into SOPAT input route: {example.sample_id}"
         )
-    all_ids = {
-        _required_string(route, key)
-        for route in route_values
-        for key in ("optical_acquisition_id", "sar_acquisition_id")
-    }
-    missing = sorted(all_ids.difference(acquisitions))
+    # Routing remains dual-modality even when the V3 plan did not materialize
+    # an acquisition for a role this SOPAT example never consumes.
+    for route in route_values:
+        _required_string(route, "optical_acquisition_id")
+        _required_string(route, "sar_acquisition_id")
+    missing = sorted((input_ids | {target_id}).difference(acquisitions))
     if missing:
         raise SOPATChunkCachePreflightError(
             f"chunk cache acquisition metadata is missing {missing[0]}"

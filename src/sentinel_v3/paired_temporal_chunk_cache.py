@@ -321,12 +321,13 @@ def build_paired_temporal_chunk_cache_plan(
     windows_per_acquisition: int = DEFAULT_WINDOWS_PER_ACQUISITION,
     free_bytes: int | None = None,
 ) -> PairedTemporalChunkCachePlan:
-    """Select full train/validation acquisitions without opening any TIFF.
+    """Select configured train/validation acquisitions without opening any TIFF.
 
-    The paired causal indexes are built in both directions using the supplied
-    V2 YAML.  Only records referenced by those train/validation indexes enter
-    the route table; test, buffer, and unused-spatial records cannot appear in
-    a materialization plan.
+    The paired causal indexes are either loaded from an explicit pair supplied
+    by the YAML or built in both directions from its selection constraints.
+    Only records referenced by those train/validation indexes enter the route
+    table; test, buffer, and unused-spatial records cannot appear in a
+    materialization plan.
     """
 
     if budget_bytes <= 0:
@@ -348,23 +349,51 @@ def build_paired_temporal_chunk_cache_plan(
     validation_split = _required_string(data, "validation_split")
     if train_split == validation_split:
         raise ValueError("train and validation splits must differ")
+    explicit_paths = _explicit_index_paths(data, base=config_file.parent)
+    split_limits = (
+        None
+        if explicit_paths is not None
+        else {
+            train_split: _optional_positive_int(data, "max_train_samples"),
+            validation_split: _optional_positive_int(data, "max_validation_samples"),
+        }
+    )
     records = load_pair_records(manifest)
     record_map = {record.pair_id: record for record in records}
     if len(record_map) != len(records):
         raise ValueError("paired temporal manifest contains duplicate pair_id values")
-    common = _index_config_from_data(data)
+    common = None if explicit_paths is not None else _index_config_from_data(data)
     selected_indexes: list[ChunkCacheIndexEntry] = []
     required_pair_ids: set[str] = set()
+    required_modalities: dict[str, set[Modality]] = {}
     for direction in ALL_DIRECTIONS:
-        for split in (train_split, validation_split):
-            index = build_paired_temporal_index(
-                records,
-                direction=direction,
-                split=split,
-                **common,
-            )
-            if not index:
-                raise RuntimeError(f"paired chunk cache selection is empty: {direction}/{split}")
+        for split, label in ((train_split, "train"), (validation_split, "validation")):
+            if explicit_paths is None:
+                assert common is not None
+                assert split_limits is not None
+                index = build_paired_temporal_index(
+                    records,
+                    direction=direction,
+                    split=split,
+                    max_samples=split_limits[split],
+                    **common,
+                )
+                if not index:
+                    raise RuntimeError(f"paired chunk cache selection is empty: {direction}/{split}")
+            else:
+                index_path = explicit_paths[direction][label]
+                if not index_path.is_file():
+                    raise FileNotFoundError(
+                        f"explicit {label} paired temporal index is missing: {index_path}"
+                    )
+                index = load_paired_temporal_index(index_path, direction=direction)
+                _validate_explicit_index(
+                    index,
+                    index_path=index_path,
+                    direction=direction,
+                    split=split,
+                    label=label,
+                )
             assert_paired_temporal_causality(index, record_map, asset_root=manifest.parent)
             selected_indexes.append(
                 ChunkCacheIndexEntry(
@@ -378,6 +407,14 @@ def build_paired_temporal_chunk_cache_plan(
                 required_pair_ids.add(sample.query_pair_id)
                 required_pair_ids.add(sample.anchor_pair_id)
                 required_pair_ids.update(sample.observation_pair_ids)
+                required_modalities.setdefault(sample.query_pair_id, set()).add(
+                    sample.target_modality
+                )
+                required_modalities.setdefault(sample.anchor_pair_id, set()).update(
+                    (sample.source_modality, sample.target_modality)
+                )
+                for pair_id in sample.observation_pair_ids:
+                    required_modalities.setdefault(pair_id, set()).add(sample.source_modality)
     selected_records = {pair_id: record_map[pair_id] for pair_id in sorted(required_pair_ids)}
     allowed_splits = {train_split, validation_split}
     invalid_records = [
@@ -417,6 +454,8 @@ def build_paired_temporal_chunk_cache_plan(
             ("optical", optical_paths, optical_id),
             ("sar", sar_paths, sar_id),
         ):
+            if modality not in required_modalities[record.pair_id]:
+                continue
             key = (acquisition_id, paths)
             existing = pending_assets.get(key)
             if existing is not None and existing[1] != grid.grid_id:
@@ -595,17 +634,33 @@ def verify_paired_temporal_chunk_cache(cache_root: str | Path) -> dict[str, obje
     routing_path = root / str(payload.get("routing_path", "routing.json"))
     if not routing_path.is_file() or file_sha256(routing_path) != str(payload.get("routing_sha256")):
         raise ChunkCacheIntegrityError("cached routing table is missing or corrupt")
+    routing_payload = _load_json_mapping(routing_path)
+    routes_value = _required_mapping(routing_payload, "routes")
+    routes = {
+        str(pair_id): ChunkRecordRoute.from_dict(route)  # type: ignore[arg-type]
+        for pair_id, route in routes_value.items()
+    }
+    indexes: list[PairedTemporalIndex] = []
     for entry in _required_sequence(payload, "indexes"):
         path = root / str(entry["relative_path"])
         if not path.is_file() or file_sha256(path) != str(entry["sha256"]):
             raise ChunkCacheIntegrityError(f"cached sample index is missing or corrupt: {path}")
+        indexes.append(load_paired_temporal_index(path))
     grids = {
         grid.grid_id: grid
         for grid in (ChunkGrid.from_dict(value) for value in _required_sequence(payload, "grids"))
     }
+    acquisitions = {
+        acquisition.acquisition_id: acquisition
+        for acquisition in (
+            _acquisition_from_completed_dict(value)
+            for value in _required_sequence(payload, "acquisitions")
+        )
+    }
+    for index in indexes:
+        _assert_dataset_routing(index.samples, routes, grids, acquisitions)
     verified = 0
-    for value in _required_sequence(payload, "acquisitions"):
-        acquisition = _acquisition_from_completed_dict(value)
+    for acquisition in acquisitions.values():
         grid = grids.get(acquisition.grid_id)
         if grid is None or not _verify_chunk_directory(root, acquisition, grid):
             raise ChunkCacheIntegrityError(f"invalid chunk: {acquisition.acquisition_id}")
@@ -1479,8 +1534,12 @@ def _assert_dataset_routing(
         used.extend(getattr(routes[pair_id], source_attr) for pair_id in sample.observation_pair_ids)
         if getattr(query, target_attr) in used:
             raise ChunkCacheIntegrityError(f"cached target leakage detected: {sample.sample_id}")
-        route_ids = [getattr(routes[pair_id], attribute) for pair_id in required for attribute in ("optical_acquisition_id", "sar_acquisition_id")]
-        missing = [acquisition_id for acquisition_id in route_ids if acquisition_id not in acquisitions]
+        required_acquisitions = {*used, getattr(query, target_attr)}
+        missing = sorted(
+            acquisition_id
+            for acquisition_id in required_acquisitions
+            if acquisition_id not in acquisitions
+        )
         if missing:
             raise ChunkCacheIntegrityError(f"cached acquisition metadata is missing: {missing[0]}")
 
@@ -1557,6 +1616,82 @@ def _required_int(values: Mapping[str, object], key: str) -> int:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError) as error:
         raise ValueError(f"expected integer at {key}") from error
+
+
+def _optional_positive_int(values: Mapping[str, object], key: str) -> int | None:
+    if key not in values:
+        return None
+    value = values[key]
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"data.{key} must be a positive integer when supplied")
+    return value
+
+
+def _explicit_index_paths(
+    data: Mapping[str, object], *, base: Path
+) -> dict[Direction, dict[str, Path]] | None:
+    has_train = "train_index" in data
+    has_validation = "validation_index" in data
+    if not has_train and not has_validation:
+        return None
+    if has_train != has_validation:
+        raise ValueError(
+            "data.train_index and data.validation_index must be supplied together for explicit routing"
+        )
+    return {
+        direction: {
+            "train": _configured_direction_path(
+                data["train_index"], "train_index", direction, base=base
+            ),
+            "validation": _configured_direction_path(
+                data["validation_index"], "validation_index", direction, base=base
+            ),
+        }
+        for direction in ALL_DIRECTIONS
+    }
+
+
+def _configured_direction_path(
+    value: object, key: str, direction: Direction, *, base: Path
+) -> Path:
+    selected = value
+    if isinstance(value, Mapping):
+        if direction not in value:
+            raise ValueError(f"data.{key} has no entry for direction={direction}")
+        selected = value[direction]
+    if not isinstance(selected, (str, Path)):
+        raise TypeError(f"data.{key} must be a path string/template or a direction-to-path mapping")
+    rendered = os.fspath(selected)
+    if "{" in rendered or "}" in rendered:
+        remainder = rendered.replace("{direction}", "")
+        if rendered.count("{direction}") != 1 or "{" in remainder or "}" in remainder:
+            raise ValueError(f"data.{key} only supports the {{direction}} path template")
+        rendered = rendered.replace("{direction}", direction)
+    return _absolute_lexical_path(rendered, base=base)
+
+
+def _validate_explicit_index(
+    index: PairedTemporalIndex,
+    *,
+    index_path: Path,
+    direction: Direction,
+    split: str,
+    label: str,
+) -> None:
+    if not index:
+        raise ValueError(f"explicit {label} paired temporal index is empty: {index_path}")
+    if index.config.direction != direction:
+        raise ValueError(
+            f"explicit {label} paired temporal index direction is {index.config.direction}, "
+            f"expected {direction}"
+        )
+    if index.config.split != split:
+        raise ValueError(
+            f"explicit {label} paired temporal index split is {index.config.split!r}, "
+            f"expected {split!r}"
+        )
+    if any(sample.split != split for sample in index):
+        raise ValueError(f"explicit {label} paired temporal index has a mismatched split: {index_path}")
 
 
 def _absolute_lexical_path(value: str | Path, *, base: Path | None = None) -> Path:
