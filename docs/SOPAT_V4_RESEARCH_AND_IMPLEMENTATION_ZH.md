@@ -269,9 +269,15 @@ tmux new-session -d -s sopat-v4-full \
   'cd /data/code/sentinel_translat/v3.2 && bash scripts/launch_sopat_v4_full_chunk_8gpu.sh'
 ```
 
-开始任何数据写入前，启动器读取 `FEASIBILITY_REPORT`（默认第二轮 feasibility 目录）的
-`.validation.selection.eligible`，值不是布尔 `true` 就直接退出；不会构建 cache 或启动
-`torchrun`。通过后，它在 `/data/datasets/sopat_v4_2017_2024` 发布：
+开始任何数据写入前，启动器 fail-closed 读取 `FEASIBILITY_REPORT`（默认第二轮
+feasibility 目录）。它要求 `.validation.selection` 的 `eligible=true`、
+`phase="feasibility"`、空 `failures` 和有限 `score`，并要求
+`.validation.selection_policy.version="sopat_v4_quality_gate_v2"`。其中序列化的
+`effective` policy 至少必须保持双方向 feasibility scene-improved fraction `>=0.50`、
+source-shuffle structural degradation `>=0.01`、optical 相对 anchor 的 SAM/NDVI 不回归且
+Edge F1 不回归、SAR absolute bias `<=0.5 dB`、SAR Edge F1 regression cap `-0.02`。更严格的
+policy 可以通过，旧式仅有 `eligible=true` 或任一较弱/缺失字段的报告会在 cache 构建和
+`torchrun` 前直接退出。通过后，它在 `/data/datasets/sopat_v4_2017_2024` 发布：
 
 - `index.jsonl` 与 `paired_indexes/{direction}/{split}.jsonl`，二者逐 sample projection
   完全相等，并由 `index_publication.json` 的内容 hash 绑定；

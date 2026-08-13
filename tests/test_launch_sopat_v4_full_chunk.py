@@ -5,6 +5,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 ROOT = Path(__file__).parents[1]
@@ -18,10 +19,50 @@ def _write(path: Path, content: str) -> Path:
     return path
 
 
-def _report(path: Path, *, eligible: bool) -> Path:
+POLICY_VERSION = "sopat_v4_quality_gate_v2"
+_VALID_EFFECTIVE_POLICY: dict[str, object] = {
+    "phase": "feasibility",
+    "feasibility_scene_improved_fraction_min": 0.50,
+    "feasibility_source_shuffle_min_degradation": 0.01,
+    "optical_sam_anchor_delta_max": 0.0,
+    "optical_ndvi_mae_anchor_delta_max": 0.0,
+    "optical_edge_f1_anchor_delta_min": 0.0,
+    "full_sar_db_bias_abs_max": 0.5,
+    "sar_edge_f1_anchor_delta_min": -0.02,
+}
+
+
+def _report(
+    path: Path,
+    *,
+    eligible: bool,
+    phase: str = "feasibility",
+    failures: list[str] | None = None,
+    score: float = 1.0,
+    include_policy: bool = True,
+    policy_version: str = POLICY_VERSION,
+    effective_policy: dict[str, object] | None = None,
+) -> Path:
+    validation: dict[str, object] = {
+        "selection": {
+            "eligible": eligible,
+            "phase": phase,
+            "failures": [] if failures is None else failures,
+            "score": score,
+        }
+    }
+    if include_policy:
+        validation["selection_policy"] = {
+            "version": policy_version,
+            "effective": (
+                dict(_VALID_EFFECTIVE_POLICY)
+                if effective_policy is None
+                else effective_policy
+            ),
+        }
     return _write(
         path,
-        json.dumps({"validation": {"selection": {"eligible": eligible}}}),
+        json.dumps({"validation": validation}),
     )
 
 
@@ -42,11 +83,17 @@ def _stub_command(directory: Path, name: str, log: Path, *, body: str = "") -> P
     ).chmod(0o755) or directory / name
 
 
-def _environment(tmp_path: Path, *, eligible: bool, world_size: int = 8) -> dict[str, str]:
+def _environment(
+    tmp_path: Path,
+    *,
+    eligible: bool,
+    world_size: int = 8,
+    report_options: dict[str, object] | None = None,
+) -> dict[str, str]:
     stubs = tmp_path / "stubs"
     log = tmp_path / "commands.log"
     _stub_command(stubs, "nvidia-smi", log, body="printf '0\\n'")
-    report = _report(tmp_path / "report.json", eligible=eligible)
+    report = _report(tmp_path / "report.json", eligible=eligible, **(report_options or {}))
     full = _full_config(tmp_path / "full.yaml", world_size=world_size)
     for name in ("index.yaml", "cache.yaml", "v3.pt"):
         _write(tmp_path / name, "placeholder\n")
@@ -68,8 +115,19 @@ def _environment(tmp_path: Path, *, eligible: bool, world_size: int = 8) -> dict
     }
 
 
-def _run(tmp_path: Path, *, eligible: bool, world_size: int = 8) -> subprocess.CompletedProcess[str]:
-    environment = _environment(tmp_path, eligible=eligible, world_size=world_size)
+def _run(
+    tmp_path: Path,
+    *,
+    eligible: bool,
+    world_size: int = 8,
+    report_options: dict[str, object] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    environment = _environment(
+        tmp_path,
+        eligible=eligible,
+        world_size=world_size,
+        report_options=report_options,
+    )
     return subprocess.run(
         ["bash", str(LAUNCHER)],
         cwd=ROOT,
@@ -85,6 +143,86 @@ def test_false_feasibility_gate_executes_no_subsequent_commands(tmp_path: Path) 
 
     assert result.returncode != 0
     assert "feasibility gate is not eligible" in result.stderr
+    assert not (tmp_path / "commands.log").exists()
+    assert not (tmp_path / "data").exists()
+
+
+def test_legacy_eligible_report_fails_closed_before_gpu_or_cache_work(tmp_path: Path) -> None:
+    result = _run(tmp_path, eligible=True, report_options={"include_policy": False})
+
+    assert result.returncode != 0
+    assert "validation.selection_policy must be an object" in result.stderr
+    assert not (tmp_path / "commands.log").exists()
+    assert not (tmp_path / "data").exists()
+
+
+def test_policy_missing_a_required_threshold_fails_closed_before_gpu_or_cache_work(
+    tmp_path: Path,
+) -> None:
+    effective_policy = dict(_VALID_EFFECTIVE_POLICY)
+    del effective_policy["sar_edge_f1_anchor_delta_min"]
+
+    result = _run(
+        tmp_path,
+        eligible=True,
+        report_options={"effective_policy": effective_policy},
+    )
+
+    assert result.returncode != 0
+    assert "sar_edge_f1_anchor_delta_min must be a finite number" in result.stderr
+    assert not (tmp_path / "commands.log").exists()
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.mark.parametrize(
+    ("field", "weaker_value"),
+    [
+        ("feasibility_scene_improved_fraction_min", 0.49),
+        ("feasibility_source_shuffle_min_degradation", 0.009),
+        ("optical_sam_anchor_delta_max", 0.001),
+        ("optical_ndvi_mae_anchor_delta_max", 0.001),
+        ("optical_edge_f1_anchor_delta_min", -0.001),
+        ("full_sar_db_bias_abs_max", 0.501),
+        ("sar_edge_f1_anchor_delta_min", -0.021),
+    ],
+)
+def test_weaker_effective_policy_fails_closed_before_gpu_or_cache_work(
+    tmp_path: Path, field: str, weaker_value: float
+) -> None:
+    effective_policy = dict(_VALID_EFFECTIVE_POLICY)
+    effective_policy[field] = weaker_value
+
+    result = _run(
+        tmp_path,
+        eligible=True,
+        report_options={"effective_policy": effective_policy},
+    )
+
+    assert result.returncode != 0
+    assert field in result.stderr
+    assert not (tmp_path / "commands.log").exists()
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.mark.parametrize(
+    ("report_options", "expected_error"),
+    [
+        ({"phase": "full"}, "validation.selection.phase must be feasibility"),
+        ({"failures": ["source_shuffle_gate"]}, "validation.selection.failures"),
+        ({"score": float("nan")}, "validation.selection.score must be a finite number"),
+        (
+            {"policy_version": "sopat_v4_quality_gate_v1"},
+            "validation.selection_policy.version must be 'sopat_v4_quality_gate_v2'",
+        ),
+    ],
+)
+def test_incomplete_or_unversioned_feasibility_decision_fails_closed(
+    tmp_path: Path, report_options: dict[str, object], expected_error: str
+) -> None:
+    result = _run(tmp_path, eligible=True, report_options=report_options)
+
+    assert result.returncode != 0
+    assert expected_error in result.stderr
     assert not (tmp_path / "commands.log").exists()
     assert not (tmp_path / "data").exists()
 

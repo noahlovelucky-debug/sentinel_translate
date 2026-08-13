@@ -43,6 +43,7 @@ VariantName = Literal[
     "source_null",
 ]
 SelectionPhase = Literal["feasibility", "full"]
+SELECTION_POLICY_VERSION = "sopat_v4_quality_gate_v2"
 
 VARIANT_NAMES: frozenset[str] = frozenset(
     {
@@ -189,9 +190,14 @@ class SOPATSelectionConfig:
     full_optical_sam_deg_max: float = 5.716
     full_sar_db_rmse_max: float = 5.0
     full_sar_db_bias_abs_max: float = 0.5
+    feasibility_scene_improved_fraction_min: float = 0.50
     full_scene_improved_fraction_min: float = 0.70
     feasibility_source_shuffle_min_degradation: float = 0.01
     full_source_shuffle_min_degradation: float = 0.02
+    optical_sam_anchor_delta_max: float = 0.0
+    optical_ndvi_mae_anchor_delta_max: float = 0.0
+    optical_edge_f1_anchor_delta_min: float = 0.0
+    sar_edge_f1_anchor_delta_min: float = -0.02
 
     def __post_init__(self) -> None:
         if self.phase not in {"feasibility", "full"}:
@@ -221,12 +227,21 @@ class SOPATSelectionConfig:
             self.full_optical_sam_deg_max,
             self.full_sar_db_rmse_max,
             self.full_sar_db_bias_abs_max,
+            self.feasibility_scene_improved_fraction_min,
             self.full_scene_improved_fraction_min,
             self.feasibility_source_shuffle_min_degradation,
             self.full_source_shuffle_min_degradation,
         )
         if any(not math.isfinite(value) or value < 0.0 for value in thresholds):
             raise ValueError("SOPAT full selection thresholds must be finite and non-negative")
+        signed_thresholds = (
+            self.optical_sam_anchor_delta_max,
+            self.optical_ndvi_mae_anchor_delta_max,
+            self.optical_edge_f1_anchor_delta_min,
+            self.sar_edge_f1_anchor_delta_min,
+        )
+        if any(not math.isfinite(value) for value in signed_thresholds):
+            raise ValueError("SOPAT anchor-relative thresholds must be finite")
 
 
 @dataclass(frozen=True)
@@ -269,8 +284,10 @@ class _MetricAccumulator:
         self.anchor_structural_squared_error = 0.0
         self.structural_pixels = 0.0
         self.sam_sum = 0.0
+        self.anchor_sam_sum = 0.0
         self.sam_pixels = 0.0
         self.ndvi_absolute_error = 0.0
+        self.anchor_ndvi_absolute_error = 0.0
         self.ndvi_error_sum = 0.0
         self.ndvi_pixels = 0.0
         self.sar_squared_error = 0.0
@@ -288,6 +305,9 @@ class _MetricAccumulator:
         self.edge_true_positive = 0.0
         self.edge_false_positive = 0.0
         self.edge_false_negative = 0.0
+        self.anchor_edge_true_positive = 0.0
+        self.anchor_edge_false_positive = 0.0
+        self.anchor_edge_false_negative = 0.0
         self.psd_log_l1_sum = 0.0
         self.psd_samples = 0
         self.scene_improved = 0
@@ -349,17 +369,20 @@ class _MetricAccumulator:
         anchor_scene = _scene_rmse(anchor, target, valid)
         self.scene_improved += int(prediction_scene < anchor_scene)
         self.scene_total += 1
-        self._add_edge_and_spectrum(prediction, target, valid)
+        self._add_edge_and_spectrum(prediction, target, anchor, valid)
         if pre_projection_violation is not None:
             self.pre_projection_sum += float(pre_projection_violation)
             self.pre_projection_samples += 1
         if self.direction == "sar_to_optical":
-            self._add_optical(prediction, target, valid)
+            self._add_optical(prediction, target, anchor, valid)
         else:
             self._add_sar(prediction, target, anchor, valid)
 
-    def _add_edge_and_spectrum(self, prediction: Tensor, target: Tensor, valid: Tensor) -> None:
+    def _add_edge_and_spectrum(
+        self, prediction: Tensor, target: Tensor, anchor: Tensor, valid: Tensor
+    ) -> None:
         edge_prediction = _edge_mask(prediction)
+        edge_anchor = _edge_mask(anchor)
         edge_target = _edge_mask(target)
         edge_valid = _interior_valid(valid).to(torch.bool)
         true_positive = edge_prediction & edge_target & edge_valid
@@ -368,10 +391,21 @@ class _MetricAccumulator:
         self.edge_true_positive += float(true_positive.sum().detach().cpu())
         self.edge_false_positive += float(false_positive.sum().detach().cpu())
         self.edge_false_negative += float(false_negative.sum().detach().cpu())
+        self.anchor_edge_true_positive += float(
+            (edge_anchor & edge_target & edge_valid).sum().detach().cpu()
+        )
+        self.anchor_edge_false_positive += float(
+            (edge_anchor & ~edge_target & edge_valid).sum().detach().cpu()
+        )
+        self.anchor_edge_false_negative += float(
+            (~edge_anchor & edge_target & edge_valid).sum().detach().cpu()
+        )
         self.psd_log_l1_sum += float(_psd_log_l1(prediction, target, valid).detach().cpu())
         self.psd_samples += 1
 
-    def _add_optical(self, prediction: Tensor, target: Tensor, valid: Tensor) -> None:
+    def _add_optical(
+        self, prediction: Tensor, target: Tensor, anchor: Tensor, valid: Tensor
+    ) -> None:
         if prediction.shape[1] < 7:
             raise ValueError("SAR-to-optical evaluation requires canonical optical channels")
         valid_pixels = valid[:, 0].to(prediction)
@@ -379,19 +413,31 @@ class _MetricAccumulator:
             prediction.square().sum(dim=1).sqrt() * target.square().sum(dim=1).sqrt()
         ).clamp_min(1e-6)
         angles = torch.acos(cosine.clamp(-1.0, 1.0)) * (180.0 / math.pi)
+        anchor_cosine = (anchor * target).sum(dim=1) / (
+            anchor.square().sum(dim=1).sqrt() * target.square().sum(dim=1).sqrt()
+        ).clamp_min(1e-6)
+        anchor_angles = torch.acos(anchor_cosine.clamp(-1.0, 1.0)) * (180.0 / math.pi)
         pixels = float(valid_pixels.sum().detach().cpu())
         self.sam_sum += float((angles * valid_pixels).sum().detach().cpu())
+        self.anchor_sam_sum += float((anchor_angles * valid_pixels).sum().detach().cpu())
         self.sam_pixels += pixels
         predicted_reflectance = (prediction + 1.0) * 0.5
         target_reflectance = (target + 1.0) * 0.5
+        anchor_reflectance = (anchor + 1.0) * 0.5
         predicted_ndvi = (
             predicted_reflectance[:, 6] - predicted_reflectance[:, 2]
         ) / (predicted_reflectance[:, 6] + predicted_reflectance[:, 2] + 1e-4)
         target_ndvi = (target_reflectance[:, 6] - target_reflectance[:, 2]) / (
             target_reflectance[:, 6] + target_reflectance[:, 2] + 1e-4
         )
+        anchor_ndvi = (anchor_reflectance[:, 6] - anchor_reflectance[:, 2]) / (
+            anchor_reflectance[:, 6] + anchor_reflectance[:, 2] + 1e-4
+        )
         ndvi_error = predicted_ndvi - target_ndvi
         self.ndvi_absolute_error += float((ndvi_error.abs() * valid_pixels).sum().detach().cpu())
+        self.anchor_ndvi_absolute_error += float(
+            ((anchor_ndvi - target_ndvi).abs() * valid_pixels).sum().detach().cpu()
+        )
         self.ndvi_error_sum += float((ndvi_error * valid_pixels).sum().detach().cpu())
         self.ndvi_pixels += pixels
 
@@ -459,6 +505,11 @@ class _MetricAccumulator:
                 self.edge_false_positive,
                 self.edge_false_negative,
             ),
+            "anchor_edge_f1": _edge_f1(
+                self.anchor_edge_true_positive,
+                self.anchor_edge_false_positive,
+                self.anchor_edge_false_negative,
+            ),
             "psd_log_l1": self.psd_log_l1_sum / max(self.psd_samples, 1),
             "scene_improved_fraction": self.scene_improved / self.scene_total
             if self.scene_total
@@ -468,7 +519,10 @@ class _MetricAccumulator:
             result.update(
                 {
                     "sam_deg": self.sam_sum / max(self.sam_pixels, 1.0),
+                    "anchor_sam_deg": self.anchor_sam_sum / max(self.sam_pixels, 1.0),
                     "ndvi_mae": self.ndvi_absolute_error / max(self.ndvi_pixels, 1.0),
+                    "anchor_ndvi_mae": self.anchor_ndvi_absolute_error
+                    / max(self.ndvi_pixels, 1.0),
                     "ndvi_bias": self.ndvi_error_sum / max(self.ndvi_pixels, 1.0),
                 }
             )
@@ -915,11 +969,20 @@ def _empty_report(direction: Direction) -> dict[str, float | int | None]:
         "anchor_structural_rmse": None,
         "pre_projection_violation": None,
         "edge_f1": None,
+        "anchor_edge_f1": None,
         "psd_log_l1": None,
         "scene_improved_fraction": None,
     }
     if direction == "sar_to_optical":
-        result.update({"sam_deg": None, "ndvi_mae": None, "ndvi_bias": None})
+        result.update(
+            {
+                "sam_deg": None,
+                "anchor_sam_deg": None,
+                "ndvi_mae": None,
+                "anchor_ndvi_mae": None,
+                "ndvi_bias": None,
+            }
+        )
     else:
         result.update(
             {
@@ -1281,22 +1344,49 @@ def _full_direction_gates(
     config: SOPATSelectionConfig,
     failures: list[str],
 ) -> None:
-    if config.phase != "full":
-        return
+    scene_minimum = (
+        config.full_scene_improved_fraction_min
+        if config.phase == "full"
+        else config.feasibility_scene_improved_fraction_min
+    )
     if direction == "sar_to_optical":
         rmse = _metric_float(metrics, "rmse")
         sam = _metric_float(metrics, "sam_deg")
-        if rmse is None or rmse > config.full_optical_rmse_max:
-            failures.append(f"optical_rmse_gate:{rmse}")
-        if sam is None or sam > config.full_optical_sam_deg_max:
-            failures.append(f"optical_sam_gate:{sam}")
+        anchor_sam = _metric_float(metrics, "anchor_sam_deg")
+        ndvi = _metric_float(metrics, "ndvi_mae")
+        anchor_ndvi = _metric_float(metrics, "anchor_ndvi_mae")
+        edge = _metric_float(metrics, "edge_f1")
+        anchor_edge = _metric_float(metrics, "anchor_edge_f1")
+        if config.phase == "full":
+            if rmse is None or rmse > config.full_optical_rmse_max:
+                failures.append(f"optical_rmse_gate:{rmse}")
+            if sam is None or sam > config.full_optical_sam_deg_max:
+                failures.append(f"optical_sam_gate:{sam}")
+        if sam is None or anchor_sam is None or (
+            sam - anchor_sam > config.optical_sam_anchor_delta_max
+        ):
+            failures.append(f"optical_sam_anchor_gate:{sam}:{anchor_sam}")
+        if ndvi is None or anchor_ndvi is None or (
+            ndvi - anchor_ndvi > config.optical_ndvi_mae_anchor_delta_max
+        ):
+            failures.append(f"optical_ndvi_anchor_gate:{ndvi}:{anchor_ndvi}")
+        if edge is None or anchor_edge is None or (
+            edge - anchor_edge < config.optical_edge_f1_anchor_delta_min
+        ):
+            failures.append(f"optical_edge_anchor_gate:{edge}:{anchor_edge}")
     else:
         rmse = _metric_float(metrics, "sar_db_rmse")
         bias = _metric_float(metrics, "sar_db_bias")
-        if rmse is None or rmse > config.full_sar_db_rmse_max:
+        edge = _metric_float(metrics, "edge_f1")
+        anchor_edge = _metric_float(metrics, "anchor_edge_f1")
+        if config.phase == "full" and (rmse is None or rmse > config.full_sar_db_rmse_max):
             failures.append(f"sar_rmse_gate:{rmse}")
         if bias is None or abs(bias) > config.full_sar_db_bias_abs_max:
             failures.append(f"sar_bias_gate:{bias}")
+        if edge is None or anchor_edge is None or (
+            edge - anchor_edge < config.sar_edge_f1_anchor_delta_min
+        ):
+            failures.append(f"sar_edge_anchor_gate:{edge}:{anchor_edge}")
     fraction = _metric_float(metrics, "scene_improved_fraction")
-    if fraction is None or fraction < config.full_scene_improved_fraction_min:
+    if fraction is None or fraction < scene_minimum:
         failures.append(f"scene_improvement_gate:{direction}:{fraction}")

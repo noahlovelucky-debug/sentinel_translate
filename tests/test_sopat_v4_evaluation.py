@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from sentinel_v4.evaluation import (
@@ -88,12 +89,19 @@ def _selection_report(
         "rmse": optical_rmse,
         "anchor_rmse": 1.0,
         "sam_deg": 1.0,
+        "anchor_sam_deg": 1.1,
+        "ndvi_mae": 0.1,
+        "anchor_ndvi_mae": 0.2,
+        "edge_f1": 0.8,
+        "anchor_edge_f1": 0.7,
         "scene_improved_fraction": 1.0,
     }
     sar: dict[str, float] = {
         "sar_db_rmse": sar_rmse,
         "sar_db_anchor_rmse": 10.0,
         "sar_db_bias": 0.0,
+        "edge_f1": 0.8,
+        "anchor_edge_f1": 0.81,
         "scene_improved_fraction": 1.0,
     }
     if optical_structural is not None:
@@ -292,6 +300,44 @@ def test_source_shuffle_gate_fails_closed_when_structural_metric_is_missing() ->
         "missing_source_shuffle_structural_metrics:sar_to_optical" in item
         for item in result.failures
     )
+
+
+@pytest.mark.parametrize(
+    ("direction", "field", "value", "failure"),
+    [
+        ("sar_to_optical", "scene_improved_fraction", 0.49, "scene_improvement_gate"),
+        ("sar_to_optical", "sam_deg", 1.11, "optical_sam_anchor_gate"),
+        ("sar_to_optical", "ndvi_mae", 0.21, "optical_ndvi_anchor_gate"),
+        ("sar_to_optical", "edge_f1", 0.69, "optical_edge_anchor_gate"),
+        ("optical_to_sar", "sar_db_bias", 0.51, "sar_bias_gate"),
+        ("optical_to_sar", "edge_f1", 0.78, "sar_edge_anchor_gate"),
+    ],
+)
+def test_feasibility_quality_gates_fail_closed(
+    direction: str, field: str, value: float, failure: str
+) -> None:
+    candidate = _selection_report(optical_structural=0.1, sar_structural=0.2)
+    directional = candidate["directions"][direction]  # type: ignore[index]
+    directional["all"]["all"][field] = value
+    shuffle = _selection_report(
+        optical_structural=0.102,
+        sar_structural=0.205,
+        variant="source_shuffle",
+    )
+    result = select_sopat_candidate(
+        candidate,
+        SOPATSelectionConfig(
+            phase="feasibility",
+            required_tasks=("translation",),
+            required_observation_counts=("one",),
+            feasibility_overall_anchor_ratio=2.0,
+            feasibility_bucket_anchor_ratio=2.0,
+        ),
+        source_shuffle_report=shuffle,
+    )
+
+    assert not result.eligible
+    assert any(failure in item for item in result.failures)
 
 
 def test_full_sar_gate_still_uses_sar_db_rmse_not_structural_rmse() -> None:

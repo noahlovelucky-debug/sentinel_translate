@@ -102,6 +102,7 @@ class SOPATTrainConfig:
     source_shuffle_probability: float = 0.5
     source_shuffle_margin: float = 0.005
     counterfactual_confidence_weight: float = 0.10
+    counterfactual_confidence_margin: float = 0.10
     structural_pool_kernel: int = 5
     autocast_bfloat16: bool = True
 
@@ -146,6 +147,7 @@ class SOPATTrainConfig:
             "source_shuffle_weight",
             "source_shuffle_margin",
             "counterfactual_confidence_weight",
+            "counterfactual_confidence_margin",
         )
         if any(float(getattr(self, name)) < 0.0 for name in nonnegative):
             raise ValueError("SOPAT loss weights and margins must be non-negative")
@@ -1050,9 +1052,9 @@ def physical_objective(
                 correct_error - wrong_error + config.source_shuffle_margin
             ).mean()
             # A shuffled history is a deliberately wrong causal source.  Its
-            # transport route must close rather than merely compete on a
-            # target-labelled ranking loss.  This target is intentionally
-            # source-counterfactual only: it never reads the query label.
+            # confidence must be lower than the matched route by a margin.
+            # This relative constraint cannot be satisfied by collapsing both
+            # routes to zero and never reads the query label.
             wrong_confidence_shape = (wrong_physical.shape[0], 1, *wrong_physical.shape[-2:])
             wrong_transport_confidence_logits = output_tensor(
                 wrong_output, "transport_confidence_logits", required=False
@@ -1081,7 +1083,14 @@ def physical_objective(
                 raise ValueError(
                     "SOPAT source-shuffle transport_evidence must have shape Bx1xHxW"
                 )
-            if wrong_transport_confidence_logits is not None or wrong_transport_confidence is not None:
+            matched_has_confidence = (
+                transport_confidence_logits is not None or transport_confidence is not None
+            )
+            wrong_has_confidence = (
+                wrong_transport_confidence_logits is not None
+                or wrong_transport_confidence is not None
+            )
+            if matched_has_confidence and wrong_has_confidence:
                 if wrong_transport_evidence is None:
                     # Pre-evidence V4 checkpoints and compact probability-only
                     # toys have no explicit evidence map.  Their counterfactual
@@ -1099,25 +1108,33 @@ def physical_objective(
                 counterfactual_valid = (
                     valid
                     * recipient_source_anchor_valid.to(valid)
+                    * (transport_evidence > 0.0).to(valid)
                     * (wrong_transport_evidence > 0.0).to(valid)
                 )
-                # BCE and logits stay FP32 regardless of the enclosing BF16
-                # autocast context.  The native renderer exposes logits; the
-                # probability branch exists only for old focused-test models.
+                # Keep the comparison in FP32 regardless of the enclosing
+                # BF16 autocast context. Native SOPAT exposes logits; the
+                # probability branches retain old focused-test compatibility.
                 with torch.autocast(device_type=physical.device.type, enabled=False):
+                    if transport_confidence_logits is not None:
+                        matched_probability = torch.sigmoid(
+                            transport_confidence_logits.float()
+                        )
+                    else:
+                        matched_probability = transport_confidence.float().clamp(0.0, 1.0)
                     if wrong_transport_confidence_logits is not None:
-                        counterfactual_confidence_map = F.binary_cross_entropy_with_logits(
-                            wrong_transport_confidence_logits.float(),
-                            torch.zeros_like(wrong_transport_confidence_logits.float()),
-                            reduction="none",
+                        wrong_probability = torch.sigmoid(
+                            wrong_transport_confidence_logits.float()
                         )
                     else:
                         assert wrong_transport_confidence is not None
-                        counterfactual_confidence_map = F.binary_cross_entropy(
-                            wrong_transport_confidence.float().clamp(1e-5, 1.0 - 1e-5),
-                            torch.zeros_like(wrong_transport_confidence.float()),
-                            reduction="none",
+                        wrong_probability = wrong_transport_confidence.float().clamp(
+                            0.0, 1.0
                         )
+                    counterfactual_confidence_map = torch.relu(
+                        wrong_probability
+                        - matched_probability
+                        + float(config.counterfactual_confidence_margin)
+                    )
                     counterfactual_confidence = _masked_single_channel_mean(
                         counterfactual_confidence_map, counterfactual_valid
                     )
@@ -1655,6 +1672,7 @@ def initialize_from_sopat_checkpoint(
     *,
     model_config: Mapping[str, object] | object,
     protocol_hashes: Mapping[str, Mapping[str, str]],
+    use_ema: bool = False,
 ) -> dict[str, object]:
     """Initialize model weights from a compatible V4 stage without optimizer state.
 
@@ -1689,9 +1707,18 @@ def initialize_from_sopat_checkpoint(
         raise RuntimeError("SOPAT initialization checkpoint model configuration differs")
     if payload.get("protocol_hashes") != _normalize_protocol_hashes(protocol_hashes):
         raise RuntimeError("SOPAT initialization checkpoint protocol hashes differ")
-    state = payload.get("model")
+    state: object
+    weight_source = "model"
+    if use_ema:
+        ema_payload = payload.get("ema")
+        if not isinstance(ema_payload, Mapping):
+            raise RuntimeError("SOPAT EMA initialization checkpoint has no EMA state")
+        state = ema_payload.get("state")
+        weight_source = "ema"
+    else:
+        state = payload.get("model")
     if not isinstance(state, Mapping):
-        raise TypeError("SOPAT initialization checkpoint has no model state")
+        raise TypeError(f"SOPAT initialization checkpoint has no {weight_source} state")
     incompatible = _unwrap_sopat_model(model).load_state_dict(state, strict=False)
     # V4.1 adds only the conservative evidence gates.  Missing these tensors
     # is a valid initialization path: their constructor bias keeps the model
@@ -1714,6 +1741,7 @@ def initialize_from_sopat_checkpoint(
         "source": str(path),
         "source_global_step": int(payload.get("global_step", 0)),
         "source_train_stage": _checkpoint_stage(payload),
+        "initialized_weight_source": weight_source,
         "initialized_missing_keys": sorted(missing),
     }
 

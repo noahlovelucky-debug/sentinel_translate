@@ -13,7 +13,7 @@ import math
 import os
 import random
 from collections.abc import Mapping, Sequence
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import Any
@@ -42,6 +42,7 @@ from sentinel_v4.data import (
     write_sopat_v4_index,
 )
 from sentinel_v4.evaluation import (
+    SELECTION_POLICY_VERSION,
     NoSingletonBatchSampler,
     SOPATSelectionConfig,
     SOPATSelectionDecision,
@@ -134,10 +135,17 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--init-checkpoint", type=Path)
+    parser.add_argument(
+        "--init-use-ema",
+        action="store_true",
+        help="initialize model weights from the checkpoint EMA instead of raw model weights",
+    )
     parser.add_argument("--init-v3", type=Path)
     parser.add_argument("--max-steps", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--num-workers", type=int)
+    parser.add_argument("--learning-rate", type=float)
+    parser.add_argument("--encoder-learning-rate", type=float)
     parser.add_argument("--seed", type=int, default=42)
     return parser
 
@@ -804,6 +812,10 @@ def _evaluate_validation(
         "anchor_copy": anchor,
         "source_shuffle": shuffle,
         "selection": decision.to_dict(),
+        "selection_policy": {
+            "version": SELECTION_POLICY_VERSION,
+            "effective": asdict(selection),
+        },
         "external_baselines": {
             "note": "V2/V3 external checkpoints require an explicit input-matched adapter; "
             "they are not fabricated by this runner."
@@ -853,6 +865,8 @@ def main() -> None:
     initializers = sum(value is not None for value in (args.resume, args.init_checkpoint, args.init_v3))
     if initializers > 1:
         raise SystemExit("use only one of --resume, --init-checkpoint, or --init-v3")
+    if args.init_use_ema and args.init_checkpoint is None:
+        raise SystemExit("--init-use-ema requires --init-checkpoint")
     rank, local_rank, world_size, device = _distributed()
     del local_rank
     try:
@@ -901,6 +915,19 @@ def main() -> None:
         coupled = CoupledDirectionLoader(train_loaders)  # type: ignore[arg-type]
         model_config = _model_config(config)
         train_config = _train_config(config, stage=args.stage)
+        learning_rate = (
+            train_config.learning_rate if args.learning_rate is None else args.learning_rate
+        )
+        encoder_learning_rate = (
+            train_config.encoder_learning_rate
+            if args.encoder_learning_rate is None
+            else args.encoder_learning_rate
+        )
+        train_config = replace(
+            train_config,
+            learning_rate=learning_rate,
+            encoder_learning_rate=encoder_learning_rate,
+        )
         model = SOPAT(model_config)
         initialization: dict[str, object] | None = None
         if args.init_checkpoint is not None:
@@ -909,6 +936,7 @@ def main() -> None:
                 args.init_checkpoint,
                 model_config=asdict(model_config),
                 protocol_hashes=prepared.protocol_hashes,
+                use_ema=args.init_use_ema,
             )
         elif args.init_v3 is not None:
             initialization = initialize_from_v3_checkpoint(model, args.init_v3)

@@ -71,6 +71,31 @@ def test_full_chunk_configuration_loads_with_eight_rank_contract(runner_module) 
     assert model.architecture == "sopat_v4"
     assert physical.source_shuffle_weight == 0.25
     assert physical.structural_pool_kernel == 5
+    assert physical.counterfactual_confidence_margin == pytest.approx(0.10)
+
+
+def test_calibration_cli_exposes_ema_and_learning_rate_overrides(runner_module) -> None:
+    parsed = runner_module._parser().parse_args(
+        [
+            "--config",
+            "config.yaml",
+            "--stage",
+            "physical",
+            "--output",
+            "output",
+            "--init-checkpoint",
+            "quality.pt",
+            "--init-use-ema",
+            "--learning-rate",
+            "1e-5",
+            "--encoder-learning-rate",
+            "2e-7",
+        ]
+    )
+
+    assert parsed.init_use_ema is True
+    assert parsed.learning_rate == pytest.approx(1.0e-5)
+    assert parsed.encoder_learning_rate == pytest.approx(2.0e-7)
 
 
 def test_chunk_preflight_missing_cache_is_clear_and_fail_closed(tmp_path: Path, runner_module) -> None:

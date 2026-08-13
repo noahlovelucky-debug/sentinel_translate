@@ -323,9 +323,17 @@ class _GatedToyModel(nn.Module):
 class _CounterfactualConfidenceToyModel(nn.Module):
     """Emit a learnable open gate only for a shuffled source history."""
 
-    def __init__(self, *, wrong_logit: float, evidence: float = 1.0, logits: bool = True) -> None:
+    def __init__(
+        self,
+        *,
+        wrong_logit: float,
+        correct_logit: float = 2.0,
+        evidence: float = 1.0,
+        logits: bool = True,
+    ) -> None:
         super().__init__()
         self.wrong_logit = nn.Parameter(torch.tensor(wrong_logit))
+        self.correct_logit = nn.Parameter(torch.tensor(correct_logit))
         self.evidence = float(evidence)
         self.logits = bool(logits)
 
@@ -342,7 +350,7 @@ class _CounterfactualConfidenceToyModel(nn.Module):
         matches_recipient = (observations[:, 0] - source_anchor).abs().flatten(1).amax(dim=1) == 0.0
         wrong_mask = (~matches_recipient).to(target_anchor).view(-1, 1, 1, 1)
         confidence_logits = (
-            wrong_mask * self.wrong_logit + (1.0 - wrong_mask) * -20.0
+            wrong_mask * self.wrong_logit + (1.0 - wrong_mask) * self.correct_logit
         ) * torch.ones_like(target_anchor[:, :1])
         confidence = torch.sigmoid(confidence_logits)
         output = SimpleNamespace(
@@ -393,7 +401,7 @@ def _counterfactual_confidence_config(*, autocast_bfloat16: bool = False) -> SOP
     )
 
 
-def test_counterfactual_confidence_closes_high_wrong_logit_with_gradient() -> None:
+def test_counterfactual_confidence_ranks_correct_above_wrong_with_gradient() -> None:
     model = _CounterfactualConfidenceToyModel(wrong_logit=4.0)
     loss, metrics = sopat_direction_objective(
         model,
@@ -404,9 +412,11 @@ def test_counterfactual_confidence_closes_high_wrong_logit_with_gradient() -> No
     )
     loss.backward()
 
-    assert metrics["physical_counterfactual_confidence"].item() > 3.0
+    assert metrics["physical_counterfactual_confidence"].item() > 0.19
     assert model.wrong_logit.grad is not None
     assert model.wrong_logit.grad.item() > 0.0
+    assert model.correct_logit.grad is not None
+    assert model.correct_logit.grad.item() < 0.0
 
 
 def test_counterfactual_confidence_vanishes_for_closed_wrong_logit() -> None:
@@ -419,7 +429,7 @@ def test_counterfactual_confidence_vanishes_for_closed_wrong_logit() -> None:
         generator=torch.Generator().manual_seed(3),
     )
 
-    assert metrics["physical_counterfactual_confidence"].item() < 1.0e-7
+    assert metrics["physical_counterfactual_confidence"].item() == 0.0
 
 
 def test_counterfactual_confidence_skips_legacy_wrong_route_without_gate_fields() -> None:
@@ -521,6 +531,7 @@ def test_counterfactual_confidence_weight_is_explicit_in_all_sopat_configs(confi
     payload.pop("steps")
     config = SOPATTrainConfig.from_mapping(payload)
     assert config.counterfactual_confidence_weight == pytest.approx(0.10)
+    assert config.counterfactual_confidence_margin == pytest.approx(0.10)
 
 
 @pytest.mark.parametrize("value", (-1.0, float("inf"), float("nan")))
@@ -1012,6 +1023,85 @@ def test_factorizer_initialization_allows_only_pre_contrast_model_config(tmp_pat
     assert exact_summary["initialized_missing_keys"] == []
 
 
+def test_sopat_initialization_can_select_checkpoint_ema_weights(tmp_path) -> None:
+    config = SOPATConfig(
+        width=8,
+        hidden=32,
+        encoder_depth=1,
+        heads=4,
+        adapter_rank=8,
+        transport_heads=4,
+        anchor_window_size=2,
+    )
+    source = SOPAT(config)
+    raw_state = {name: value.detach().clone() for name, value in source.state_dict().items()}
+    ema_state = {
+        name: (value.detach().clone() + 0.25 if torch.is_floating_point(value) else value.detach().clone())
+        for name, value in raw_state.items()
+    }
+    path = tmp_path / "ema-init.pt"
+    torch.save(
+        {
+            "sopat_v4_format": 1,
+            "family": "sopat_v4",
+            "directions": ["sar_to_optical", "optical_to_sar"],
+            "model_config": asdict(config),
+            "train_config": {"stage": "physical"},
+            "protocol_hashes": _protocol(),
+            "model": raw_state,
+            "ema": {"decay": 0.999, "state": ema_state},
+        },
+        path,
+    )
+    restored = SOPAT(config)
+
+    summary = initialize_from_sopat_checkpoint(
+        restored,
+        path,
+        model_config=asdict(config),
+        protocol_hashes=_protocol(),
+        use_ema=True,
+    )
+
+    assert summary["initialized_weight_source"] == "ema"
+    for name, value in restored.state_dict().items():
+        assert torch.equal(value, ema_state[name])
+
+
+def test_sopat_ema_initialization_fails_without_complete_ema_state(tmp_path) -> None:
+    config = SOPATConfig(
+        width=8,
+        hidden=32,
+        encoder_depth=1,
+        heads=4,
+        adapter_rank=8,
+        transport_heads=4,
+        anchor_window_size=2,
+    )
+    source = SOPAT(config)
+    path = tmp_path / "missing-ema.pt"
+    torch.save(
+        {
+            "sopat_v4_format": 1,
+            "family": "sopat_v4",
+            "directions": ["sar_to_optical", "optical_to_sar"],
+            "model_config": asdict(config),
+            "train_config": {"stage": "physical"},
+            "protocol_hashes": _protocol(),
+            "model": source.state_dict(),
+        },
+        path,
+    )
+    with pytest.raises(RuntimeError, match="no EMA state"):
+        initialize_from_sopat_checkpoint(
+            SOPAT(config),
+            path,
+            model_config=asdict(config),
+            protocol_hashes=_protocol(),
+            use_ema=True,
+        )
+
+
 def test_evaluation_is_stratified_and_has_both_direction_schemas() -> None:
     optical = _batch(2, 10, batch_size=2, observations=2, changed=True)
     optical["target"][0] = optical["target_anchor"][0]  # type: ignore[index]
@@ -1073,6 +1163,11 @@ def _selection_report(
         "rmse": optical_rmse,
         "anchor_rmse": 1.0,
         "sam_deg": 1.0,
+        "anchor_sam_deg": 1.1,
+        "ndvi_mae": 0.1,
+        "anchor_ndvi_mae": 0.2,
+        "edge_f1": 0.8,
+        "anchor_edge_f1": 0.7,
         "scene_improved_fraction": 1.0,
         "structural_rmse": optical_structural,
     }
@@ -1080,6 +1175,8 @@ def _selection_report(
         "sar_db_rmse": sar_rmse,
         "sar_db_anchor_rmse": 10.0,
         "sar_db_bias": 0.0,
+        "edge_f1": 0.8,
+        "anchor_edge_f1": 0.81,
         "scene_improved_fraction": 1.0,
         "structural_rmse": sar_structural,
     }

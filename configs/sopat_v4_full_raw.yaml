@@ -69,6 +69,7 @@ training:
     source_shuffle_probability: 0.5
     source_shuffle_margin: 0.005
     counterfactual_confidence_weight: 0.10
+    counterfactual_confidence_margin: 0.10
     structural_pool_kernel: 5
   validate_every: 1000
   full_validate_every: 5000
@@ -91,5 +92,10 @@ validation:
     full_sar_db_rmse_max: 5.0
     full_sar_db_bias_abs_max: 0.5
     full_scene_improved_fraction_min: 0.70
+    feasibility_scene_improved_fraction_min: 0.50
+    optical_sam_anchor_delta_max: 0.0
+    optical_ndvi_mae_anchor_delta_max: 0.0
+    optical_edge_f1_anchor_delta_min: 0.0
+    sar_edge_f1_anchor_delta_min: -0.02
     feasibility_source_shuffle_min_degradation: 0.01
     full_source_shuffle_min_degradation: 0.02
