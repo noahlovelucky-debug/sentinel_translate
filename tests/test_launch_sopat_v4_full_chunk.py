@@ -19,17 +19,29 @@ def _write(path: Path, content: str) -> Path:
     return path
 
 
-POLICY_VERSION = "sopat_v4_quality_gate_v2"
+POLICY_VERSION = "sopat_v4_quality_gate_v3"
 _VALID_EFFECTIVE_POLICY: dict[str, object] = {
     "phase": "feasibility",
     "feasibility_scene_improved_fraction_min": 0.50,
     "feasibility_source_shuffle_min_degradation": 0.01,
+    "feasibility_candidate_source_shuffle_min_degradation": 0.01,
     "optical_sam_anchor_delta_max": 0.0,
     "optical_ndvi_mae_anchor_delta_max": 0.0,
     "optical_edge_f1_anchor_delta_min": 0.0,
     "full_sar_db_bias_abs_max": 0.5,
     "sar_edge_f1_anchor_delta_min": -0.02,
 }
+
+
+def _global_counterfactual_variant() -> dict[str, object]:
+    return {
+        "name": "global_cross_tile",
+        "planner": "global_cross_tile_hard_v1",
+        "plan_hash": "a" * 64,
+        "coverage": 1.0,
+        "cross_tile_coverage": 1.0,
+        "tier_counts": {"same_task_exact_n": 2},
+    }
 
 
 def _report(
@@ -42,6 +54,8 @@ def _report(
     include_policy: bool = True,
     policy_version: str = POLICY_VERSION,
     effective_policy: dict[str, object] | None = None,
+    source_shuffle_variant: dict[str, object] | None = None,
+    include_source_shuffle: bool = True,
 ) -> Path:
     validation: dict[str, object] = {
         "selection": {
@@ -59,6 +73,14 @@ def _report(
                 if effective_policy is None
                 else effective_policy
             ),
+        }
+    if include_source_shuffle:
+        validation["source_shuffle"] = {
+            "variant": (
+                _global_counterfactual_variant()
+                if source_shuffle_variant is None
+                else source_shuffle_variant
+            )
         }
     return _write(
         path,
@@ -179,6 +201,7 @@ def test_policy_missing_a_required_threshold_fails_closed_before_gpu_or_cache_wo
     [
         ("feasibility_scene_improved_fraction_min", 0.49),
         ("feasibility_source_shuffle_min_degradation", 0.009),
+        ("feasibility_candidate_source_shuffle_min_degradation", 0.009),
         ("optical_sam_anchor_delta_max", 0.001),
         ("optical_ndvi_mae_anchor_delta_max", 0.001),
         ("optical_edge_f1_anchor_delta_min", -0.001),
@@ -212,7 +235,11 @@ def test_weaker_effective_policy_fails_closed_before_gpu_or_cache_work(
         ({"score": float("nan")}, "validation.selection.score must be a finite number"),
         (
             {"policy_version": "sopat_v4_quality_gate_v1"},
-            "validation.selection_policy.version must be 'sopat_v4_quality_gate_v2'",
+            "validation.selection_policy.version must be 'sopat_v4_quality_gate_v3'",
+        ),
+        (
+            {"policy_version": "sopat_v4_quality_gate_v2"},
+            "validation.selection_policy.version must be 'sopat_v4_quality_gate_v3'",
         ),
     ],
 )
@@ -220,6 +247,35 @@ def test_incomplete_or_unversioned_feasibility_decision_fails_closed(
     tmp_path: Path, report_options: dict[str, object], expected_error: str
 ) -> None:
     result = _run(tmp_path, eligible=True, report_options=report_options)
+
+    assert result.returncode != 0
+    assert expected_error in result.stderr
+    assert not (tmp_path / "commands.log").exists()
+    assert not (tmp_path / "data").exists()
+
+
+@pytest.mark.parametrize(
+    ("variant", "expected_error"),
+    [
+        ({"name": "source_shuffle"}, "validation.source_shuffle.variant.name"),
+        (
+            {**_global_counterfactual_variant(), "coverage": 0.99},
+            "validation.source_shuffle.variant.coverage=0.99 must be >= 1",
+        ),
+        (
+            {**_global_counterfactual_variant(), "cross_tile_coverage": 0.99},
+            "validation.source_shuffle.variant.cross_tile_coverage=0.99 must be >= 1",
+        ),
+    ],
+)
+def test_global_counterfactual_metadata_fails_closed_before_gpu_or_cache_work(
+    tmp_path: Path, variant: dict[str, object], expected_error: str
+) -> None:
+    result = _run(
+        tmp_path,
+        eligible=True,
+        report_options={"source_shuffle_variant": variant},
+    )
 
     assert result.returncode != 0
     assert expected_error in result.stderr

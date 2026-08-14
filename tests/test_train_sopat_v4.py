@@ -190,6 +190,11 @@ def test_datasets_chunk_route_uses_cache_adapter_not_raster(tmp_path: Path, runn
 
     monkeypatch.setattr(runner_module, "load_sopat_v4_index", lambda _path: index)
     monkeypatch.setattr(runner_module, "_validate_v4_index", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "build_global_cross_tile_hard_negative_plan",
+        lambda *_args, direction, split: f"plan:{direction}:{split}",
+    )
 
     def adapter(_root, _index, *, direction, split, window_mode, **_kwargs):
         calls.append((direction, split, window_mode))
@@ -212,6 +217,109 @@ def test_datasets_chunk_route_uses_cache_adapter_not_raster(tmp_path: Path, runn
     ]
 
 
+def test_physical_datasets_build_and_attach_global_plans(tmp_path: Path, runner_module, monkeypatch) -> None:
+    config = _minimal_config(tmp_path, cache_root="chunks")
+    prepared = runner_module._PreparedData(
+        route="chunk_cache",
+        index_path=tmp_path / "route.jsonl",
+        cache_root=tmp_path / "chunks",
+        manifest_path=None,
+        train_split="train",
+        validation_split="validation_temporal",
+        protocol_hashes={direction: {} for direction in ("sar_to_optical", "optical_to_sar")},
+    )
+    class _Index:
+        def select(self, **_kwargs):
+            return ()
+
+    index = _Index()
+    calls: list[tuple[str, str, object, bool]] = []
+    plans: list[tuple[str, str]] = []
+
+    def plan_builder(_index, *, direction, split):
+        plans.append((direction, split))
+        return SimpleNamespace(
+            mapping_metadata={
+                "plan_hash": f"{direction}:{split}",
+                "coverage": 1.0,
+                "cross_tile_coverage": 1.0,
+                "tier_counts": {"same_task_exact_n": 1},
+            }
+        )
+
+    def adapter(_root, _index, *, direction, split, hard_negative_plan, include_cf, **_kwargs):
+        calls.append((direction, split, hard_negative_plan, include_cf))
+        return SimpleNamespace(direction=direction, split=split, hard_negative_plan=hard_negative_plan)
+
+    monkeypatch.setattr(runner_module, "load_sopat_v4_index", lambda _path: index)
+    monkeypatch.setattr(runner_module, "_validate_v4_index", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(runner_module, "build_global_cross_tile_hard_negative_plan", plan_builder)
+    monkeypatch.setattr(runner_module, "sopat_chunk_dataset_from_cache", adapter)
+
+    train, validation = runner_module._datasets(config, prepared, seed=3, stage="physical")
+
+    assert plans == [
+        ("sar_to_optical", "train"),
+        ("sar_to_optical", "validation_temporal"),
+        ("optical_to_sar", "train"),
+        ("optical_to_sar", "validation_temporal"),
+    ]
+    assert all(include_cf is True and plan is not None for *_rest, plan, include_cf in calls)
+    state = runner_module._global_counterfactual_data_state(
+        train_datasets=train,
+        validation_datasets=validation,
+        train_split="train",
+        validation_split="validation_temporal",
+    )
+    counterfactual = state["global_counterfactual"]
+    assert counterfactual["train"]["plans"]["sar_to_optical"]["plan_hash"] == "sar_to_optical:train"
+    assert (
+        counterfactual["validation"]["plans"]["optical_to_sar"]["plan_hash"]
+        == "optical_to_sar:validation_temporal"
+    )
+    missing_plan = {
+        direction: SimpleNamespace(hard_negative_plan=None)
+        for direction in ("sar_to_optical", "optical_to_sar")
+    }
+    with pytest.raises(TypeError, match="requires global counterfactual plan metadata"):
+        runner_module._global_counterfactual_data_state(
+            train_datasets=missing_plan,
+            validation_datasets=validation,
+            train_split="train",
+            validation_split="validation_temporal",
+        )
+
+
+def test_factorizer_datasets_do_not_build_global_plans(tmp_path: Path, runner_module, monkeypatch) -> None:
+    config = _minimal_config(tmp_path, cache_root="chunks")
+    prepared = runner_module._PreparedData(
+        route="chunk_cache",
+        index_path=tmp_path / "route.jsonl",
+        cache_root=tmp_path / "chunks",
+        manifest_path=None,
+        train_split="train",
+        validation_split="validation_temporal",
+        protocol_hashes={direction: {} for direction in ("sar_to_optical", "optical_to_sar")},
+    )
+    monkeypatch.setattr(runner_module, "load_sopat_v4_index", lambda _path: SimpleNamespace())
+    monkeypatch.setattr(runner_module, "_validate_v4_index", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "build_global_cross_tile_hard_negative_plan",
+        lambda *_args, **_kwargs: pytest.fail("factorizer must not build a donor plan"),
+    )
+    seen: list[tuple[object, bool]] = []
+
+    def adapter(*_args, hard_negative_plan, include_cf, **_kwargs):
+        seen.append((hard_negative_plan, include_cf))
+        return SimpleNamespace(direction="sar_to_optical", split="train")
+
+    monkeypatch.setattr(runner_module, "sopat_chunk_dataset_from_cache", adapter)
+    runner_module._datasets(config, prepared, seed=3, stage="factorizer")
+
+    assert seen and all(plan is None and include_cf is False for plan, include_cf in seen)
+
+
 def test_datasets_raw_route_uses_random_train_and_center_validation(
     tmp_path: Path, runner_module, monkeypatch
 ) -> None:
@@ -231,8 +339,14 @@ def test_datasets_raw_route_uses_random_train_and_center_validation(
         },
     )
     calls: list[tuple[str, str, str]] = []
-    monkeypatch.setattr(runner_module, "load_sopat_v4_index", lambda _path: object())
+    index = object()
+    monkeypatch.setattr(runner_module, "load_sopat_v4_index", lambda _path: index)
     monkeypatch.setattr(runner_module, "_validate_v4_index", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        runner_module,
+        "build_global_cross_tile_hard_negative_plan",
+        lambda *_args, direction, split: f"plan:{direction}:{split}",
+    )
 
     def raster(_index, _manifest, *, direction, split, crop_mode, **_kwargs):
         calls.append((direction, split, crop_mode))
@@ -268,41 +382,23 @@ def test_validation_batch_size_is_independent_and_checked(tmp_path: Path, runner
     runner_module._validate_run_config(config, world_size=1)
 
     config["validation"]["batch_size"] = 1  # type: ignore[index]
-    with pytest.raises(ValueError, match="validation.batch_size.*at least 2"):
+    runner_module._validate_run_config(config, world_size=1)
+
+    config["validation"]["batch_size"] = 0  # type: ignore[index]
+    with pytest.raises(ValueError, match="validation.batch_size.*positive"):
         runner_module._validate_run_config(config, world_size=1)
 
 
-@pytest.mark.parametrize(
-    ("sample_count", "batch_size", "expected"),
-    [
-        (2, 4, [[0, 1]]),
-        (5, 4, [[0, 1, 2], [3, 4]]),
-        (9, 4, [[0, 1, 2, 3], [4, 5, 6], [7, 8]]),
-    ],
-)
-def test_no_singleton_validation_batch_sampler_covers_every_sample_once(
-    runner_module, sample_count: int, batch_size: int, expected: list[list[int]]
-) -> None:
-    sampler = runner_module.NoSingletonBatchSampler(sample_count, batch_size)
-    batches = list(sampler)
+def test_runner_pins_global_counterfactual_selection_policy_v3(tmp_path: Path, runner_module) -> None:
+    config = _minimal_config(tmp_path)
+    config["validation"]["selection"] = {"policy_version": "sopat_v4_quality_gate_v2"}  # type: ignore[index]
 
-    assert batches == expected
-    flattened = [sample for batch in batches for sample in batch]
-    assert flattened == list(range(sample_count))
-    assert len(flattened) == len(set(flattened))
-    assert all(2 <= len(batch) <= batch_size for batch in batches)
+    selection = runner_module._selection_config(config, phase="feasibility")
+
+    assert selection.policy_version == "sopat_v4_quality_gate_v3"
 
 
-def test_no_singleton_validation_batch_sampler_fails_closed_for_impossible_sizes(
-    runner_module,
-) -> None:
-    with pytest.raises(ValueError, match="at least two samples"):
-        runner_module.NoSingletonBatchSampler(1, 4)
-    with pytest.raises(ValueError, match="odd sample count.*batch_size=2"):
-        runner_module.NoSingletonBatchSampler(3, 2)
-
-
-def test_validation_loaders_accept_explicit_batch_samplers(runner_module, monkeypatch) -> None:
+def test_validation_loader_uses_normal_batch_size_for_global_plan(runner_module, monkeypatch) -> None:
     calls: list[dict[str, object]] = []
 
     class _LengthOnlyDataset:
@@ -318,23 +414,19 @@ def test_validation_loaders_accept_explicit_batch_samplers(runner_module, monkey
         return _Loader()
 
     monkeypatch.setattr(runner_module, "DataLoader", fake_loader)
-    samplers = {
-        direction: runner_module.NoSingletonBatchSampler(5, 4)
-        for direction in ("sar_to_optical", "optical_to_sar")
-    }
     loaders = runner_module._loaders(
-        {direction: _LengthOnlyDataset() for direction in samplers},
-        batch_size=4,
+        {direction: _LengthOnlyDataset() for direction in ("sar_to_optical", "optical_to_sar")},
+        batch_size=1,
         num_workers=0,
         device=runner_module.torch.device("cpu"),
         rank=0,
         world_size=1,
         training=False,
         seed=7,
-        batch_samplers=samplers,
     )
 
-    assert set(loaders) == set(samplers)
+    assert set(loaders) == {"sar_to_optical", "optical_to_sar"}
     assert len(calls) == 2
-    assert all(call["batch_sampler"] is samplers[direction] for call, direction in zip(calls, samplers))
-    assert all("batch_size" not in call and "drop_last" not in call for call in calls)
+    assert all(call["batch_size"] == 1 for call in calls)
+    assert all(call["shuffle"] is False for call in calls)
+    assert all("batch_sampler" not in call for call in calls)

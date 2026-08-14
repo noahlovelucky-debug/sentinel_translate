@@ -15,12 +15,14 @@ from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
 from sentinel_v4 import evaluation as sopat_evaluation
+from sentinel_v4 import training as sopat_training
 from sentinel_v4.evaluation import SOPATVariantConfig, evaluate_sopat_loaders
 from sentinel_v4.model import SOPAT, SOPATConfig
 from sentinel_v4.training import (
     ModelEMA,
     SOPATTrainConfig,
     SOPATTrainingModule,
+    _source_counterfactual_batch,
     _structural_error,
     _utility_oracle,
     configure_sopat_stage,
@@ -173,6 +175,40 @@ def test_two_rank_gloo_keeps_both_direction_heads_synchronized(tmp_path) -> None
     # Both renderer heads participated in the single coupled DDP graph.
     assert values[0][1] != pytest.approx(0.10)
     assert values[0][2] != pytest.approx(-0.10)
+
+
+def _ddp_counterfactual_probability_worker(
+    rank: int, world_size: int, init_method: str, queue: object
+) -> None:
+    assert hasattr(queue, "put")
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
+    try:
+        seed = 0 if rank == 0 else 1
+        local_generator = torch.Generator().manual_seed(seed)
+        local = sopat_training._sample_probability(0.5, torch.device("cpu"), local_generator)
+        synchronized_generator = torch.Generator().manual_seed(seed)
+        synchronized = sopat_training._rank_synchronized_probability(
+            0.5, torch.device("cpu"), synchronized_generator
+        )
+        queue.put((rank, local, synchronized))
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available(), reason="torch.distributed is unavailable")
+def test_two_rank_counterfactual_probability_is_synchronized(tmp_path) -> None:
+    rendezvous = tmp_path / f"sopat-counterfactual-probability-{os.getpid()}"
+    context = mp.get_context("spawn")
+    queue = context.SimpleQueue()
+    mp.spawn(
+        _ddp_counterfactual_probability_worker,
+        args=(2, f"file://{rendezvous}", queue),
+        nprocs=2,
+        join=True,
+    )
+    values = sorted(queue.get() for _ in range(2))
+    assert [local for _rank, local, _synchronized in values] == [True, False]
+    assert [synchronized for _rank, _local, synchronized in values] == [True, True]
 
 
 class _SourceAwareToyModel(nn.Module):
@@ -402,6 +438,329 @@ def _counterfactual_confidence_config(*, autocast_bfloat16: bool = False) -> SOP
     )
 
 
+def _global_cross_tile_batch(*, batch_size: int = 2, changed: bool = False) -> dict[str, object]:
+    """Attach a valid deterministic donor contract to a compact recipient batch."""
+
+    batch = _counterfactual_confidence_batch(batch_size=batch_size)
+    source = batch["observations"]
+    source_valid = batch["observation_valid"]
+    assert isinstance(source, torch.Tensor)
+    assert isinstance(source_valid, torch.Tensor)
+    donor = source + 0.75
+    batch.update(
+        {
+            "counterfactual_observation_values": donor,
+            "counterfactual_observation_valid": source_valid.clone(),
+            "sopat_example_id": [f"recipient-{index}" for index in range(batch_size)],
+            "sopat_tile": [f"tile-recipient-{index}" for index in range(batch_size)],
+            # Canonical grids can be intentionally shared between distinct
+            # tiles; they remain required provenance, not an inequality key.
+            "sopat_grid_id": ["canonical-10m" for _ in range(batch_size)],
+            "sopat_cf_donor_sample_id": [f"donor-{index}" for index in range(batch_size)],
+            "sopat_cf_donor_tile": [f"tile-donor-{index}" for index in range(batch_size)],
+            "sopat_cf_donor_grid_id": ["canonical-10m" for _ in range(batch_size)],
+            "sopat_cf_tier": ["same_task_exact_n" for _ in range(batch_size)],
+            "sopat_cf_plan_hash": ["plan-0123456789abcdef" for _ in range(batch_size)],
+        }
+    )
+    if changed:
+        target = batch["target"]
+        target_anchor = batch["target_anchor"]
+        assert isinstance(target, torch.Tensor)
+        assert isinstance(target_anchor, torch.Tensor)
+        target.copy_(target_anchor + 0.2)
+    return batch
+
+
+def _global_counterfactual_config(**overrides: object) -> SOPATTrainConfig:
+    values: dict[str, object] = {
+        "stage": "physical",
+        "autocast_bfloat16": False,
+        "physical_charbonnier_weight": 1e-12,
+        "physical_gradient_weight": 0.0,
+        "physical_optical_spectral_weight": 0.0,
+        "physical_optical_ndvi_weight": 0.0,
+        "physical_sar_statistics_weight": 0.0,
+        "physical_anchor_delta_weight": 0.0,
+        "physical_null_change_weight": 0.0,
+        "physical_null_change_probability": 0.0,
+        "physical_nll_weight": 0.0,
+        "physical_permutation_weight": 0.0,
+        "physical_permutation_probability": 0.0,
+        "physical_anchor_regret_weight": 0.0,
+        "candidate_weight": 0.0,
+        "utility_weight": 0.0,
+        "source_shuffle_weight": 0.0,
+        "source_shuffle_probability": 1.0,
+        "source_counterfactual_mode": "global_cross_tile_v1",
+        "counterfactual_candidate_ranking_weight": 0.0,
+        "counterfactual_source_effect_floor_weight": 0.0,
+        "counterfactual_confidence_weight": 0.0,
+    }
+    values.update(overrides)
+    return SOPATTrainConfig(**values)  # type: ignore[arg-type]
+
+
+class _GlobalCandidateToyModel(nn.Module):
+    """Expose matched/wrong candidates and gates from the public source input."""
+
+    def __init__(
+        self,
+        *,
+        correct_offset: float,
+        wrong_offset: float,
+        correct_logit: float = 0.0,
+        wrong_logit: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.correct_offset = nn.Parameter(torch.tensor(correct_offset))
+        self.wrong_offset = nn.Parameter(torch.tensor(wrong_offset))
+        self.correct_logit = nn.Parameter(torch.tensor(correct_logit))
+        self.wrong_logit = nn.Parameter(torch.tensor(wrong_logit))
+        self.calls: list[set[str]] = []
+
+    def forward(self, **inputs: object) -> SimpleNamespace:
+        self.calls.append(set(inputs))
+        observations = inputs["observations"]
+        target_anchor = inputs["target_anchor"]
+        source_anchor = inputs["source_anchor"]
+        assert isinstance(observations, torch.Tensor)
+        assert isinstance(target_anchor, torch.Tensor)
+        assert isinstance(source_anchor, torch.Tensor)
+        recipient_history = (observations[:, 0] - source_anchor).abs().flatten(1).amax(dim=1) == 0.0
+        recipient_mask = recipient_history.to(target_anchor).view(-1, 1, 1, 1)
+        offset = recipient_mask * self.correct_offset + (1.0 - recipient_mask) * self.wrong_offset
+        candidate = target_anchor + offset * torch.ones_like(target_anchor)
+        logit = recipient_mask * self.correct_logit + (1.0 - recipient_mask) * self.wrong_logit
+        logits = logit * torch.ones_like(target_anchor[:, :1])
+        confidence = torch.sigmoid(logits)
+        return SimpleNamespace(
+            # Keep the baseline physical reconstruction independent from the
+            # candidate parameters, so candidate-only objective gradients are
+            # analytically testable below.
+            physical=target_anchor,
+            candidate_physical=candidate,
+            transport_confidence=confidence,
+            transport_confidence_logits=logits,
+            transport_evidence=torch.ones_like(confidence),
+            log_variance=torch.zeros_like(candidate),
+        )
+
+
+def test_global_cross_tile_counterfactual_replaces_only_source_values_and_valid() -> None:
+    batch = _global_cross_tile_batch()
+    recipient_values = batch["observations"]
+    recipient_valid = batch["observation_valid"]
+    recipient_days = batch["observation_days"]
+    recipient_present = batch["observation_present"]
+    recipient_target = batch["target"]
+    recipient_anchor = batch["target_anchor"]
+    assert isinstance(recipient_days, torch.Tensor)
+    assert isinstance(recipient_present, torch.Tensor)
+    assert isinstance(recipient_values, torch.Tensor)
+    assert isinstance(recipient_valid, torch.Tensor)
+    assert isinstance(recipient_target, torch.Tensor)
+    assert isinstance(recipient_anchor, torch.Tensor)
+    recipient_values_before = recipient_values.clone()
+    recipient_valid_before = recipient_valid.clone()
+    recipient_days_before = recipient_days.clone()
+    recipient_present_before = recipient_present.clone()
+    recipient_target_before = recipient_target.clone()
+    recipient_anchor_before = recipient_anchor.clone()
+
+    counterfactual = _source_counterfactual_batch(batch, mode="global_cross_tile_v1")
+
+    assert counterfactual is not None
+    assert counterfactual["observation_days"] is recipient_days
+    assert counterfactual["observation_present"] is recipient_present
+    assert counterfactual["target"] is recipient_target
+    assert counterfactual["target_anchor"] is recipient_anchor
+    counterfactual_values = counterfactual["observations"]
+    expected_values = batch["counterfactual_observation_values"]
+    assert isinstance(counterfactual_values, torch.Tensor)
+    assert isinstance(expected_values, torch.Tensor)
+    torch.testing.assert_close(counterfactual_values, expected_values)
+    counterfactual_valid = counterfactual["observation_valid"]
+    expected_valid = batch["counterfactual_observation_valid"]
+    assert isinstance(counterfactual_valid, torch.Tensor)
+    assert isinstance(expected_valid, torch.Tensor)
+    torch.testing.assert_close(counterfactual_valid, expected_valid)
+    # Construction is functional: the recipient batch remains intact and
+    # equal grid identifiers are accepted provenance for distinct tiles.
+    torch.testing.assert_close(batch["observations"], recipient_values_before)
+    torch.testing.assert_close(batch["observation_valid"], recipient_valid_before)
+    torch.testing.assert_close(batch["observation_days"], recipient_days_before)
+    torch.testing.assert_close(batch["observation_present"], recipient_present_before)
+    torch.testing.assert_close(batch["target"], recipient_target_before)
+    torch.testing.assert_close(batch["target_anchor"], recipient_anchor_before)
+    assert batch["sopat_grid_id"] == batch["sopat_cf_donor_grid_id"]
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "error"),
+    (
+        ("counterfactual_observation_values", None, "counterfactual_observation_values"),
+        ("counterfactual_observation_valid", None, "counterfactual_observation_valid"),
+        ("sopat_cf_tier", None, "sopat_cf_tier"),
+        ("sopat_cf_donor_sample_id", ["recipient-0", "donor-1"], "recipient sample"),
+        ("sopat_cf_donor_tile", ["tile-recipient-0", "tile-donor-1"], "recipient tile"),
+        ("sopat_cf_plan_hash", ["", "plan-0123456789abcdef"], "non-empty strings"),
+    ),
+)
+def test_global_cross_tile_counterfactual_fails_closed_for_missing_or_self_contract(
+    field: str, value: object, error: str
+) -> None:
+    batch = _global_cross_tile_batch()
+    if value is None:
+        batch.pop(field)
+    else:
+        batch[field] = value
+
+    with pytest.raises((TypeError, ValueError), match=error):
+        _source_counterfactual_batch(batch, mode="global_cross_tile_v1")
+
+
+def test_global_cross_tile_counterfactual_fails_closed_for_misaligned_donor_shapes() -> None:
+    batch = _global_cross_tile_batch()
+    donor = batch["counterfactual_observation_values"]
+    assert isinstance(donor, torch.Tensor)
+    batch["counterfactual_observation_values"] = donor[:, :-1]
+
+    with pytest.raises(ValueError, match="counterfactual_observation_values"):
+        _source_counterfactual_batch(batch, mode="global_cross_tile_v1")
+
+
+def test_global_cross_tile_counterfactual_rejects_unknown_donor_tier() -> None:
+    batch = _global_cross_tile_batch()
+    batch["sopat_cf_tier"] = ["untrusted", "untrusted"]
+
+    with pytest.raises(ValueError, match="unsupported donor tier"):
+        _source_counterfactual_batch(batch, mode="global_cross_tile_v1")
+
+
+def test_global_cross_tile_counterfactual_donor_construction_uses_no_ddp_collectives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_distributed_access(*_args: object, **_kwargs: object) -> int:
+        raise AssertionError("global donor construction must not access DDP")
+
+    monkeypatch.setattr(sopat_training, "_distributed_world_size", unexpected_distributed_access)
+    counterfactual = _source_counterfactual_batch(
+        _global_cross_tile_batch(), mode="global_cross_tile_v1"
+    )
+
+    assert counterfactual is not None
+
+
+def test_global_cross_tile_candidate_ranking_and_effect_have_exact_gradients() -> None:
+    model = _GlobalCandidateToyModel(correct_offset=0.30, wrong_offset=0.10)
+    config = _global_counterfactual_config(
+        counterfactual_candidate_ranking_weight=1.0,
+        counterfactual_candidate_ranking_margin=0.05,
+        counterfactual_source_effect_floor_weight=0.25,
+        counterfactual_source_effect_floor=0.40,
+    )
+    loss, metrics = sopat_direction_objective(
+        model,
+        _global_cross_tile_batch(),
+        "sar_to_optical",
+        config,
+    )
+    loss.backward()
+
+    # Structural error is |offset| here: 0.30 - 0.10 + 0.05 = 0.25.
+    assert metrics["physical_counterfactual_candidate_ranking"].item() == pytest.approx(0.25)
+    # Low-pass maps are uniform, so source effect is |0.30 - 0.10| = 0.20.
+    assert metrics["physical_counterfactual_candidate_effect"].item() == pytest.approx(0.20)
+    assert metrics["physical_counterfactual_source_effect_floor"].item() == pytest.approx(0.20)
+    assert model.correct_offset.grad is not None
+    assert model.wrong_offset.grad is not None
+    # Ranking contributes (+1, -1); the 0.25-weighted source-effect floor
+    # contributes (-0.25, +0.25), yielding exactly (+0.75, -0.75).
+    assert model.correct_offset.grad.item() == pytest.approx(0.75, abs=1e-5)
+    assert model.wrong_offset.grad.item() == pytest.approx(-0.75, abs=1e-5)
+    assert all("target" not in call and "target_values" not in call for call in model.calls)
+
+
+def test_global_cross_tile_candidate_ranking_rejects_both_close_candidates() -> None:
+    model = _GlobalCandidateToyModel(correct_offset=0.0, wrong_offset=0.0)
+    config = _global_counterfactual_config(
+        counterfactual_candidate_ranking_weight=1.0,
+        counterfactual_candidate_ranking_margin=0.05,
+        counterfactual_source_effect_floor_weight=1.0,
+        counterfactual_source_effect_floor=0.05,
+    )
+    _loss, metrics = sopat_direction_objective(
+        model,
+        _global_cross_tile_batch(),
+        "sar_to_optical",
+        config,
+    )
+
+    assert metrics["physical_counterfactual_candidate_ranking"].item() == pytest.approx(0.05)
+    assert metrics["physical_counterfactual_source_effect_floor"].item() == pytest.approx(0.05)
+
+
+def test_global_cross_tile_candidate_losses_require_shared_evidence_support() -> None:
+    batch = _global_cross_tile_batch()
+    source_anchor_valid = batch["source_anchor_valid"]
+    assert isinstance(source_anchor_valid, torch.Tensor)
+    source_anchor_valid.zero_()
+    model = _GlobalCandidateToyModel(correct_offset=0.30, wrong_offset=0.10)
+    config = _global_counterfactual_config(
+        counterfactual_candidate_ranking_weight=1.0,
+        counterfactual_source_effect_floor_weight=1.0,
+        counterfactual_source_effect_floor=0.40,
+    )
+
+    loss, metrics = sopat_direction_objective(model, batch, "sar_to_optical", config)
+    loss.backward()
+
+    assert metrics["physical_counterfactual_candidate_ranking"].item() == 0.0
+    assert metrics["physical_counterfactual_source_effect_floor"].item() == 0.0
+    assert model.correct_offset.grad is not None and model.correct_offset.grad.item() == 0.0
+    assert model.wrong_offset.grad is not None and model.wrong_offset.grad.item() == 0.0
+
+
+def test_legacy_source_counterfactual_mode_remains_metadata_free() -> None:
+    batch = _counterfactual_confidence_batch()
+    original_observations = batch["observations"]
+    assert isinstance(original_observations, torch.Tensor)
+
+    counterfactual = _source_counterfactual_batch(
+        batch,
+        mode="legacy_local_shuffle_v1",
+        generator=torch.Generator().manual_seed(3),
+    )
+
+    assert counterfactual is not None
+    observations = counterfactual["observations"]
+    assert isinstance(observations, torch.Tensor)
+    assert not torch.equal(observations, original_observations)
+
+
+def test_global_cross_tile_confidence_uses_utility_target_for_good_and_bad_candidates() -> None:
+    bad = _GlobalCandidateToyModel(correct_offset=0.50, wrong_offset=0.50)
+    good = _GlobalCandidateToyModel(correct_offset=0.19, wrong_offset=0.50)
+    config = _global_counterfactual_config(
+        counterfactual_confidence_weight=1.0,
+        counterfactual_confidence_binary_weight=1.0,
+    )
+    bad_loss, _ = sopat_direction_objective(
+        bad, _global_cross_tile_batch(changed=True), "sar_to_optical", config
+    )
+    bad_loss.backward()
+    good_loss, _ = sopat_direction_objective(
+        good, _global_cross_tile_batch(changed=True), "sar_to_optical", config
+    )
+    good_loss.backward()
+
+    assert bad.correct_logit.grad is not None and bad.correct_logit.grad.item() > 0.0
+    assert good.correct_logit.grad is not None and good.correct_logit.grad.item() < 0.0
+    assert bad.wrong_logit.grad is not None and bad.wrong_logit.grad.item() > 0.0
+    assert good.wrong_logit.grad is not None and good.wrong_logit.grad.item() > 0.0
+
+
 def test_counterfactual_confidence_has_symmetric_authenticity_gradients() -> None:
     model = _CounterfactualConfidenceToyModel(wrong_logit=4.0)
     loss, metrics = sopat_direction_objective(
@@ -560,6 +919,11 @@ def test_counterfactual_confidence_weight_is_explicit_in_all_sopat_configs(confi
     payload = {**objective, **physical_stage, "stage": "physical"}
     payload.pop("steps")
     config = SOPATTrainConfig.from_mapping(payload)
+    assert config.source_counterfactual_mode == "global_cross_tile_v1"
+    assert config.counterfactual_candidate_ranking_weight == pytest.approx(0.25)
+    assert config.counterfactual_candidate_ranking_margin == pytest.approx(0.005)
+    assert config.counterfactual_source_effect_floor_weight == pytest.approx(0.05)
+    assert config.counterfactual_source_effect_floor == pytest.approx(0.005)
     assert config.counterfactual_confidence_weight == pytest.approx(0.10)
     assert config.counterfactual_confidence_binary_weight == pytest.approx(1.0)
     assert config.counterfactual_confidence_margin == pytest.approx(0.10)
@@ -577,6 +941,23 @@ def test_counterfactual_confidence_binary_weight_requires_a_finite_nonnegative_v
 ) -> None:
     with pytest.raises(ValueError, match="counterfactual_confidence_binary_weight|loss weights"):
         SOPATTrainConfig(counterfactual_confidence_binary_weight=value)
+
+
+@pytest.mark.parametrize(
+    ("values", "error"),
+    (
+        ({"source_counterfactual_mode": "unsupported"}, "source_counterfactual_mode"),
+        ({"counterfactual_candidate_ranking_weight": -0.1}, "loss weights"),
+        ({"counterfactual_candidate_ranking_margin": float("nan")}, "ranking_margin"),
+        ({"counterfactual_source_effect_floor_weight": float("inf")}, "effect_floor_weight"),
+        ({"counterfactual_source_effect_floor": -0.1}, "loss weights"),
+    ),
+)
+def test_global_counterfactual_config_requires_valid_mode_and_objective_knobs(
+    values: dict[str, object], error: str
+) -> None:
+    with pytest.raises(ValueError, match=error):
+        SOPATTrainConfig(**values)  # type: ignore[arg-type]
 
 
 def test_confidence_only_scope_freezes_everything_except_two_confidence_heads() -> None:

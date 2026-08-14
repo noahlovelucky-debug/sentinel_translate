@@ -32,6 +32,7 @@ from torch import Tensor, nn
 Direction = Literal["sar_to_optical", "optical_to_sar"]
 Stage = Literal["factorizer", "physical"]
 TrainableScope = Literal["full", "confidence_only"]
+SourceCounterfactualMode = Literal["legacy_local_shuffle_v1", "global_cross_tile_v1"]
 
 DIRECTIONS: tuple[Direction, Direction] = ("sar_to_optical", "optical_to_sar")
 SOPAT_V4_FORMAT = 1
@@ -103,6 +104,11 @@ class SOPATTrainConfig:
     source_shuffle_weight: float = 0.25
     source_shuffle_probability: float = 0.5
     source_shuffle_margin: float = 0.005
+    source_counterfactual_mode: SourceCounterfactualMode = "legacy_local_shuffle_v1"
+    counterfactual_candidate_ranking_weight: float = 0.25
+    counterfactual_candidate_ranking_margin: float = 0.005
+    counterfactual_source_effect_floor_weight: float = 0.05
+    counterfactual_source_effect_floor: float = 0.005
     counterfactual_confidence_weight: float = 0.10
     counterfactual_confidence_binary_weight: float = 1.0
     counterfactual_confidence_margin: float = 0.10
@@ -114,6 +120,13 @@ class SOPATTrainConfig:
             raise ValueError("SOPAT stage must be factorizer or physical")
         if self.trainable_scope not in {"full", "confidence_only"}:
             raise ValueError("SOPAT trainable_scope must be full or confidence_only")
+        if self.source_counterfactual_mode not in {
+            "legacy_local_shuffle_v1",
+            "global_cross_tile_v1",
+        }:
+            raise ValueError(
+                "source_counterfactual_mode must be legacy_local_shuffle_v1 or global_cross_tile_v1"
+            )
         if self.stage != "physical" and self.trainable_scope != "full":
             raise ValueError("confidence_only scope is valid only for the physical stage")
         if self.learning_rate <= 0.0 or self.gradient_clip <= 0.0:
@@ -153,6 +166,10 @@ class SOPATTrainConfig:
             "utility_weight",
             "source_shuffle_weight",
             "source_shuffle_margin",
+            "counterfactual_candidate_ranking_weight",
+            "counterfactual_candidate_ranking_margin",
+            "counterfactual_source_effect_floor_weight",
+            "counterfactual_source_effect_floor",
             "counterfactual_confidence_weight",
             "counterfactual_confidence_binary_weight",
             "counterfactual_confidence_margin",
@@ -160,6 +177,10 @@ class SOPATTrainConfig:
         if any(float(getattr(self, name)) < 0.0 for name in nonnegative):
             raise ValueError("SOPAT loss weights and margins must be non-negative")
         for name in (
+            "counterfactual_candidate_ranking_weight",
+            "counterfactual_candidate_ranking_margin",
+            "counterfactual_source_effect_floor_weight",
+            "counterfactual_source_effect_floor",
             "counterfactual_confidence_weight",
             "counterfactual_confidence_binary_weight",
         ):
@@ -817,15 +838,31 @@ def _padded_cross_rank_source_histories(inputs: Mapping[str, Tensor]) -> dict[st
 def _source_counterfactual_batch(
     batch: Mapping[str, object],
     *,
+    mode: SourceCounterfactualMode = "legacy_local_shuffle_v1",
+    device: torch.device | None = None,
     generator: torch.Generator | None = None,
 ) -> dict[str, object] | None:
-    """Build a guaranteed non-self source-history counterfactual, if possible."""
+    """Build a non-self source-history counterfactual for the configured contract.
 
-    inputs = forward_input_tensors(batch)
+    ``global_cross_tile_v1`` accepts only the deterministic donor payload
+    pre-collated by the data pipeline.  It intentionally performs no DDP
+    collective: each recipient already has its split-global cross-tile donor.
+    ``legacy_local_shuffle_v1`` preserves the historical local/cross-rank
+    implementation for old tests and checkpoints.
+    """
+
+    if mode == "global_cross_tile_v1":
+        return _global_cross_tile_counterfactual_batch(batch, device=device)
+    if mode != "legacy_local_shuffle_v1":
+        raise ValueError(f"unsupported SOPAT source counterfactual mode: {mode}")
+
+    inputs = forward_input_tensors(batch, device=device)
     batch_size = inputs["observations"].shape[0]
     world_size = _distributed_world_size()
     if batch_size >= 2:
-        return source_shuffle_batch(batch, generator=generator)
+        result = source_shuffle_batch(batch, generator=generator)
+        _assert_counterfactual_recipient_preserved(batch, result)
+        return result
     if world_size == 1:
         return None
 
@@ -840,6 +877,148 @@ def _source_counterfactual_batch(
         )
     result = dict(batch)
     result.update(_padded_cross_rank_source_histories(inputs))
+    _assert_counterfactual_recipient_preserved(batch, result)
+    return result
+
+
+_GLOBAL_COUNTERFACTUAL_METADATA: tuple[str, ...] = (
+    "sopat_example_id",
+    "sopat_tile",
+    "sopat_grid_id",
+    "sopat_cf_donor_sample_id",
+    "sopat_cf_donor_tile",
+    "sopat_cf_donor_grid_id",
+    "sopat_cf_tier",
+    "sopat_cf_plan_hash",
+)
+_GLOBAL_COUNTERFACTUAL_TIERS = frozenset(
+    {"same_task_exact_n", "same_task_n_bin", "same_task", "same_orbit"}
+)
+
+
+def _global_counterfactual_metadata(
+    batch: Mapping[str, object], *, batch_size: int
+) -> dict[str, tuple[str, ...]]:
+    """Read the public split-global donor identity contract without coercion."""
+
+    result: dict[str, tuple[str, ...]] = {}
+    for name in _GLOBAL_COUNTERFACTUAL_METADATA:
+        value = batch.get(name)
+        if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+            raise TypeError(
+                f"SOPAT global source counterfactual requires batch-aligned {name} metadata"
+            )
+        if len(value) != batch_size:
+            raise ValueError(
+                f"SOPAT global source counterfactual {name} metadata must have length {batch_size}"
+            )
+        values = tuple(value)
+        if any(not isinstance(item, str) or not item for item in values):
+            raise ValueError(
+                f"SOPAT global source counterfactual {name} metadata must contain non-empty strings"
+            )
+        result[name] = values  # type: ignore[assignment]
+    invalid_tiers = sorted(set(result["sopat_cf_tier"]).difference(_GLOBAL_COUNTERFACTUAL_TIERS))
+    if invalid_tiers:
+        raise ValueError(
+            "SOPAT global source counterfactual has unsupported donor tier "
+            f"{invalid_tiers[0]!r}"
+        )
+    return result
+
+
+_COUNTERFACTUAL_HISTORY_KEYS = frozenset(
+    {"observations", "observation_valid", "observation_days", "observation_present"}
+)
+
+
+def _assert_counterfactual_recipient_preserved(
+    original: Mapping[str, object], result: Mapping[str, object]
+) -> None:
+    """Guard the causal recipient state against accidental donor replacement."""
+
+    for name, value in original.items():
+        if name not in _COUNTERFACTUAL_HISTORY_KEYS and result.get(name) is not value:
+            raise AssertionError(
+                f"SOPAT source counterfactual must preserve recipient field {name}"
+            )
+
+
+def _assert_global_counterfactual_recipient_history(
+    original: Mapping[str, object], result: Mapping[str, object]
+) -> None:
+    """Ensure a global donor never changes the recipient temporal contract."""
+
+    _assert_counterfactual_recipient_preserved(original, result)
+    for name in ("observation_days", "observation_present"):
+        if result.get(name) is not original.get(name):
+            raise AssertionError(
+                f"SOPAT global source counterfactual must retain recipient {name}"
+            )
+
+
+def _global_cross_tile_counterfactual_batch(
+    batch: Mapping[str, object], *, device: torch.device | None = None
+) -> dict[str, object]:
+    """Substitute one validated pre-collated global donor history per recipient."""
+
+    inputs = forward_input_tensors(batch, device=device)
+    observations = inputs["observations"]
+    observation_valid = inputs["observation_valid"]
+    observation_days = inputs["observation_days"]
+    observation_present = inputs["observation_present"]
+    batch_size = observations.shape[0]
+    if observations.ndim != 5:
+        raise ValueError("SOPAT recipient observations must have shape BxTxCxHxW")
+    if observation_valid.shape != (
+        batch_size,
+        observations.shape[1],
+        1,
+        *observations.shape[-2:],
+    ):
+        raise ValueError("SOPAT recipient observation_valid must have shape BxTx1xHxW")
+    if observation_days.shape != observations.shape[:2]:
+        raise ValueError("SOPAT recipient observation_days must have shape BxT")
+    if observation_present.shape != observations.shape[:2]:
+        raise ValueError("SOPAT recipient observation_present must have shape BxT")
+    values = batch.get("counterfactual_observation_values")
+    valid = batch.get("counterfactual_observation_valid")
+    if not isinstance(values, Tensor):
+        raise TypeError(
+            "SOPAT global source counterfactual requires counterfactual_observation_values"
+        )
+    if not isinstance(valid, Tensor):
+        raise TypeError(
+            "SOPAT global source counterfactual requires counterfactual_observation_valid"
+        )
+    if values.shape != observations.shape:
+        raise ValueError(
+            "SOPAT counterfactual_observation_values must match recipient observations shape"
+        )
+    if valid.shape != observation_valid.shape:
+        raise ValueError(
+            "SOPAT counterfactual_observation_valid must match recipient observation_valid shape"
+        )
+    values = values.to(device=observations.device, dtype=observations.dtype, non_blocking=True)
+    valid = valid.to(
+        device=observation_valid.device,
+        dtype=observation_valid.dtype,
+        non_blocking=True,
+    )
+    metadata = _global_counterfactual_metadata(batch, batch_size=batch_size)
+    for recipient, donor, label in (
+        ("sopat_example_id", "sopat_cf_donor_sample_id", "sample"),
+        ("sopat_tile", "sopat_cf_donor_tile", "tile"),
+    ):
+        if any(left == right for left, right in zip(metadata[recipient], metadata[donor], strict=True)):
+            raise ValueError(
+                f"SOPAT global source counterfactual donor must differ from recipient {label}"
+            )
+    result = dict(batch)
+    # Preserve recipient chronology/presence and every anchor/label field.
+    result["observations"] = values
+    result["observation_valid"] = valid
+    _assert_global_counterfactual_recipient_history(batch, result)
     return result
 
 
@@ -878,6 +1057,28 @@ def _structural_error(
     numerator = (local_error * mask).flatten(1).sum(dim=1)
     denominator = mask.flatten(1).sum(dim=1).clamp_min(1.0)
     return (numerator / denominator + 1e-8).sqrt()
+
+
+def _low_pass_difference(
+    matched: Tensor,
+    counterfactual: Tensor,
+    valid: Tensor,
+    *,
+    kernel_size: int,
+) -> tuple[Tensor, Tensor]:
+    """Return a mask-aware low-pass source effect and its spatial support."""
+
+    if matched.shape != counterfactual.shape:
+        raise ValueError("SOPAT counterfactual candidate must match matched candidate shape")
+    matched_low_pass, matched_support = _local_masked_mean(matched, valid, kernel_size=kernel_size)
+    counterfactual_low_pass, counterfactual_support = _local_masked_mean(
+        counterfactual, valid, kernel_size=kernel_size
+    )
+    support = (matched_support > 0.0).to(matched) * (counterfactual_support > 0.0).to(matched)
+    # ``kernel_size == 1`` preserves the candidate channel count in
+    # ``_local_masked_mean``.  Downstream support is spatial rather than
+    # channel-specific, so normalize it to the public Bx1xHxW mask shape.
+    return (matched_low_pass - counterfactual_low_pass).abs(), support[:, :1]
 
 
 def _utility_oracle(
@@ -1037,14 +1238,25 @@ def physical_objective(
         assert permuted_physical is not None
         permutation = masked_mean((physical - permuted_physical).abs(), valid)
     source_shuffle = physical.new_zeros(())
+    counterfactual_candidate_ranking = physical.new_zeros(())
+    counterfactual_source_effect_floor = physical.new_zeros(())
+    counterfactual_candidate_effect = physical.new_zeros(())
     counterfactual_confidence = physical.new_zeros(())
     counterfactual_confidence_binary = physical.new_zeros(())
     counterfactual_confidence_margin = physical.new_zeros(())
+    # The wrong forward must be present in every DDP rank's graph.  Global
+    # mode avoids donor-construction collectives; this one-step Bernoulli
+    # synchronization only decides whether all ranks execute the same graph.
     source_shuffle_enabled = _rank_synchronized_probability(
         config.source_shuffle_probability, physical.device, generator
     )
     if source_shuffle_enabled:
-        counterfactual_batch = _source_counterfactual_batch(batch, generator=generator)
+        counterfactual_batch = _source_counterfactual_batch(
+            batch,
+            mode=config.source_counterfactual_mode,
+            device=physical.device,
+            generator=generator,
+        )
         if counterfactual_batch is not None:
             wrong_output = forward_direction(
                 model, counterfactual_batch, direction, device=physical.device
@@ -1053,6 +1265,15 @@ def physical_objective(
             assert wrong_physical is not None
             if wrong_physical.shape != physical.shape:
                 raise ValueError("SOPAT source-shuffle physical output must match target labels")
+            wrong_candidate_physical = output_tensor(
+                wrong_output, "candidate_physical", required=False
+            )
+            if wrong_candidate_physical is None:
+                wrong_candidate_physical = wrong_physical
+            if wrong_candidate_physical.shape != candidate_physical.shape:
+                raise ValueError(
+                    "SOPAT source-shuffle candidate_physical must match matched candidate shape"
+                )
             correct_error = _structural_error(
                 physical,
                 target,
@@ -1100,6 +1321,69 @@ def physical_objective(
                 raise ValueError(
                     "SOPAT source-shuffle transport_evidence must have shape Bx1xHxW"
                 )
+            if wrong_transport_evidence is None:
+                # Candidate ranking/effect supervision remains available for
+                # pre-evidence checkpoints over target-valid recipient support.
+                wrong_transport_evidence = torch.ones(
+                    wrong_confidence_shape,
+                    device=wrong_physical.device,
+                    dtype=wrong_physical.dtype,
+                )
+            recipient_source_anchor_valid = inputs["source_anchor_valid"]
+            if recipient_source_anchor_valid.shape != wrong_confidence_shape:
+                raise ValueError(
+                    "SOPAT source_anchor_valid must match source-shuffle confidence shape"
+                )
+            counterfactual_valid = (
+                valid
+                * recipient_source_anchor_valid.to(valid)
+                * (transport_evidence > 0.0).to(valid)
+                * (wrong_transport_evidence > 0.0).to(valid)
+            )
+            counterfactual_example_support = (
+                counterfactual_valid.flatten(1).sum(dim=1) > 0.0
+            ).to(physical)
+            correct_candidate_error = _structural_error(
+                candidate_physical,
+                target,
+                counterfactual_valid,
+                kernel_size=config.structural_pool_kernel,
+            )
+            wrong_candidate_error = _structural_error(
+                wrong_candidate_physical,
+                target,
+                counterfactual_valid,
+                kernel_size=config.structural_pool_kernel,
+            )
+            counterfactual_candidate_ranking_values = torch.relu(
+                correct_candidate_error
+                - wrong_candidate_error
+                + float(config.counterfactual_candidate_ranking_margin)
+            )
+            counterfactual_candidate_ranking = (
+                counterfactual_candidate_ranking_values * counterfactual_example_support
+            ).sum() / counterfactual_example_support.sum().clamp_min(1.0)
+            low_pass_difference, low_pass_support = _low_pass_difference(
+                candidate_physical,
+                wrong_candidate_physical,
+                counterfactual_valid,
+                kernel_size=config.structural_pool_kernel,
+            )
+            low_pass_mask = _resize_valid(low_pass_support, low_pass_difference).expand_as(
+                low_pass_difference
+            )
+            low_pass_support_count = low_pass_mask.sum()
+            counterfactual_candidate_effect = (
+                low_pass_difference * low_pass_mask
+            ).sum() / low_pass_support_count.clamp_min(1.0)
+            counterfactual_source_effect_floor = torch.where(
+                low_pass_support_count > 0.0,
+                torch.relu(
+                    low_pass_difference.new_tensor(config.counterfactual_source_effect_floor)
+                    - counterfactual_candidate_effect
+                ),
+                low_pass_difference.new_zeros(()),
+            )
             # ``transport_confidence`` above has a ones fallback for the
             # historical utility objective.  Counterfactual calibration needs
             # a real matched gate, otherwise legacy outputs must remain a
@@ -1113,26 +1397,6 @@ def physical_objective(
                 or wrong_transport_confidence is not None
             )
             if matched_has_confidence and wrong_has_confidence:
-                if wrong_transport_evidence is None:
-                    # Pre-evidence V4 checkpoints and compact probability-only
-                    # toys have no explicit evidence map.  Their counterfactual
-                    # route remains valid over the recipient's valid support.
-                    wrong_transport_evidence = torch.ones(
-                        wrong_confidence_shape,
-                        device=wrong_physical.device,
-                        dtype=wrong_physical.dtype,
-                    )
-                recipient_source_anchor_valid = inputs["source_anchor_valid"]
-                if recipient_source_anchor_valid.shape != wrong_confidence_shape:
-                    raise ValueError(
-                        "SOPAT source_anchor_valid must match source-shuffle confidence shape"
-                    )
-                counterfactual_valid = (
-                    valid
-                    * recipient_source_anchor_valid.to(valid)
-                    * (transport_evidence > 0.0).to(valid)
-                    * (wrong_transport_evidence > 0.0).to(valid)
-                )
                 # Source authenticity has exactly two labels: this unshuffled
                 # forward received the recipient's matched input history, and
                 # this counterfactual forward received a non-self history.
@@ -1142,19 +1406,24 @@ def physical_objective(
                 # logits; probability branches retain focused-test and legacy
                 # checkpoint compatibility.
                 with torch.autocast(device_type=physical.device.type, enabled=False):
+                    matched_confidence_target = (
+                        utility_target.float()
+                        if config.source_counterfactual_mode == "global_cross_tile_v1"
+                        else torch.ones_like(transport_confidence.float())
+                    )
                     if transport_confidence_logits is not None:
                         matched_logits = transport_confidence_logits.float()
                         matched_probability = torch.sigmoid(matched_logits)
                         matched_binary_map = F.binary_cross_entropy_with_logits(
                             matched_logits,
-                            torch.ones_like(matched_logits),
+                            matched_confidence_target,
                             reduction="none",
                         )
                     else:
                         matched_probability = transport_confidence.float().clamp(0.0, 1.0)
                         matched_binary_map = F.binary_cross_entropy(
                             matched_probability.clamp(1e-5, 1.0 - 1e-5),
-                            torch.ones_like(matched_probability),
+                            matched_confidence_target,
                             reduction="none",
                         )
                     if wrong_transport_confidence_logits is not None:
@@ -1184,7 +1453,7 @@ def physical_objective(
                             wrong_probability
                             - matched_probability
                             + float(config.counterfactual_confidence_margin)
-                        ),
+                        ) * matched_confidence_target,
                         counterfactual_valid,
                     )
                     counterfactual_confidence = (
@@ -1206,6 +1475,8 @@ def physical_objective(
         + config.candidate_weight * candidate
         + config.utility_weight * utility
         + config.source_shuffle_weight * source_shuffle
+        + config.counterfactual_candidate_ranking_weight * counterfactual_candidate_ranking
+        + config.counterfactual_source_effect_floor_weight * counterfactual_source_effect_floor
         + config.counterfactual_confidence_weight * counterfactual_confidence
     )
     return total, {
@@ -1222,6 +1493,9 @@ def physical_objective(
         "physical_nll": nll.detach(),
         "physical_permutation": permutation.detach(),
         "physical_source_shuffle": source_shuffle.detach(),
+        "physical_counterfactual_candidate_ranking": counterfactual_candidate_ranking.detach(),
+        "physical_counterfactual_source_effect_floor": counterfactual_source_effect_floor.detach(),
+        "physical_counterfactual_candidate_effect": counterfactual_candidate_effect.detach(),
         "physical_counterfactual_confidence": counterfactual_confidence.detach(),
         "physical_counterfactual_confidence_binary": counterfactual_confidence_binary.detach(),
         "physical_counterfactual_confidence_margin": counterfactual_confidence_margin.detach(),

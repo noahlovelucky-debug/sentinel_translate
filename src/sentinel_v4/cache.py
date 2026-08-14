@@ -36,6 +36,7 @@ from .data import (
     SOPAT_CANONICAL_GSD_METERS,
     SOPAT_CANONICALIZATION_VERSION,
     SOPAT_NORMALIZATION_VERSION,
+    GlobalCrossTileHardNegativePlan,
     SOPATDirectionDataset,
     SOPATExampleV4,
     SOPATIndexV4,
@@ -157,6 +158,8 @@ def sopat_chunk_dataset_from_cache(
     window_mode: Literal["all", "center"] | None = None,
     permutation_seed: int = 0,
     permute_observations: bool = True,
+    hard_negative_plan: GlobalCrossTileHardNegativePlan | None = None,
+    include_cf: bool = False,
     verify_chunks: bool = False,
     **chunk_dataset_kwargs: object,
 ) -> SOPATDirectionDataset:
@@ -193,6 +196,8 @@ def sopat_chunk_dataset_from_cache(
         split=split,
         permutation_seed=permutation_seed,
         permute_observations=permute_observations,
+        hard_negative_plan=hard_negative_plan,
+        include_cf=include_cf,
     )
 
 

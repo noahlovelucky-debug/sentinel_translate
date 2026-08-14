@@ -9,6 +9,7 @@ available observation count, and target-anchor change.  This makes a reported
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import os
 from collections.abc import Iterable, Iterator, Mapping, Sequence
@@ -25,6 +26,7 @@ from .training import (
     DIRECTIONS,
     Direction,
     SOPATForwardProtocol,
+    _global_cross_tile_counterfactual_batch,
     forward_direction,
     forward_input_tensors,
     latest_only_batch,
@@ -39,11 +41,17 @@ VariantName = Literal[
     "latest_only",
     "mean_pool",
     "concat",
+    "global_cross_tile",
     "source_shuffle",
     "source_null",
 ]
 SelectionPhase = Literal["feasibility", "full"]
-SELECTION_POLICY_VERSION = "sopat_v4_quality_gate_v2"
+SelectionPolicyVersion = Literal["sopat_v4_quality_gate_v2", "sopat_v4_quality_gate_v3"]
+
+# V2 accepted a batch-local source-history permutation.  V3 is deliberately
+# tied to the immutable, index-wide donor plan emitted by ``data.py``.
+LEGACY_SELECTION_POLICY_VERSION = "sopat_v4_quality_gate_v2"
+SELECTION_POLICY_VERSION = "sopat_v4_quality_gate_v3"
 
 VARIANT_NAMES: frozenset[str] = frozenset(
     {
@@ -52,6 +60,7 @@ VARIANT_NAMES: frozenset[str] = frozenset(
         "latest_only",
         "mean_pool",
         "concat",
+        "global_cross_tile",
         "source_shuffle",
         "source_null",
     }
@@ -63,16 +72,16 @@ _SAR_HISTOGRAM_MAXIMUM_DB = 20.0
 _SAR_HISTOGRAM_BINS = 320
 _STRUCTURAL_BOX_SIZE = 9
 _SOURCE_SHUFFLE_PLANNER = "stable_cyclic_offset_v1"
+_GLOBAL_CROSS_TILE_HARD_PLANNER = "global_cross_tile_hard_v1"
 
 
 class NoSingletonBatchSampler(Sampler[list[int]]):
     """Yield a fixed full-validation partition with no singleton batches.
 
-    Source-history shuffling is only meaningful when every evaluated batch
-    contains at least two independent scenes.  This sampler preserves the
-    complete validation protocol by visiting each index exactly once in
-    ascending order.  When a singleton tail would occur, one item is moved
-    from the preceding full batch to make ``batch_size - 1`` and ``2``.
+    This legacy sampler remains available for old callers that need a
+    no-singleton validation partition.  Global cross-tile counterfactual
+    evaluation does not use it: donor assignment is dataset-level and is
+    invariant to loader batching.
 
     A batch size of two cannot partition an odd number of samples without a
     singleton, duplication, or an oversized batch.  That case fails closed so
@@ -146,7 +155,7 @@ class SOPATVariantConfig:
             return "nonlearned_anchor_baseline"
         if self.name in {"mean_pool", "concat"}:
             return "trained_ablation_interface"
-        if self.name in {"source_shuffle", "source_null"}:
+        if self.name in {"global_cross_tile", "source_shuffle", "source_null"}:
             return "counterfactual"
         return "trained_sopat"
 
@@ -157,12 +166,17 @@ class SOPATVariantConfig:
             "route_kind": self.route_kind,
             "external_reproduction": False,
         }
-        if self.name == "source_shuffle":
+        if self.name in {"global_cross_tile", "source_shuffle"}:
             result.update(
                 {
-                    "shuffle_planner": _SOURCE_SHUFFLE_PLANNER,
-                    "shuffle_key": ("variant.seed", "direction", "batch_index"),
-                    "shuffle_generator": "ignored_for_reproducibility",
+                    "planner": _GLOBAL_CROSS_TILE_HARD_PLANNER,
+                    "counterfactual_source": "dataset_global_plan",
+                    # These are populated by ``evaluate_sopat_loaders`` from
+                    # the dataset plan, rather than guessed from batch order.
+                    "plan_hash": None,
+                    "coverage": None,
+                    "cross_tile_coverage": None,
+                    "tier_counts": None,
                 }
             )
         return result
@@ -180,6 +194,9 @@ class SOPATSelectionConfig:
     """
 
     phase: SelectionPhase = "feasibility"
+    # Keep the public helper backwards-compatible for callers explicitly
+    # selecting historical reports.  The runner always pins V3 below.
+    policy_version: SelectionPolicyVersion = LEGACY_SELECTION_POLICY_VERSION
     required_tasks: tuple[str, ...] = ("translation", "forecast")
     required_observation_counts: tuple[int | str, ...] = ("one",)
     feasibility_overall_anchor_ratio: float = 1.10
@@ -194,6 +211,8 @@ class SOPATSelectionConfig:
     full_scene_improved_fraction_min: float = 0.70
     feasibility_source_shuffle_min_degradation: float = 0.01
     full_source_shuffle_min_degradation: float = 0.02
+    feasibility_candidate_source_shuffle_min_degradation: float = 0.01
+    full_candidate_source_shuffle_min_degradation: float = 0.02
     optical_sam_anchor_delta_max: float = 0.0
     optical_ndvi_mae_anchor_delta_max: float = 0.0
     optical_edge_f1_anchor_delta_min: float = 0.0
@@ -202,6 +221,11 @@ class SOPATSelectionConfig:
     def __post_init__(self) -> None:
         if self.phase not in {"feasibility", "full"}:
             raise ValueError("SOPAT selection phase must be feasibility or full")
+        if self.policy_version not in {
+            LEGACY_SELECTION_POLICY_VERSION,
+            SELECTION_POLICY_VERSION,
+        }:
+            raise ValueError("unsupported SOPAT selection policy version")
         if any(not task for task in self.required_tasks):
             raise ValueError("SOPAT selection tasks must be non-empty strings")
         allowed_counts = {"one", "two_to_three", "four_plus"}
@@ -231,6 +255,8 @@ class SOPATSelectionConfig:
             self.full_scene_improved_fraction_min,
             self.feasibility_source_shuffle_min_degradation,
             self.full_source_shuffle_min_degradation,
+            self.feasibility_candidate_source_shuffle_min_degradation,
+            self.full_candidate_source_shuffle_min_degradation,
         )
         if any(not math.isfinite(value) or value < 0.0 for value in thresholds):
             raise ValueError("SOPAT full selection thresholds must be finite and non-negative")
@@ -265,6 +291,7 @@ _DEFAULT_SELECTION = SOPATSelectionConfig()
 class _Prediction:
     values: Tensor
     pre_projection_violation: Tensor | None
+    candidate_values: Tensor | None = None
 
 
 class _MetricAccumulator:
@@ -573,20 +600,19 @@ def predict_sopat_variant(
     resolved = _coerce_variant(variant)
     if resolved.name == "anchor_copy":
         inputs = forward_input_tensors(batch, device=device)
-        return _Prediction(inputs["target_anchor"], None)
+        return _Prediction(inputs["target_anchor"], None, inputs["target_anchor"])
     if model is None:
         raise TypeError(f"SOPAT variant {resolved.name} requires a trained model")
     routed_batch: Mapping[str, object]
     if resolved.name == "latest_only":
         routed_batch = latest_only_batch(batch)
-    elif resolved.name == "source_shuffle":
-        routed_batch = _source_shuffle_batch(
-            batch,
-            seed=resolved.seed,
-            direction=direction,
-            batch_index=batch_index,
-            generator=generator,
-        )
+    elif resolved.name in {"global_cross_tile", "source_shuffle"}:
+        # ``source_shuffle`` is retained only as a rejected legacy spelling in
+        # selection metadata.  It no longer constructs a batch-local mapping:
+        # every recipient receives the precomputed global-plan donor values
+        # while retaining its own timing and presence tensors.
+        del generator, batch_index
+        routed_batch = _global_cross_tile_counterfactual_batch(batch)
     elif resolved.name == "source_null":
         routed_batch = null_change_batch(batch)
     else:
@@ -598,7 +624,8 @@ def predict_sopat_variant(
     physical = output_tensor(output, "physical")
     assert physical is not None
     violation = output_tensor(output, "pre_projection_violation", required=False)
-    return _Prediction(physical, violation)
+    candidate = output_tensor(output, "candidate_physical", required=False)
+    return _Prediction(physical, violation, candidate)
 
 
 def evaluate_sopat_loaders(
@@ -640,11 +667,21 @@ def evaluate_sopat_loaders(
     finally:
         if isinstance(model, nn.Module) and was_training:
             model.train()
+    metadata = resolved.metadata()
+    if resolved.name in {"global_cross_tile", "source_shuffle"}:
+        metadata.update(_global_plan_metadata_from_loaders(loaders))
+    # Keep the physical direction report compatible with existing consumers;
+    # candidate metrics are a distinct evaluation surface used by the V3
+    # structural-degradation gate.
+    candidate_directions = {
+        direction: directions[direction].pop("candidate") for direction in DIRECTIONS
+    }
     return {
         "family": "sopat_v4_evaluation",
-        "variant": resolved.metadata(),
+        "variant": metadata,
         "changed_threshold_normalized": float(changed_threshold),
         "directions": directions,
+        "candidate_directions": candidate_directions,
     }
 
 
@@ -765,19 +802,15 @@ def select_sopat_candidate(
     *,
     source_shuffle_report: Mapping[str, object] | None = None,
 ) -> SOPATSelectionDecision:
-    """Require joint directional quality and effective source-shuffle evidence.
-
-    The source-shuffle counterfactual is a causal-input dependence check.  A
-    candidate can only become best when replacing each scene's source history
-    with a different scene's history measurably degrades mask-aware structural
-    RMSE in both directions.  Missing or invalid shuffle evidence fails closed.
-    """
+    """Require joint quality and global-plan causal evidence in both directions."""
 
     directions = report.get("directions")
     if not isinstance(directions, Mapping):
         raise TypeError("SOPAT selection report is missing directions")
     failures: list[str] = []
     scores: list[float] = []
+    if config.policy_version == SELECTION_POLICY_VERSION:
+        _global_counterfactual_report_gate(source_shuffle_report, failures)
     overall_ratio, bucket_ratio = _selection_ratios(config)
     for direction in DIRECTIONS:
         directional = directions.get(direction)
@@ -798,12 +831,29 @@ def select_sopat_candidate(
             _overall_metrics(
                 source_shuffle_report,
                 direction,
-                required_variant="source_shuffle",
+                required_variant=(
+                    "global_cross_tile"
+                    if config.policy_version == SELECTION_POLICY_VERSION
+                    else "source_shuffle"
+                ),
             ),
             direction,
             config,
             failures,
+            label="global_counterfactual"
+            if config.policy_version == SELECTION_POLICY_VERSION
+            else "source_shuffle",
         )
+        if config.policy_version == SELECTION_POLICY_VERSION:
+            _source_shuffle_gate(
+                _candidate_overall_metrics(report, direction),
+                _candidate_overall_metrics(source_shuffle_report, direction),
+                direction,
+                config,
+                failures,
+                candidate_level=True,
+                label="global_counterfactual_candidate",
+            )
         for task in config.required_tasks:
             for count in config.required_observation_counts:
                 key = f"{task}/n={_count_bin_label(count)}"
@@ -852,6 +902,7 @@ def _evaluate_direction_loader(
     generator: torch.Generator | None,
 ) -> dict[str, object]:
     buckets: dict[tuple[str, str], _MetricAccumulator] = {}
+    candidate_buckets: dict[tuple[str, str], _MetricAccumulator] = {}
 
     def accumulator(group: str, change: str) -> _MetricAccumulator:
         key = (group, change)
@@ -859,6 +910,14 @@ def _evaluate_direction_loader(
         if current is None:
             current = _MetricAccumulator(direction)
             buckets[key] = current
+        return current
+
+    def candidate_accumulator(group: str, change: str) -> _MetricAccumulator:
+        key = (group, change)
+        current = candidate_buckets.get(key)
+        if current is None:
+            current = _MetricAccumulator(direction)
+            candidate_buckets[key] = current
         return current
 
     for batch_index, batch in enumerate(loader):
@@ -885,6 +944,8 @@ def _evaluate_direction_loader(
                 raise ValueError("SOPAT evaluation physical prediction does not match the target")
             if anchor.shape != target.shape:
                 raise ValueError("SOPAT evaluation target anchor does not match the target")
+            if prediction.candidate_values is not None and prediction.candidate_values.shape != target.shape:
+                raise ValueError("SOPAT evaluation candidate prediction does not match the target")
             task_modes = _task_modes(batch, target.shape[0])
             counts = inputs["observation_present"].sum(dim=1).to(dtype=torch.int64)
             changed = _changed_mask(target, anchor, valid, changed_threshold)
@@ -920,7 +981,34 @@ def _evaluate_direction_loader(
                         sample_valid * (1.0 - sample_changed),
                         pre_projection_violation=pre_projection,
                     )
-    return _direction_report(buckets, direction)
+                    if prediction.candidate_values is not None:
+                        candidate_accumulator(group, "all").add(
+                            prediction.candidate_values[sample_index : sample_index + 1],
+                            target[sample_index : sample_index + 1],
+                            anchor[sample_index : sample_index + 1],
+                            sample_valid,
+                            pre_projection_violation=None,
+                        )
+                        candidate_accumulator(group, "changed").add(
+                            prediction.candidate_values[sample_index : sample_index + 1],
+                            target[sample_index : sample_index + 1],
+                            anchor[sample_index : sample_index + 1],
+                            sample_valid * sample_changed,
+                            pre_projection_violation=None,
+                        )
+                        candidate_accumulator(group, "unchanged").add(
+                            prediction.candidate_values[sample_index : sample_index + 1],
+                            target[sample_index : sample_index + 1],
+                            anchor[sample_index : sample_index + 1],
+                            sample_valid * (1.0 - sample_changed),
+                            pre_projection_violation=None,
+                        )
+    report = _direction_report(buckets, direction)
+    # A separate report makes the selection gate compare like with like:
+    # correct-route candidate against global-counterfactual candidate, never
+    # the confidence-gated physical output as a proxy for candidate behavior.
+    report["candidate"] = _direction_report(candidate_buckets, direction)
+    return report
 
 
 def _direction_report(
@@ -1277,6 +1365,141 @@ def _overall_metrics(
     return _bucket_metrics(directional, "all") if isinstance(directional, Mapping) else None
 
 
+def _candidate_overall_metrics(
+    report: Mapping[str, object] | None, direction: Direction
+) -> Mapping[str, object] | None:
+    """Read the separately accumulated candidate report for one direction."""
+
+    if not isinstance(report, Mapping):
+        return None
+    candidate_directions = report.get("candidate_directions")
+    if isinstance(candidate_directions, Mapping):
+        candidate = candidate_directions.get(direction)
+        return _bucket_metrics(candidate, "all") if isinstance(candidate, Mapping) else None
+    # Reports emitted before the candidate report became top-level placed it
+    # under each physical direction.  Retain this read-only fallback so a V3
+    # gate fails on missing candidate data rather than a schema migration.
+    directions = report.get("directions")
+    if not isinstance(directions, Mapping):
+        return None
+    directional = directions.get(direction)
+    if not isinstance(directional, Mapping):
+        return None
+    candidate = directional.get("candidate")
+    return _bucket_metrics(candidate, "all") if isinstance(candidate, Mapping) else None
+
+
+def _global_counterfactual_report_gate(
+    report: Mapping[str, object] | None, failures: list[str]
+) -> None:
+    """Validate the immutable global donor-plan contract before scoring it.
+
+    A V3 selection must not treat a legacy report, a partial plan, or an
+    unverified same-tile route as causal evidence.  The plan is published by
+    the data layer, so this gate checks report metadata rather than attempting
+    to infer global coverage from a potentially limited evaluation loader.
+    """
+
+    if not isinstance(report, Mapping):
+        failures.append("missing_global_counterfactual_report")
+        return
+    variant = report.get("variant")
+    if not isinstance(variant, Mapping):
+        failures.append("missing_global_counterfactual_metadata")
+        return
+    if variant.get("name") != "global_cross_tile":
+        failures.append("legacy_global_counterfactual_planner")
+    if variant.get("planner") != _GLOBAL_CROSS_TILE_HARD_PLANNER:
+        failures.append("invalid_global_counterfactual_planner")
+    plan_hash = variant.get("plan_hash")
+    if not isinstance(plan_hash, str) or not plan_hash:
+        failures.append("missing_global_counterfactual_plan_hash")
+    for name in ("coverage", "cross_tile_coverage"):
+        value = variant.get(name)
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            failures.append(f"missing_global_counterfactual_{name}")
+            continue
+        if not math.isfinite(float(value)) or float(value) < 1.0:
+            failures.append(f"incomplete_global_counterfactual_{name}:{float(value):.6f}")
+    tiers = variant.get("tier_counts")
+    if not isinstance(tiers, Mapping) or not tiers:
+        failures.append("missing_global_counterfactual_tier_counts")
+    elif any(
+        isinstance(value, bool) or not isinstance(value, int) or value < 0
+        for value in tiers.values()
+    ):
+        failures.append("invalid_global_counterfactual_tier_counts")
+
+
+def _global_plan_metadata_from_loaders(
+    loaders: Mapping[Direction, Iterable[Mapping[str, object]]]
+) -> dict[str, object]:
+    """Collect one immutable plan metadata record per direction from loaders."""
+
+    plans: dict[str, Mapping[str, object]] = {}
+    for direction in DIRECTIONS:
+        loader = loaders[direction]
+        dataset = getattr(loader, "dataset", None)
+        plan = getattr(dataset, "hard_negative_plan", None)
+        metadata = getattr(plan, "mapping_metadata", None)
+        if not isinstance(metadata, Mapping):
+            return {
+                "plan_hash": None,
+                "coverage": None,
+                "cross_tile_coverage": None,
+                "tier_counts": None,
+                "plans": {},
+            }
+        plans[direction] = dict(metadata)
+    # Each direction has an independent plan.  The combined digest binds them
+    # together while retaining the individual hashes for checkpoint audit.
+    plan_hashes: dict[str, str] = {}
+    for direction, metadata in plans.items():
+        value = metadata.get("plan_hash")
+        if not isinstance(value, str) or not value:
+            return {
+                "plan_hash": None,
+                "coverage": None,
+                "cross_tile_coverage": None,
+                "tier_counts": None,
+                "plans": plans,
+            }
+        plan_hashes[direction] = value
+    plan_hash = hashlib.sha256(
+        json.dumps(plan_hashes, sort_keys=True, separators=(",", ":")).encode("ascii")
+    ).hexdigest()
+    def minimum_plan_fraction(name: str) -> float | None:
+        values: list[float] = []
+        for metadata in plans.values():
+            value = metadata.get(name)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            fraction = float(value)
+            if not math.isfinite(fraction):
+                return None
+            values.append(fraction)
+        return min(values) if values else None
+
+    coverage = minimum_plan_fraction("coverage")
+    cross_tile_coverage = minimum_plan_fraction("cross_tile_coverage")
+    tier_counts: dict[str, int] = {}
+    for metadata in plans.values():
+        values = metadata.get("tier_counts")
+        if not isinstance(values, Mapping):
+            continue
+        for tier, count in values.items():
+            if isinstance(tier, str) and isinstance(count, int) and not isinstance(count, bool):
+                tier_counts[tier] = tier_counts.get(tier, 0) + count
+    return {
+        "plan_hash": plan_hash,
+        "plan_hashes": plan_hashes,
+        "coverage": coverage,
+        "cross_tile_coverage": cross_tile_coverage,
+        "tier_counts": tier_counts,
+        "plans": plans,
+    }
+
+
 def _change_bucket_metrics(value: object, change: str) -> Mapping[str, object] | None:
     if not isinstance(value, Mapping):
         return None
@@ -1304,26 +1527,36 @@ def _source_shuffle_gate(
     direction: Direction,
     config: SOPATSelectionConfig,
     failures: list[str],
+    *,
+    candidate_level: bool = False,
+    label: str = "source_shuffle",
 ) -> None:
     candidate_rmse = _metric_float(candidate, "structural_rmse")
     shuffle_rmse = _metric_float(shuffle, "structural_rmse")
     if candidate_rmse is None or shuffle_rmse is None:
-        failures.append(f"missing_source_shuffle_structural_metrics:{direction}")
+        failures.append(f"missing_{label}_structural_metrics:{direction}")
         return
     if candidate_rmse <= 0.0:
         failures.append(
-            f"invalid_source_shuffle_structural_rmse:{direction}:{candidate_rmse}"
+            f"invalid_{label}_structural_rmse:{direction}:{candidate_rmse}"
         )
         return
     degradation = shuffle_rmse / candidate_rmse - 1.0
-    threshold = (
-        config.full_source_shuffle_min_degradation
-        if config.phase == "full"
-        else config.feasibility_source_shuffle_min_degradation
-    )
+    if candidate_level:
+        threshold = (
+            config.full_candidate_source_shuffle_min_degradation
+            if config.phase == "full"
+            else config.feasibility_candidate_source_shuffle_min_degradation
+        )
+    else:
+        threshold = (
+            config.full_source_shuffle_min_degradation
+            if config.phase == "full"
+            else config.feasibility_source_shuffle_min_degradation
+        )
     if degradation < threshold:
         failures.append(
-            "source_shuffle_insufficient_structural_degradation:"
+            f"{label}_insufficient_structural_degradation:"
             f"{direction}:{degradation:.6f}<{threshold:.6f}"
         )
 

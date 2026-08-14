@@ -36,6 +36,7 @@ from sentinel_v4.data import (
     CoupledDirectionLoader,
     SOPATDirectionDataset,
     SOPATIndexV4,
+    build_global_cross_tile_hard_negative_plan,
     collate_sopat_direction,
     load_sopat_v4_index,
     migrate_paired_temporal_index_v4,
@@ -43,7 +44,6 @@ from sentinel_v4.data import (
 )
 from sentinel_v4.evaluation import (
     SELECTION_POLICY_VERSION,
-    NoSingletonBatchSampler,
     SOPATSelectionConfig,
     SOPATSelectionDecision,
     SOPATVariantConfig,
@@ -475,6 +475,24 @@ def _datasets(
     options = _dataset_options(data, stage=stage)
     train: dict[str, SOPATDirectionDataset] = {}
     validation: dict[str, SOPATDirectionDataset] = {}
+    # Factorizer never consumes source-history counterfactuals.  Physical
+    # training and validation receive a deterministic, split-global plan for
+    # each direction; this makes donor assignment independent of batch order.
+    plans = (
+        {
+            direction: {
+                "train": build_global_cross_tile_hard_negative_plan(
+                    index, direction=direction, split=prepared.train_split
+                ),
+                "validation": build_global_cross_tile_hard_negative_plan(
+                    index, direction=direction, split=prepared.validation_split
+                ),
+            }
+            for direction in DIRECTIONS
+        }
+        if stage == "physical"
+        else {}
+    )
     if prepared.route == "chunk_cache":
         cache_root = prepared.cache_root
         if cache_root is None:
@@ -491,6 +509,8 @@ def _datasets(
                 max_observations=int(options["max_observations"]),
                 registration_audit=bool(options["registration_audit"]),
                 maximum_registration_shift_px=float(options["maximum_registration_shift_px"]),
+                hard_negative_plan=plans.get(direction, {}).get("train"),
+                include_cf=stage == "physical",
             )
             validation[direction] = sopat_chunk_dataset_from_cache(
                 cache_root,
@@ -503,6 +523,8 @@ def _datasets(
                 max_observations=int(options["max_observations"]),
                 registration_audit=bool(options["registration_audit"]),
                 maximum_registration_shift_px=float(options["maximum_registration_shift_px"]),
+                hard_negative_plan=plans.get(direction, {}).get("validation"),
+                include_cf=stage == "physical",
             )
     else:
         manifest = prepared.manifest_path
@@ -517,6 +539,8 @@ def _datasets(
                 direction=direction,
                 split=prepared.train_split,
                 permutation_seed=seed,
+                hard_negative_plan=plans.get(direction, {}).get("train"),
+                include_cf=stage == "physical",
                 **train_options,
             )
             validation[direction] = SOPATDirectionDataset.from_raster(
@@ -525,6 +549,8 @@ def _datasets(
                 direction=direction,
                 split=prepared.validation_split,
                 permutation_seed=seed,
+                hard_negative_plan=plans.get(direction, {}).get("validation"),
+                include_cf=stage == "physical",
                 **validation_options,
             )
     return train, validation
@@ -573,6 +599,7 @@ def _selection_config(config: Mapping[str, Any], *, phase: str) -> SOPATSelectio
         raise ValueError(f"unknown SOPAT selection setting(s): {', '.join(unknown)}")
     payload = dict(values)
     payload["phase"] = phase
+    payload["policy_version"] = SELECTION_POLICY_VERSION
     if "required_observation_counts" in payload:
         counts = payload["required_observation_counts"]
         if not isinstance(counts, Sequence) or isinstance(counts, (str, bytes)):
@@ -607,10 +634,8 @@ def _validate_run_config(config: Mapping[str, Any], *, world_size: int) -> None:
         raise ValueError("SOPAT training.log_every must be positive")
     validation = _mapping(config, "validation")
     validation_batch_size = validation.get("batch_size", training.get("batch_size", 1))
-    if int(validation_batch_size) < 2:
-        raise ValueError(
-            "SOPAT validation.batch_size must be at least 2 for source_shuffle evaluation"
-        )
+    if int(validation_batch_size) <= 0:
+        raise ValueError("SOPAT validation.batch_size must be positive")
 
 
 def _seed(seed: int, rank: int) -> None:
@@ -640,7 +665,7 @@ def _loaders(
     for direction in DIRECTIONS:
         dataset = datasets[direction]
         if not training and batch_samplers is None:
-            batch_sampler: Sampler[list[int]] = NoSingletonBatchSampler(len(dataset), batch_size)
+            batch_sampler: Sampler[list[int]] | None = None
         elif not training:
             try:
                 batch_sampler = batch_samplers[direction]  # type: ignore[index]
@@ -671,14 +696,25 @@ def _loaders(
                 collate_fn=collate_sopat_direction,
             )
         else:
-            loader = DataLoader(
-                dataset,
-                batch_sampler=batch_sampler,
-                num_workers=num_workers,
-                persistent_workers=num_workers > 0,
-                pin_memory=device.type == "cuda",
-                collate_fn=collate_sopat_direction,
-            )
+            if batch_sampler is None:
+                loader = DataLoader(
+                    dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    persistent_workers=num_workers > 0,
+                    pin_memory=device.type == "cuda",
+                    collate_fn=collate_sopat_direction,
+                )
+            else:
+                loader = DataLoader(
+                    dataset,
+                    batch_sampler=batch_sampler,
+                    num_workers=num_workers,
+                    persistent_workers=num_workers > 0,
+                    pin_memory=device.type == "cuda",
+                    collate_fn=collate_sopat_direction,
+                )
         if len(loader) <= 0:
             raise RuntimeError(
                 f"SOPAT {direction} {'train' if training else 'validation'} loader is empty; "
@@ -730,6 +766,38 @@ def _write_json(path: Path, value: Mapping[str, object]) -> None:
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _global_counterfactual_data_state(
+    *,
+    train_datasets: Mapping[str, SOPATDirectionDataset],
+    validation_datasets: Mapping[str, SOPATDirectionDataset],
+    train_split: str,
+    validation_split: str,
+) -> dict[str, object]:
+    """Serialize both immutable donor-plan sets for resume auditing."""
+
+    def split_state(
+        datasets: Mapping[str, SOPATDirectionDataset], *, split: str
+    ) -> dict[str, object]:
+        plans: dict[str, object] = {}
+        for direction in DIRECTIONS:
+            plan = getattr(datasets[direction], "hard_negative_plan", None)
+            metadata = getattr(plan, "mapping_metadata", None)
+            if not isinstance(metadata, Mapping):
+                raise TypeError(
+                    "SOPAT physical checkpoint requires global counterfactual plan metadata "
+                    f"for {direction}/{split}"
+                )
+            plans[direction] = dict(metadata)
+        return {"split": split, "plans": plans}
+
+    return {
+        "global_counterfactual": {
+            "train": split_state(train_datasets, split=train_split),
+            "validation": split_state(validation_datasets, split=validation_split),
+        }
+    }
 
 
 def _best_from_checkpoint(payload: Mapping[str, object]) -> SOPATSelectionDecision | None:
@@ -797,7 +865,7 @@ def _evaluate_validation(
         shuffle = evaluate_sopat_loaders(
             model,
             loaders,
-            variant=SOPATVariantConfig("source_shuffle", seed=seed),
+            variant=SOPATVariantConfig("global_cross_tile", seed=seed),
             device=device,
             limit_batches=limit_batches,
         )
@@ -888,9 +956,9 @@ def main() -> None:
         validation = _mapping(config, "validation")
         validation_batch_size = int(validation.get("batch_size", batch_size))
         num_workers = int(args.num_workers if args.num_workers is not None else training.get("num_workers", 4))
-        if batch_size <= 0 or validation_batch_size < 2 or num_workers < 0:
+        if batch_size <= 0 or validation_batch_size <= 0 or num_workers < 0:
             raise ValueError(
-                "SOPAT training.batch_size must be positive, validation.batch_size at least 2, "
+                "SOPAT training.batch_size and validation.batch_size must be positive, "
                 "and num_workers non-negative"
             )
         train_loaders = _loaders(
@@ -913,6 +981,20 @@ def main() -> None:
             training=False,
             seed=args.seed,
         )
+        checkpoint_data_state = {
+            "epoch": 0,
+            "step_in_epoch": 0,
+            **(
+                _global_counterfactual_data_state(
+                    train_datasets=train_datasets,
+                    validation_datasets=validation_datasets,
+                    train_split=prepared.train_split,
+                    validation_split=prepared.validation_split,
+                )
+                if args.stage == "physical"
+                else {}
+            ),
+        }
         coupled = CoupledDirectionLoader(train_loaders)  # type: ignore[arg-type]
         model_config = _model_config(config)
         train_config = _train_config(config, stage=args.stage)
@@ -1177,7 +1259,11 @@ def main() -> None:
                             global_step=global_step,
                             best_metrics=report["best_metrics"],
                             rng_state=rng_states,
-                            data_state={"epoch": epoch, "step_in_epoch": coupled_batch.step},
+                            data_state={
+                                **checkpoint_data_state,
+                                "epoch": epoch,
+                                "step_in_epoch": coupled_batch.step,
+                            },
                         )
                         if full and became_best:
                             save_sopat_checkpoint(
@@ -1192,7 +1278,11 @@ def main() -> None:
                                 global_step=global_step,
                                 best_metrics=report["best_metrics"],
                                 rng_state=rng_states,
-                                data_state={"epoch": epoch, "step_in_epoch": coupled_batch.step},
+                                data_state={
+                                    **checkpoint_data_state,
+                                    "epoch": epoch,
+                                    "step_in_epoch": coupled_batch.step,
+                                },
                             )
                             if args.stage == "physical":
                                 panel_count = int(_mapping(config, "validation").get("panel_samples", 16))

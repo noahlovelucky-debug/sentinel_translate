@@ -44,6 +44,21 @@ SOPAT_CANONICAL_GSD_METERS = 10.0
 SOPAT_NORMALIZATION_VERSION = "paired_temporal_v3_normalized"
 SOPAT_CANONICALIZATION_VERSION = "canonical_10m_v1"
 ObservationRole = Literal["history", "query_source"]
+GlobalCrossTileHardNegativeTier = Literal[
+    "same_task_exact_n",
+    "same_task_n_bin",
+    "same_task",
+    "same_orbit",
+]
+
+GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLAN_VERSION = 1
+GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLANNER = "global_cross_tile_hard_v1"
+_GLOBAL_CROSS_TILE_HARD_NEGATIVE_TIERS: tuple[GlobalCrossTileHardNegativeTier, ...] = (
+    "same_task_exact_n",
+    "same_task_n_bin",
+    "same_task",
+    "same_orbit",
+)
 
 
 def sensor_schema_hash() -> str:
@@ -475,6 +490,227 @@ class SOPATIndexV4:
         )
 
 
+@dataclass(frozen=True)
+class GlobalCrossTileHardNegativeMapping:
+    """One immutable recipient-to-donor source-history route."""
+
+    recipient_sample_id: str
+    donor_sample_id: str
+    tier: GlobalCrossTileHardNegativeTier
+
+    def __post_init__(self) -> None:
+        if not self.recipient_sample_id or not self.donor_sample_id:
+            raise ValueError("global hard-negative mapping sample IDs must be non-empty")
+        if self.recipient_sample_id == self.donor_sample_id:
+            raise ValueError("global hard-negative mapping cannot select itself")
+        if self.tier not in _GLOBAL_CROSS_TILE_HARD_NEGATIVE_TIERS:
+            raise ValueError(f"unsupported global hard-negative tier: {self.tier!r}")
+
+    def to_dict(self) -> dict[str, str]:
+        return {
+            "recipient_sample_id": self.recipient_sample_id,
+            "donor_sample_id": self.donor_sample_id,
+            "tier": self.tier,
+        }
+
+
+@dataclass(frozen=True)
+class GlobalCrossTileHardNegativePlan:
+    """Fully covered, deterministic cross-tile source-history donor plan.
+
+    The plan commits only to immutable V4 index identity and sample routing.
+    Pixel tensors remain backend-owned and are read only when a dataset opts
+    into counterfactual examples.
+    """
+
+    direction: Direction
+    split: str
+    index_content_sha256: str
+    mappings: tuple[GlobalCrossTileHardNegativeMapping, ...]
+    format_version: int = GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLAN_VERSION
+    planner: str = GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLANNER
+
+    def __post_init__(self) -> None:
+        if self.format_version != GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLAN_VERSION:
+            raise ValueError("unsupported global hard-negative plan format")
+        if self.direction not in ALL_DIRECTIONS or not self.split:
+            raise ValueError("global hard-negative plan requires direction and split")
+        if not self.index_content_sha256:
+            raise ValueError("global hard-negative plan requires index content hash")
+        if self.planner != GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLANNER:
+            raise ValueError("unsupported global hard-negative planner")
+        mappings = tuple(sorted(self.mappings, key=lambda item: item.recipient_sample_id))
+        recipient_ids = tuple(item.recipient_sample_id for item in mappings)
+        if not mappings or len(recipient_ids) != len(set(recipient_ids)):
+            raise ValueError("global hard-negative plan requires one mapping per recipient")
+        object.__setattr__(self, "mappings", mappings)
+
+    @classmethod
+    def from_index(
+        cls,
+        index: SOPATIndexV4,
+        *,
+        direction: Direction,
+        split: str,
+    ) -> GlobalCrossTileHardNegativePlan:
+        """Build a complete deterministic donor mapping or fail closed."""
+
+        examples = index.select(direction=direction, split=split)
+        if not examples:
+            raise ValueError(f"SOPAT V4 has no examples for {direction}/{split}")
+        mappings: list[GlobalCrossTileHardNegativeMapping] = []
+        for recipient in examples:
+            candidates = [
+                donor
+                for donor in examples
+                if _global_cross_tile_hard_negative_eligible(recipient, donor)
+            ]
+            if not candidates:
+                raise ValueError(
+                    "global cross-tile hard-negative plan has no eligible donor for "
+                    f"{recipient.sample_id}"
+                )
+            tier = min(
+                (_global_cross_tile_hard_negative_tier(recipient, donor) for donor in candidates),
+                key=_GLOBAL_CROSS_TILE_HARD_NEGATIVE_TIERS.index,
+            )
+            tier_candidates = [
+                donor
+                for donor in candidates
+                if _global_cross_tile_hard_negative_tier(recipient, donor) == tier
+            ]
+            donor = min(
+                tier_candidates,
+                key=lambda candidate: (
+                    _global_cross_tile_hard_negative_temporal_distance(recipient, candidate),
+                    _global_cross_tile_hard_negative_choice_key(
+                        recipient.sample_id,
+                        candidate.sample_id,
+                    ),
+                ),
+            )
+            mappings.append(
+                GlobalCrossTileHardNegativeMapping(
+                    recipient_sample_id=recipient.sample_id,
+                    donor_sample_id=donor.sample_id,
+                    tier=tier,
+                )
+            )
+        result = cls(
+            direction=direction,
+            split=split,
+            index_content_sha256=index.content_hash,
+            mappings=tuple(mappings),
+        )
+        result.assert_valid_for(index)
+        return result
+
+    @property
+    def coverage(self) -> float:
+        """Plan construction is all-or-nothing, so a usable plan is complete."""
+
+        return 1.0
+
+    @property
+    def version(self) -> int:
+        """Compatibility-friendly public plan version alias."""
+
+        return self.format_version
+
+    @property
+    def tier_counts(self) -> dict[str, int]:
+        return {
+            tier: sum(mapping.tier == tier for mapping in self.mappings)
+            for tier in _GLOBAL_CROSS_TILE_HARD_NEGATIVE_TIERS
+        }
+
+    @property
+    def mapping_metadata(self) -> dict[str, object]:
+        return {
+            "format_version": self.format_version,
+            "version": self.version,
+            "planner": self.planner,
+            "selection": "relative_source_anchor_l1_then_sha256_v1",
+            "alignment": "chronological_normalized_nearest_v1",
+            "direction": self.direction,
+            "split": self.split,
+            "index_content_sha256": self.index_content_sha256,
+            "coverage": self.coverage,
+            "cross_tile_coverage": self.coverage,
+            "mappings": len(self.mappings),
+            "tier_counts": self.tier_counts,
+            "plan_hash": self.plan_hash,
+        }
+
+    def to_dict(self) -> dict[str, object]:
+        """Return a JSON-safe, hash-bound representation of this plan."""
+
+        return {
+            **self.mapping_metadata,
+            "mappings": [mapping.to_dict() for mapping in self.mappings],
+        }
+
+    @property
+    def plan_hash(self) -> str:
+        return _payload_hash(
+            {
+                "format_version": self.format_version,
+                "planner": self.planner,
+                "direction": self.direction,
+                "split": self.split,
+                "index_content_sha256": self.index_content_sha256,
+                "mappings": [mapping.to_dict() for mapping in self.mappings],
+            }
+        )
+
+    @property
+    def hash(self) -> str:
+        """Compatibility-friendly public immutable plan hash alias."""
+
+        return self.plan_hash
+
+    def donor_for(self, recipient_sample_id: str) -> GlobalCrossTileHardNegativeMapping:
+        for mapping in self.mappings:
+            if mapping.recipient_sample_id == recipient_sample_id:
+                return mapping
+        raise KeyError(f"global hard-negative plan has no recipient {recipient_sample_id}")
+
+    def assert_valid_for(self, index: SOPATIndexV4) -> None:
+        """Revalidate immutable route constraints against the supplied index."""
+
+        if index.content_hash != self.index_content_sha256:
+            raise ValueError("global hard-negative plan index content hash differs from dataset index")
+        examples = index.select(direction=self.direction, split=self.split)
+        by_id = {example.sample_id: example for example in examples}
+        if len(by_id) != len(examples):
+            raise AssertionError("SOPAT V4 direction/split has duplicate sample IDs")
+        if set(by_id) != {mapping.recipient_sample_id for mapping in self.mappings}:
+            raise ValueError("global hard-negative plan coverage differs from the dataset route")
+        for mapping in self.mappings:
+            recipient = by_id[mapping.recipient_sample_id]
+            donor = by_id.get(mapping.donor_sample_id)
+            if donor is None:
+                raise ValueError("global hard-negative plan donor is outside the dataset route")
+            if not _global_cross_tile_hard_negative_eligible(recipient, donor):
+                raise ValueError(
+                    "global hard-negative plan donor no longer meets cross-tile constraints: "
+                    f"{recipient.sample_id}"
+                )
+            if _global_cross_tile_hard_negative_tier(recipient, donor) != mapping.tier:
+                raise ValueError("global hard-negative plan tier does not match its donor")
+
+
+def build_global_cross_tile_hard_negative_plan(
+    index: SOPATIndexV4,
+    *,
+    direction: Direction,
+    split: str,
+) -> GlobalCrossTileHardNegativePlan:
+    """Public convenience constructor for a complete global donor plan."""
+
+    return GlobalCrossTileHardNegativePlan.from_index(index, direction=direction, split=split)
+
+
 def assert_sopat_v4_causality(
     index: SOPATIndexV4 | Sequence[SOPATExampleV4],
     *,
@@ -728,6 +964,8 @@ class SOPATDirectionDataset(Dataset[dict[str, object]]):
         split: str,
         permutation_seed: int = 0,
         permute_observations: bool = True,
+        hard_negative_plan: GlobalCrossTileHardNegativePlan | None = None,
+        include_cf: bool = False,
     ) -> None:
         examples = index.select(direction=direction, split=split)
         if not examples:
@@ -769,9 +1007,19 @@ class SOPATDirectionDataset(Dataset[dict[str, object]]):
         self.split = split
         self.permutation_seed = int(permutation_seed)
         self.permute_observations = bool(permute_observations)
+        if include_cf and hard_negative_plan is None:
+            raise ValueError("include_cf requires a global cross-tile hard-negative plan")
+        if hard_negative_plan is not None:
+            if hard_negative_plan.direction != direction or hard_negative_plan.split != split:
+                raise ValueError("global hard-negative plan route differs from SOPAT dataset")
+            hard_negative_plan.assert_valid_for(index)
+        self.hard_negative_plan = hard_negative_plan
+        self.include_cf = bool(include_cf)
         self.epoch = 0
         self.backend_windows = backend_windows
         self._backend_positions = tuple(by_sample_id[example.sample_id] for example in examples)
+        self._backend_position_by_sample_id = by_sample_id
+        self._examples_by_sample_id = {example.sample_id: example for example in examples}
         self._backend_observation_ids = {
             example.sample_id: tuple(
                 observation.measurement.measurement_id
@@ -796,6 +1044,8 @@ class SOPATDirectionDataset(Dataset[dict[str, object]]):
         split: str,
         permutation_seed: int = 0,
         permute_observations: bool = True,
+        hard_negative_plan: GlobalCrossTileHardNegativePlan | None = None,
+        include_cf: bool = False,
         **dataset_kwargs: object,
     ) -> SOPATDirectionDataset:
         """Construct a V4 wrapper around ``PairedTemporalRasterDataset``."""
@@ -811,6 +1061,8 @@ class SOPATDirectionDataset(Dataset[dict[str, object]]):
             split=split,
             permutation_seed=permutation_seed,
             permute_observations=permute_observations,
+            hard_negative_plan=hard_negative_plan,
+            include_cf=include_cf,
         )
 
     def set_epoch(self, epoch: int) -> None:
@@ -841,6 +1093,7 @@ class SOPATDirectionDataset(Dataset[dict[str, object]]):
             {
                 "sopat_example_id": example.sample_id,
                 "sopat_direction": self.direction,
+                "sopat_tile": example.tile,
                 "sopat_grid_id": example.canonical_grid.grid_id,
                 "sopat_time_precision": example.provenance.time_precision,
                 "sopat_query_source_id": example.query_source_id,
@@ -850,7 +1103,81 @@ class SOPATDirectionDataset(Dataset[dict[str, object]]):
                 ),
             }
         )
+        if self.include_cf:
+            self._add_counterfactual_observations(
+                item,
+                recipient=example,
+                recipient_order=order,
+                window_position=window_position,
+            )
         return item
+
+    def _add_counterfactual_observations(
+        self,
+        item: dict[str, object],
+        *,
+        recipient: SOPATExampleV4,
+        recipient_order: tuple[int, ...],
+        window_position: int,
+    ) -> None:
+        plan = self.hard_negative_plan
+        if plan is None:
+            raise AssertionError("counterfactual route requires a hard-negative plan")
+        mapping = plan.donor_for(recipient.sample_id)
+        donor = self._examples_by_sample_id.get(mapping.donor_sample_id)
+        if donor is None:
+            raise RuntimeError("counterfactual donor is absent from SOPAT dataset route")
+        donor_position = self._backend_position_by_sample_id.get(donor.sample_id)
+        if donor_position is None:
+            raise RuntimeError("counterfactual donor is absent from backend route")
+        donor_item = self.backend[donor_position * self.backend_windows + window_position]
+        if donor_item.get("direction") != self.direction or donor_item.get("task_mode") != donor.task_mode:
+            raise RuntimeError("SOPAT V4 backend donor disagrees with routed example")
+        donor_values, donor_valid, donor_present = self._counterfactual_donor_tensors(donor_item)
+        recipient_count = len(recipient_order)
+        values, valid = _align_counterfactual_observations(
+            donor_values,
+            donor_valid,
+            donor_present,
+            recipient_count=recipient_count,
+        )
+        selector = torch.tensor(recipient_order, dtype=torch.long, device=values.device)
+        item.update(
+            {
+                "counterfactual_observation_values": values.index_select(0, selector),
+                "counterfactual_observation_valid": valid.index_select(
+                    0, selector.to(valid.device)
+                ),
+                "sopat_cf_donor_sample_id": donor.sample_id,
+                "sopat_cf_donor_tile": donor.tile,
+                "sopat_cf_donor_grid_id": donor.canonical_grid.grid_id,
+                "sopat_cf_tier": mapping.tier,
+                "sopat_cf_plan_hash": plan.plan_hash,
+            }
+        )
+
+    @staticmethod
+    def _counterfactual_donor_tensors(
+        donor_item: Mapping[str, object],
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        values = donor_item.get("observation_values")
+        valid = donor_item.get("observation_valid")
+        present = donor_item.get("observation_present")
+        if not isinstance(values, torch.Tensor) or not isinstance(valid, torch.Tensor):
+            raise TypeError("SOPAT V4 donor backend lacks observation tensors")
+        if not isinstance(present, torch.Tensor) or present.ndim != 1:
+            raise TypeError("SOPAT V4 donor backend lacks one-dimensional observation_present")
+        if values.ndim < 2 or valid.ndim < 2 or values.shape[0] != present.shape[0]:
+            raise RuntimeError("SOPAT V4 donor observation tensors have inconsistent leading dimensions")
+        if valid.shape[0] != present.shape[0]:
+            raise RuntimeError("SOPAT V4 donor validity tensor has inconsistent leading dimension")
+        count = int(present.bool().sum().item())
+        if count <= 0 or not torch.equal(
+            present.bool(),
+            torch.arange(present.shape[0], device=present.device) < count,
+        ):
+            raise RuntimeError("SOPAT V4 donor backend must keep real observations before padding")
+        return values[:count], valid[:count], present[:count].bool()
 
     def _observation_permutation(
         self, item: Mapping[str, object], example: SOPATExampleV4, window: int
@@ -908,12 +1235,58 @@ def collate_sopat_direction(samples: Sequence[Mapping[str, object]]) -> dict[str
     for key in (
         "sopat_example_id",
         "sopat_grid_id",
+        "sopat_tile",
         "sopat_time_precision",
         "sopat_query_source_id",
         "sopat_observation_ids",
         "sopat_observation_roles",
     ):
         batch[key] = [sample.get(key) for sample in samples]
+    has_counterfactual = [
+        "counterfactual_observation_values" in sample
+        or "counterfactual_observation_valid" in sample
+        for sample in samples
+    ]
+    if any(has_counterfactual):
+        if not all(has_counterfactual):
+            raise ValueError("SOPAT batch cannot mix counterfactual and regular samples")
+        counterfactual_values = [
+            _required_counterfactual_tensor(sample, "counterfactual_observation_values")
+            for sample in samples
+        ]
+        counterfactual_valid = [
+            _required_counterfactual_tensor(sample, "counterfactual_observation_valid")
+            for sample in samples
+        ]
+        recipient_values = batch.get("observation_values")
+        if not isinstance(recipient_values, torch.Tensor) or recipient_values.ndim != 5:
+            raise TypeError("SOPAT collator did not produce BxTxCxHxW recipient observations")
+        # Counterfactual rows are real-recipient-N only.  Pad them independently
+        # into the existing recipient batch time axis without touching core tensors.
+        maximum_counterfactual_observations = int(recipient_values.shape[1])
+        padded_counterfactual_values: list[torch.Tensor] = []
+        padded_counterfactual_valid: list[torch.Tensor] = []
+        for values, valid in zip(counterfactual_values, counterfactual_valid, strict=True):
+            _validate_counterfactual_observation_tensors(values, valid)
+            padded_counterfactual_values.append(
+                _pad_counterfactual_observation_tensor(values, maximum_counterfactual_observations)
+            )
+            padded_counterfactual_valid.append(
+                _pad_counterfactual_observation_tensor(valid, maximum_counterfactual_observations)
+            )
+        batch["counterfactual_observation_values"] = torch.stack(padded_counterfactual_values)
+        batch["counterfactual_observation_valid"] = torch.stack(padded_counterfactual_valid)
+        for key in (
+            "sopat_cf_donor_sample_id",
+            "sopat_cf_donor_tile",
+            "sopat_cf_donor_grid_id",
+            "sopat_cf_tier",
+            "sopat_cf_plan_hash",
+        ):
+            values = [sample.get(key) for sample in samples]
+            if any(value is None for value in values):
+                raise KeyError(f"SOPAT counterfactual sample lacks metadata {key}")
+            batch[key] = values
     return batch
 
 
@@ -1221,6 +1594,201 @@ def _observation_serialization_key(
 def _observation_backend_key(observation: SOPATObservationRefV4) -> tuple[str, str, str]:
     measurement = observation.measurement
     return measurement.time, measurement.record_id, measurement.measurement_id
+
+
+def _observation_count_bin(value: int) -> str:
+    if value <= 0:
+        raise ValueError("global hard-negative planning requires at least one observation")
+    if value == 1:
+        return "one"
+    if value <= 3:
+        return "two_to_three"
+    return "four_plus"
+
+
+def _global_cross_tile_hard_negative_eligible(
+    recipient: SOPATExampleV4,
+    donor: SOPATExampleV4,
+) -> bool:
+    """Return whether a donor is physically disjoint from a recipient route."""
+
+    if (
+        recipient.sample_id == donor.sample_id
+        or recipient.direction != donor.direction
+        or recipient.split != donor.split
+        or recipient.orbit != donor.orbit
+        or recipient.tile == donor.tile
+        or recipient.anchor_pair.registration_id == donor.anchor_pair.registration_id
+        or recipient.target.record_id == donor.target.record_id
+    ):
+        return False
+    recipient_record_ids = {
+        recipient.target.record_id,
+        recipient.anchor_pair.registration_id,
+        *(observation.measurement.record_id for observation in recipient.observations),
+    }
+    donor_record_ids = {
+        donor.target.record_id,
+        donor.anchor_pair.registration_id,
+        *(observation.measurement.record_id for observation in donor.observations),
+    }
+    if not recipient_record_ids.isdisjoint(donor_record_ids):
+        return False
+    recipient_measurements = {
+        observation.measurement.measurement_id for observation in recipient.observations
+    }
+    donor_measurements = {
+        observation.measurement.measurement_id for observation in donor.observations
+    }
+    return recipient_measurements.isdisjoint(donor_measurements)
+
+
+def _global_cross_tile_hard_negative_tier(
+    recipient: SOPATExampleV4,
+    donor: SOPATExampleV4,
+) -> GlobalCrossTileHardNegativeTier:
+    recipient_n = len(recipient.observations)
+    donor_n = len(donor.observations)
+    if recipient.task_mode == donor.task_mode and recipient_n == donor_n:
+        return "same_task_exact_n"
+    if (
+        recipient.task_mode == donor.task_mode
+        and _observation_count_bin(recipient_n) == _observation_count_bin(donor_n)
+    ):
+        return "same_task_n_bin"
+    if recipient.task_mode == donor.task_mode:
+        return "same_task"
+    return "same_orbit"
+
+
+def _global_cross_tile_hard_negative_choice_key(
+    recipient_sample_id: str,
+    donor_sample_id: str,
+) -> tuple[str, str]:
+    """Stable SHA choice with sample ID as an explicit collision tie-break."""
+
+    digest = hashlib.sha256(
+        f"{GLOBAL_CROSS_TILE_HARD_NEGATIVE_PLANNER}:{recipient_sample_id}:{donor_sample_id}".encode()
+    ).hexdigest()
+    return digest, donor_sample_id
+
+
+def _global_cross_tile_hard_negative_temporal_distance(
+    recipient: SOPATExampleV4,
+    donor: SOPATExampleV4,
+) -> int:
+    """Compare source-history cadence relative to each source anchor.
+
+    A candidate's physical scene is intentionally wrong, but an avoidable
+    seasonal or cadence mismatch would make that wrongness trivial to detect.
+    When counts differ, each recipient chronological rank chooses the nearest
+    donor normalized rank before the relative-day L1 comparison.
+    """
+
+    recipient_offsets = _observation_offsets_from_source_anchor(recipient)
+    donor_offsets = _observation_offsets_from_source_anchor(donor)
+    donor_indices = _normalized_nearest_indices(
+        recipient_count=len(recipient_offsets),
+        donor_count=len(donor_offsets),
+    )
+    return sum(
+        abs(recipient_offset - donor_offsets[donor_index])
+        for recipient_offset, donor_index in zip(recipient_offsets, donor_indices, strict=True)
+    )
+
+
+def _observation_offsets_from_source_anchor(example: SOPATExampleV4) -> tuple[int, ...]:
+    anchor_day = _day(example.anchor_pair.source.time)
+    return tuple(
+        (_day(observation.measurement.time) - anchor_day).days
+        for observation in example.observation_ordered_for_backend()
+    )
+
+
+def _normalized_nearest_indices(
+    *,
+    recipient_count: int,
+    donor_count: int,
+) -> tuple[int, ...]:
+    """Map recipient chronological ranks to nearest donor normalized ranks."""
+
+    if recipient_count <= 0 or donor_count <= 0:
+        raise ValueError("normalized chronological alignment requires non-empty histories")
+    if recipient_count == 1 or donor_count == 1:
+        return (0,) * recipient_count
+    denominator = recipient_count - 1
+    return tuple(
+        (2 * recipient_index * (donor_count - 1) + denominator) // (2 * denominator)
+        for recipient_index in range(recipient_count)
+    )
+
+
+def _align_counterfactual_observations(
+    donor_values: torch.Tensor,
+    donor_valid: torch.Tensor,
+    donor_present: torch.Tensor,
+    *,
+    recipient_count: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Map donor chronological history onto recipient chronological slots.
+
+    Exact-N donor routes retain every chronological frame.  Differing-N tiers
+    use normalized chronological ranks, retaining recipient time semantics in
+    the separate recipient ``observation_days`` and ``observation_present``
+    tensors.  The caller applies its recipient set permutation afterwards.
+    """
+
+    if recipient_count <= 0:
+        raise ValueError("counterfactual recipient must have at least one observation")
+    donor_count = int(donor_present.bool().sum().item())
+    if donor_count != donor_values.shape[0] or donor_count != donor_valid.shape[0]:
+        raise RuntimeError("counterfactual donor tensors must contain only real observations")
+    if donor_count <= 0:
+        raise RuntimeError("counterfactual donor has no real observations")
+    if donor_count == recipient_count:
+        return donor_values, donor_valid
+    indices = torch.tensor(
+        _normalized_nearest_indices(
+            recipient_count=recipient_count,
+            donor_count=donor_count,
+        ),
+        dtype=torch.long,
+        device=donor_values.device,
+    )
+    return donor_values.index_select(0, indices), donor_valid.index_select(0, indices.to(donor_valid.device))
+
+
+def _required_counterfactual_tensor(sample: Mapping[str, object], key: str) -> torch.Tensor:
+    value = sample.get(key)
+    if not isinstance(value, torch.Tensor):
+        raise TypeError(f"SOPAT counterfactual sample lacks tensor {key}")
+    return value
+
+
+def _validate_counterfactual_observation_tensors(
+    values: torch.Tensor,
+    valid: torch.Tensor,
+) -> None:
+    if values.ndim < 2 or valid.ndim < 2:
+        raise ValueError("SOPAT counterfactual observation tensors need a leading frame dimension")
+    if values.shape[0] <= 0 or valid.shape[0] != values.shape[0]:
+        raise ValueError("SOPAT counterfactual observation tensor lengths disagree")
+    if values.shape[-2:] != valid.shape[-2:]:
+        raise ValueError("SOPAT counterfactual value and validity spatial shapes disagree")
+
+
+def _pad_counterfactual_observation_tensor(values: torch.Tensor, length: int) -> torch.Tensor:
+    if values.shape[0] > length:
+        raise ValueError("cannot shrink SOPAT counterfactual observations while collating")
+    if values.shape[0] == length:
+        return values
+    result = torch.zeros(
+        (length, *values.shape[1:]),
+        dtype=values.dtype,
+        device=values.device,
+    )
+    result[: values.shape[0]] = values
+    return result
 
 
 def _example_sort_key(example: SOPATExampleV4) -> tuple[str, str, str, str]:

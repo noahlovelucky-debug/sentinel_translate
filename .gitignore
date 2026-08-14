@@ -6,3 +6,5 @@ checkpoints*/
 reports*/
 logs/
 *.log
+/artifacts/
+/BUNDLE_INFO.json

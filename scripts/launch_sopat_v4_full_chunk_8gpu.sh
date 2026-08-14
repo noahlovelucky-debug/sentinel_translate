@@ -57,7 +57,7 @@ import sys
 from pathlib import Path
 
 path = Path(sys.argv[1])
-policy_version = "sopat_v4_quality_gate_v2"
+policy_version = "sopat_v4_quality_gate_v3"
 
 
 def refuse(reason: str) -> None:
@@ -112,6 +112,7 @@ if effective.get("phase") != "feasibility":
 constraints = (
     ("feasibility_scene_improved_fraction_min", ">=", 0.50),
     ("feasibility_source_shuffle_min_degradation", ">=", 0.01),
+    ("feasibility_candidate_source_shuffle_min_degradation", ">=", 0.01),
     ("optical_sam_anchor_delta_max", "<=", 0.0),
     ("optical_ndvi_mae_anchor_delta_max", "<=", 0.0),
     ("optical_edge_f1_anchor_delta_min", ">=", 0.0),
@@ -126,6 +127,26 @@ for name, operator, bound in constraints:
             "validation.selection_policy.effective."
             f"{name}={value:g} must be {operator} {bound:g}"
         )
+
+source_shuffle = mapping(validation.get("source_shuffle"), "validation.source_shuffle")
+variant = mapping(source_shuffle.get("variant"), "validation.source_shuffle.variant")
+if variant.get("name") != "global_cross_tile":
+    refuse("validation.source_shuffle.variant.name must be 'global_cross_tile'")
+if variant.get("planner") != "global_cross_tile_hard_v1":
+    refuse("validation.source_shuffle.variant.planner must be 'global_cross_tile_hard_v1'")
+plan_hash = variant.get("plan_hash")
+if not isinstance(plan_hash, str) or not plan_hash:
+    refuse("validation.source_shuffle.variant.plan_hash must be a non-empty string")
+for name in ("coverage", "cross_tile_coverage"):
+    value = finite_number(variant.get(name), f"validation.source_shuffle.variant.{name}")
+    if value < 1.0:
+        refuse(f"validation.source_shuffle.variant.{name}={value:g} must be >= 1")
+tier_counts = mapping(variant.get("tier_counts"), "validation.source_shuffle.variant.tier_counts")
+if not tier_counts:
+    refuse("validation.source_shuffle.variant.tier_counts must not be empty")
+for tier, count in tier_counts.items():
+    if not isinstance(tier, str) or isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        refuse("validation.source_shuffle.variant.tier_counts must contain non-negative integer counts")
 
 print(f"feasibility_gate=eligible policy={policy_version} report={path}")
 PY

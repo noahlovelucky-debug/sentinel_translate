@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -20,10 +21,13 @@ from sentinel_v3.paired_temporal_data import (
 from sentinel_v3.schema import S2_CHANNEL_ORDER, SAR_CHANNEL_ORDER
 from sentinel_v4.data import (
     CoupledDirectionLoader,
+    GlobalCrossTileHardNegativePlan,
     SOPATDirectionDataset,
+    SOPATExampleV4,
     SOPATIndexConfigV4,
     SOPATIndexV4,
     assert_sopat_v4_causality,
+    build_global_cross_tile_hard_negative_plan,
     build_sopat_v4_index,
     collate_sopat_direction,
     load_sopat_v4_index,
@@ -87,6 +91,100 @@ def _index(records: list[PairRecord]) -> SOPATIndexV4:
         max_observations=3,
         horizon_days=180,
     )
+
+
+def _cross_tile_records(*, tile_count: int = 4) -> list[PairRecord]:
+    """Make independently gridded routes with matching SOPAT chronology."""
+
+    result: list[PairRecord] = []
+    for tile_number in range(tile_count):
+        tile = f"tile-cf-{tile_number}"
+        for number, day in enumerate((1, 3, 5, 10, 13, 17)):
+            result.append(
+                _record(
+                    tile_number * 100 + number,
+                    tile=tile,
+                    s1_date=f"2020-01-{day:02d}",
+                    s2_date=f"2020-01-{day:02d}",
+                )
+            )
+    return result
+
+
+def _cross_tile_index(*, tile_count: int = 4) -> SOPATIndexV4:
+    return build_sopat_v4_index(
+        _cross_tile_records(tile_count=tile_count),
+        splits=("train",),
+        max_observations=3,
+        horizon_days=180,
+    )
+
+
+def _cross_tile_forecast_index(*, tile_count: int = 3) -> SOPATIndexV4:
+    records: list[PairRecord] = []
+    dates = (
+        ("2020-01-01", "2020-01-01"),
+        ("2020-01-03", "2020-01-03"),
+        ("2020-01-05", "2020-01-05"),
+        ("2020-01-10", "2020-01-10"),
+        ("2020-01-13", "2020-01-14"),
+        ("2020-01-15", "2020-01-17"),
+    )
+    for tile_number in range(tile_count):
+        tile = f"tile-mixed-{tile_number}"
+        for number, (s1_date, s2_date) in enumerate(dates):
+            records.append(
+                _record(
+                    tile_number * 100 + number,
+                    tile=tile,
+                    s1_date=s1_date,
+                    s2_date=s2_date,
+                )
+            )
+    return build_sopat_v4_index(
+        records,
+        splits=("train",),
+        max_observations=3,
+        horizon_days=180,
+    )
+
+
+def _cross_tile_example(
+    index: SOPATIndexV4,
+    *,
+    tile: str,
+    task_mode: str,
+    observation_count: int,
+    target_time: str | None = None,
+) -> SOPATExampleV4:
+    return next(
+        example
+        for example in index.select(direction=SAR_TO_OPTICAL, split="train")
+        if example.tile == tile
+        and example.task_mode == task_mode
+        and len(example.observations) == observation_count
+        and (target_time is None or example.target_time == target_time)
+    )
+
+
+def _route_index(
+    index: SOPATIndexV4, examples: tuple[SOPATExampleV4, ...]
+) -> SOPATIndexV4:
+    return SOPATIndexV4(config=index.config, examples=examples)
+
+
+def _route_record_ids(example: SOPATExampleV4) -> set[str]:
+    return {
+        example.target.record_id,
+        example.anchor_pair.registration_id,
+        *(observation.measurement.record_id for observation in example.observations),
+    }
+
+
+def _route_measurement_ids(example: SOPATExampleV4) -> set[str]:
+    return {
+        observation.measurement.measurement_id for observation in example.observations
+    }
 
 
 def test_migration_preserves_both_directions_roles_and_date_causality(
@@ -232,6 +330,207 @@ def test_future_target_asset_or_role_leakage_is_rejected(records: list[PairRecor
         assert_sopat_v4_causality((role_leak,), config=SOPATIndexConfigV4())
 
 
+def test_global_cross_tile_hard_negative_plan_is_deterministic_and_disjoint() -> None:
+    index = _cross_tile_index()
+    plan = build_global_cross_tile_hard_negative_plan(
+        index,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+    )
+    repeated = GlobalCrossTileHardNegativePlan.from_index(
+        index,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+    )
+
+    assert plan == repeated
+    assert plan.hash == plan.plan_hash == repeated.plan_hash
+    assert plan.coverage == 1.0
+    assert plan.tier_counts == {
+        "same_task_exact_n": len(plan.mappings),
+        "same_task_n_bin": 0,
+        "same_task": 0,
+        "same_orbit": 0,
+    }
+    assert plan.mapping_metadata == {
+        "format_version": 1,
+        "version": 1,
+        "planner": "global_cross_tile_hard_v1",
+        "selection": "relative_source_anchor_l1_then_sha256_v1",
+        "alignment": "chronological_normalized_nearest_v1",
+        "direction": SAR_TO_OPTICAL,
+        "split": "train",
+        "index_content_sha256": index.content_hash,
+        "coverage": 1.0,
+        "cross_tile_coverage": 1.0,
+        "mappings": len(plan.mappings),
+        "tier_counts": plan.tier_counts,
+        "plan_hash": plan.plan_hash,
+    }
+    serialized = plan.to_dict()
+    assert serialized["mappings"] == [mapping.to_dict() for mapping in plan.mappings]
+
+    by_id = {example.sample_id: example for example in index.select(direction=SAR_TO_OPTICAL, split="train")}
+    for mapping in plan.mappings:
+        recipient = by_id[mapping.recipient_sample_id]
+        donor = by_id[mapping.donor_sample_id]
+        assert recipient.sample_id != donor.sample_id
+        assert recipient.tile != donor.tile
+        assert recipient.direction == donor.direction == SAR_TO_OPTICAL
+        assert recipient.split == donor.split == "train"
+        assert recipient.orbit == donor.orbit
+        assert recipient.anchor_pair.registration_id != donor.anchor_pair.registration_id
+        assert recipient.target.record_id != donor.target.record_id
+        assert _route_record_ids(recipient).isdisjoint(_route_record_ids(donor))
+        assert _route_measurement_ids(recipient).isdisjoint(_route_measurement_ids(donor))
+
+
+def test_global_cross_tile_hard_negative_plan_fails_closed_without_cross_tile_donor() -> None:
+    index = _cross_tile_index(tile_count=1)
+
+    with pytest.raises(ValueError, match="no eligible donor"):
+        build_global_cross_tile_hard_negative_plan(
+            index,
+            direction=SAR_TO_OPTICAL,
+            split="train",
+        )
+
+    legacy = paired_temporal_index_from_sopat_v4(index, direction=SAR_TO_OPTICAL, split="train")
+    backend = _SyntheticBackend(legacy.samples, windows_per_sample=1)
+    with pytest.raises(ValueError, match="requires a global cross-tile"):
+        SOPATDirectionDataset(
+            index,
+            backend,
+            direction=SAR_TO_OPTICAL,
+            split="train",
+            include_cf=True,
+        )
+
+
+def test_global_cross_tile_hard_negative_plan_uses_tier_priority_and_same_orbit() -> None:
+    full = _cross_tile_index()
+    exact_n = _cross_tile_example(
+        full,
+        tile="tile-cf-0",
+        task_mode=TRANSLATION,
+        observation_count=2,
+    )
+    n_bin = _cross_tile_example(
+        full,
+        tile="tile-cf-1",
+        task_mode=TRANSLATION,
+        observation_count=3,
+        target_time="2020-01-10",
+    )
+    same_task = _cross_tile_example(
+        full,
+        tile="tile-cf-2",
+        task_mode=TRANSLATION,
+        observation_count=1,
+    )
+    tier_index = _route_index(full, (exact_n, n_bin, same_task))
+    tier_plan = build_global_cross_tile_hard_negative_plan(
+        tier_index,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+    )
+
+    recipient_mapping = tier_plan.donor_for(exact_n.sample_id)
+    assert recipient_mapping.donor_sample_id == n_bin.sample_id
+    assert recipient_mapping.tier == "same_task_n_bin"
+    assert tier_plan.donor_for(same_task.sample_id).tier == "same_task"
+
+    mixed = _cross_tile_forecast_index()
+    translation = _cross_tile_example(
+        mixed,
+        tile="tile-mixed-0",
+        task_mode=TRANSLATION,
+        observation_count=1,
+    )
+    forecast_one = _cross_tile_example(
+        mixed,
+        tile="tile-mixed-1",
+        task_mode=FORECAST,
+        observation_count=3,
+    )
+    forecast_two = _cross_tile_example(
+        mixed,
+        tile="tile-mixed-2",
+        task_mode=FORECAST,
+        observation_count=3,
+    )
+    orbit_index = _route_index(mixed, (translation, forecast_one, forecast_two))
+    orbit_plan = build_global_cross_tile_hard_negative_plan(
+        orbit_index,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+    )
+
+    assert orbit_plan.donor_for(translation.sample_id).tier == "same_orbit"
+    assert orbit_plan.donor_for(forecast_one.sample_id).tier == "same_task_exact_n"
+
+
+def test_global_cross_tile_hard_negative_plan_prefers_time_matched_donor_before_sha() -> None:
+    full = _cross_tile_index()
+    examples = tuple(
+        _cross_tile_example(
+            full,
+            tile=f"tile-cf-{tile_number}",
+            task_mode=TRANSLATION,
+            observation_count=3,
+            target_time="2020-01-10",
+        )
+        for tile_number in range(4)
+    )
+    recipient, *candidates = examples
+    sha_first = min(
+        candidates,
+        key=lambda donor: (
+            hashlib.sha256(
+                f"global_cross_tile_hard_v1:{recipient.sample_id}:{donor.sample_id}".encode()
+            ).hexdigest(),
+            donor.sample_id,
+        ),
+    )
+    history_dates = iter(("2020-01-08", "2020-01-09"))
+    timing_mismatch = replace(
+        sha_first,
+        observations=tuple(
+            replace(
+                observation,
+                measurement=replace(observation.measurement, time=next(history_dates)),
+            )
+            if observation.role == "history"
+            else observation
+            for observation in sha_first.observations
+        ),
+    )
+    timing_index = _route_index(
+        full,
+        tuple(
+            timing_mismatch if example.sample_id == sha_first.sample_id else example
+            for example in examples
+        ),
+    )
+    plan = build_global_cross_tile_hard_negative_plan(
+        timing_index,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+    )
+    expected = min(
+        (candidate for candidate in candidates if candidate.sample_id != sha_first.sample_id),
+        key=lambda donor: (
+            hashlib.sha256(
+                f"global_cross_tile_hard_v1:{recipient.sample_id}:{donor.sample_id}".encode()
+            ).hexdigest(),
+            donor.sample_id,
+        ),
+    )
+
+    assert plan.donor_for(recipient.sample_id).tier == "same_task_exact_n"
+    assert plan.donor_for(recipient.sample_id).donor_sample_id == expected.sample_id
+
+
 class _SyntheticBackend(Dataset[dict[str, object]]):
     def __init__(self, samples: tuple[object, ...], *, windows_per_sample: int) -> None:
         self.samples = samples
@@ -275,6 +574,78 @@ class _SyntheticBackend(Dataset[dict[str, object]]):
         }
 
 
+class _TaggedSyntheticBackend(_SyntheticBackend):
+    """Expose sample identity in pixels so donor leakage is observable in tests."""
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        item = super().__getitem__(index)
+        sample_position, _ = divmod(index, self.windows_per_sample)
+        tag = float((sample_position + 1) * 1000)
+        observation_values = item["observation_values"]
+        source_anchor_values = item["source_anchor_values"]
+        target_anchor_values = item["target_anchor_values"]
+        target_values = item["target_values"]
+        assert isinstance(observation_values, torch.Tensor)
+        assert isinstance(source_anchor_values, torch.Tensor)
+        assert isinstance(target_anchor_values, torch.Tensor)
+        assert isinstance(target_values, torch.Tensor)
+        item["observation_values"] = observation_values + tag
+        item["source_anchor_values"] = torch.full_like(source_anchor_values, tag + 1)
+        item["target_anchor_values"] = torch.full_like(target_anchor_values, tag + 2)
+        item["target_values"] = torch.full_like(target_values, tag + 3)
+        return item
+
+
+def _fallback_counterfactual_dataset():
+    full = _cross_tile_index()
+    recipient = _cross_tile_example(
+        full,
+        tile="tile-cf-0",
+        task_mode=TRANSLATION,
+        observation_count=2,
+    )
+    donor = _cross_tile_example(
+        full,
+        tile="tile-cf-1",
+        task_mode=TRANSLATION,
+        observation_count=3,
+        target_time="2020-01-10",
+    )
+    same_task = _cross_tile_example(
+        full,
+        tile="tile-cf-2",
+        task_mode=TRANSLATION,
+        observation_count=1,
+    )
+    index = _route_index(full, (recipient, donor, same_task))
+    plan = build_global_cross_tile_hard_negative_plan(
+        index,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+    )
+    assert plan.donor_for(recipient.sample_id).donor_sample_id == donor.sample_id
+    assert plan.donor_for(recipient.sample_id).tier == "same_task_n_bin"
+    legacy = paired_temporal_index_from_sopat_v4(index, direction=SAR_TO_OPTICAL, split="train")
+    backend = _TaggedSyntheticBackend(legacy.samples, windows_per_sample=2)
+    baseline = SOPATDirectionDataset(
+        index,
+        backend,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+        permutation_seed=17,
+    )
+    counterfactual = SOPATDirectionDataset(
+        index,
+        backend,
+        direction=SAR_TO_OPTICAL,
+        split="train",
+        permutation_seed=17,
+        hard_negative_plan=plan,
+        include_cf=True,
+    )
+    return recipient, donor, plan, backend, legacy, baseline, counterfactual
+
+
 def test_direction_dataset_permutation_collation_and_chunk_window_routing(
     records: list[PairRecord],
 ) -> None:
@@ -304,6 +675,143 @@ def test_direction_dataset_permutation_collation_and_chunk_window_routing(
     assert batch["observation_values"].shape[0] == 2
     with pytest.raises(ValueError, match="homogeneous"):
         collate_sopat_direction((item_zero, {**item_one, "sopat_direction": OPTICAL_TO_SAR}))
+
+
+def test_global_counterfactual_uses_donor_history_only_and_preserves_recipient_order() -> None:
+    recipient, donor, plan, backend, legacy, baseline, counterfactual = (
+        _fallback_counterfactual_dataset()
+    )
+    recipient_position = next(
+        position
+        for position, example in enumerate(counterfactual.examples)
+        if example.sample_id == recipient.sample_id
+    )
+    position = recipient_position * counterfactual.backend_windows + 1
+    unchanged = baseline[position]
+    item = counterfactual[position]
+    donor_position = next(
+        position
+        for position, sample in enumerate(legacy.samples)
+        if sample.sample_id == donor.sample_id
+    )
+    donor_item = backend[donor_position * counterfactual.backend_windows + 1]
+    donor_values = donor_item["observation_values"]
+    donor_valid = donor_item["observation_valid"]
+    donor_target = donor_item["target_values"]
+    donor_source_anchor = donor_item["source_anchor_values"]
+    donor_target_anchor = donor_item["target_anchor_values"]
+    assert isinstance(donor_values, torch.Tensor)
+    assert isinstance(donor_valid, torch.Tensor)
+    assert isinstance(donor_target, torch.Tensor)
+    assert isinstance(donor_source_anchor, torch.Tensor)
+    assert isinstance(donor_target_anchor, torch.Tensor)
+
+    for key in (
+        "source_anchor_values",
+        "source_anchor_valid",
+        "target_anchor_values",
+        "target_anchor_valid",
+        "observation_values",
+        "observation_valid",
+        "observation_days",
+        "observation_present",
+        "target_values",
+        "target_valid",
+    ):
+        assert torch.equal(item[key], unchanged[key])
+    assert item["sopat_tile"] == recipient.tile
+    assert item["sopat_cf_donor_sample_id"] == donor.sample_id
+    assert item["sopat_cf_donor_tile"] == donor.tile
+    assert item["sopat_cf_donor_grid_id"] == donor.canonical_grid.grid_id
+    assert item["sopat_cf_tier"] == "same_task_n_bin"
+    assert item["sopat_cf_plan_hash"] == plan.plan_hash
+
+    recipient_ids = tuple(
+        observation.measurement.measurement_id
+        for observation in recipient.observation_ordered_for_backend()
+    )
+    item_ids = item["sopat_observation_ids"]
+    assert isinstance(item_ids, tuple)
+    recipient_order = torch.tensor(
+        [recipient_ids.index(measurement_id) for measurement_id in item_ids],
+        dtype=torch.long,
+    )
+    chronological = donor_values[: len(donor.observations)].index_select(
+        0,
+        torch.tensor([0, 2], dtype=torch.long),
+    )
+    chronological_valid = donor_valid[: len(donor.observations)].index_select(
+        0,
+        torch.tensor([0, 2], dtype=torch.long),
+    )
+    expected_values = chronological.index_select(0, recipient_order)
+    expected_valid = chronological_valid.index_select(0, recipient_order)
+    counterfactual_values = item["counterfactual_observation_values"]
+    counterfactual_valid = item["counterfactual_observation_valid"]
+    assert isinstance(counterfactual_values, torch.Tensor)
+    assert isinstance(counterfactual_valid, torch.Tensor)
+    assert torch.equal(counterfactual_values, expected_values)
+    assert torch.equal(counterfactual_valid, expected_valid)
+
+    # Tagged tensors make it explicit that donor targets and anchors never enter the item.
+    assert not torch.equal(item["target_values"], donor_target)
+    assert not torch.equal(item["source_anchor_values"], donor_source_anchor)
+    assert not torch.equal(item["target_anchor_values"], donor_target_anchor)
+
+
+def test_global_counterfactual_collation_pads_real_recipient_lengths_independently() -> None:
+    _, _, _, _, _, _, dataset = _fallback_counterfactual_dataset()
+    item_one = next(
+        dataset[position * dataset.backend_windows]
+        for position, example in enumerate(dataset.examples)
+        if len(example.observations) == 1
+    )
+    item_three = next(
+        dataset[position * dataset.backend_windows]
+        for position, example in enumerate(dataset.examples)
+        if len(example.observations) == 3
+    )
+    one_values = item_one["counterfactual_observation_values"]
+    one_valid = item_one["counterfactual_observation_valid"]
+    three_values = item_three["counterfactual_observation_values"]
+    three_valid = item_three["counterfactual_observation_valid"]
+    assert isinstance(one_values, torch.Tensor)
+    assert isinstance(one_valid, torch.Tensor)
+    assert isinstance(three_values, torch.Tensor)
+    assert isinstance(three_valid, torch.Tensor)
+
+    batch = collate_sopat_direction((item_one, item_three))
+    batch_values = batch["counterfactual_observation_values"]
+    batch_valid = batch["counterfactual_observation_valid"]
+    observation_values = batch["observation_values"]
+    observation_valid = batch["observation_valid"]
+    assert isinstance(batch_values, torch.Tensor)
+    assert isinstance(batch_valid, torch.Tensor)
+    assert isinstance(observation_values, torch.Tensor)
+    assert isinstance(observation_valid, torch.Tensor)
+    assert batch_values.shape == observation_values.shape
+    assert batch_valid.shape == observation_valid.shape
+    assert torch.equal(batch_values[0, : one_values.shape[0]], one_values)
+    assert torch.equal(batch_valid[0, : one_valid.shape[0]], one_valid)
+    assert torch.equal(batch_values[1, : three_values.shape[0]], three_values)
+    assert torch.equal(batch_valid[1, : three_valid.shape[0]], three_valid)
+    assert not batch_values[0, one_values.shape[0] :].bool().any()
+    assert not batch_valid[0, one_valid.shape[0] :].bool().any()
+    assert batch["sopat_tile"] == [item_one["sopat_tile"], item_three["sopat_tile"]]
+    assert batch["sopat_cf_donor_sample_id"] == [
+        item_one["sopat_cf_donor_sample_id"],
+        item_three["sopat_cf_donor_sample_id"],
+    ]
+    for batch_index, item in enumerate((item_one, item_three)):
+        for key in (
+            "observation_values",
+            "observation_valid",
+            "observation_days",
+            "observation_present",
+        ):
+            values = item[key]
+            assert isinstance(values, torch.Tensor)
+            assert torch.equal(batch[key][batch_index, : values.shape[0]], values)
 
 
 class _LoaderProbe:

@@ -71,6 +71,11 @@ training:
     source_shuffle_weight: 0.25
     source_shuffle_probability: 0.5
     source_shuffle_margin: 0.005
+    source_counterfactual_mode: global_cross_tile_v1
+    counterfactual_candidate_ranking_weight: 0.25
+    counterfactual_candidate_ranking_margin: 0.005
+    counterfactual_source_effect_floor_weight: 0.05
+    counterfactual_source_effect_floor: 0.005
     counterfactual_confidence_weight: 0.10
     counterfactual_confidence_binary_weight: 1.0
     counterfactual_confidence_margin: 0.10

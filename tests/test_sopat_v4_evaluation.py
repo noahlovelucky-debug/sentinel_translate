@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -8,9 +9,11 @@ import torch
 from sentinel_v4.evaluation import (
     SOPATSelectionConfig,
     SOPATVariantConfig,
+    _global_cross_tile_counterfactual_batch,
     _masked_box_lowpass,
     _source_shuffle_batch,
     evaluate_sopat_loaders,
+    predict_sopat_variant,
     select_sopat_candidate,
 )
 
@@ -44,7 +47,85 @@ def _batch(direction: str, *, batch_size: int = 2) -> dict[str, object]:
         "target": target,
         "target_valid": torch.ones(batch_size, 1, height, width),
         "task_mode": ["translation" if index % 2 == 0 else "forecast" for index in range(batch_size)],
+        "sopat_example_id": [f"recipient-{index}" for index in range(batch_size)],
+        "sopat_tile": [f"tile-{index}" for index in range(batch_size)],
+        "sopat_grid_id": [f"grid-{index}" for index in range(batch_size)],
     }
+
+
+def _global_counterfactual_batch(direction: str, *, batch_size: int = 2) -> dict[str, object]:
+    batch = _batch(direction, batch_size=batch_size)
+    observations = batch["observations"]
+    valid = batch["observation_valid"]
+    assert isinstance(observations, torch.Tensor)
+    assert isinstance(valid, torch.Tensor)
+    donor = observations.clone()
+    donor[:, :, 0, 0, 0] = torch.arange(batch_size, dtype=donor.dtype)[:, None] + 10.0
+    return {
+        **batch,
+        "counterfactual_observation_values": donor,
+        "counterfactual_observation_valid": valid.clone(),
+        "sopat_cf_donor_sample_id": [f"donor-{index}" for index in range(batch_size)],
+        "sopat_cf_donor_tile": [f"donor-tile-{index}" for index in range(batch_size)],
+        "sopat_cf_donor_grid_id": [f"donor-grid-{index}" for index in range(batch_size)],
+        "sopat_cf_tier": ["same_task_exact_n"] * batch_size,
+        "sopat_cf_plan_hash": ["a" * 64] * batch_size,
+    }
+
+
+class _EchoCandidateModel(torch.nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.calls: list[dict[str, object]] = []
+
+    def forward(self, **inputs: object) -> dict[str, torch.Tensor]:
+        self.calls.append(dict(inputs))
+        observations = inputs["observations"]
+        target_anchor = inputs["target_anchor"]
+        assert isinstance(observations, torch.Tensor)
+        assert isinstance(target_anchor, torch.Tensor)
+        source_effect = observations[:, 0].mean(dim=(1, 2, 3), keepdim=True)
+        value = target_anchor + source_effect
+        return {
+            "physical": value,
+            "candidate_physical": value + 0.1,
+            "pre_projection_violation": torch.zeros(value.shape[0], device=value.device),
+        }
+
+
+class _PlanLoader:
+    def __init__(self, batches: list[dict[str, object]], *, direction: str) -> None:
+        self._batches = batches
+        self.dataset = SimpleNamespace(
+            hard_negative_plan=SimpleNamespace(
+                mapping_metadata={
+                    "planner": "global_cross_tile_hard_v1",
+                    "direction": direction,
+                    "split": "validation_temporal",
+                    "plan_hash": ("a" if direction == "sar_to_optical" else "b") * 64,
+                    "coverage": 1.0,
+                    "cross_tile_coverage": 1.0,
+                    "tier_counts": {"same_task_exact_n": 3},
+                }
+            )
+        )
+
+    def __iter__(self):
+        return iter(self._batches)
+
+
+def _select_batch(batch: dict[str, object], order: list[int]) -> dict[str, object]:
+    indices = torch.tensor(order)
+    batch_size = len(order)
+    result: dict[str, object] = {}
+    for key, value in batch.items():
+        if isinstance(value, torch.Tensor) and value.shape[0] >= batch_size:
+            result[key] = value.index_select(0, indices)
+        elif isinstance(value, list) and len(value) >= batch_size:
+            result[key] = [value[index] for index in order]
+        else:
+            result[key] = value
+    return result
 
 
 def _tagged_source_shuffle_batch(*, batch_size: int = 5) -> tuple[dict[str, object], torch.Tensor]:
@@ -122,6 +203,51 @@ def _selection_report(
     }
     if variant is not None:
         report["variant"] = {"name": variant}
+    return report
+
+
+def _global_selection_report(*, candidate_structural: tuple[float, float] = (0.1, 0.2)) -> dict[str, object]:
+    report = _selection_report(optical_structural=0.1, sar_structural=0.2)
+    directions = report["directions"]
+    assert isinstance(directions, dict)
+    candidate_directions: dict[str, object] = {}
+    for direction, structural in zip(("sar_to_optical", "optical_to_sar"), candidate_structural, strict=True):
+        candidate = _selection_report(
+            optical_structural=structural if direction == "sar_to_optical" else 0.1,
+            sar_structural=structural if direction == "optical_to_sar" else 0.2,
+        )["directions"][direction]
+        assert isinstance(candidate, dict)
+        candidate_directions[direction] = candidate
+    report["candidate_directions"] = candidate_directions
+    return report
+
+
+def _global_counterfactual_report(*, candidate_structural: tuple[float, float] = (0.102, 0.205)) -> dict[str, object]:
+    report = _selection_report(
+        optical_structural=0.102,
+        sar_structural=0.205,
+        variant="global_cross_tile",
+    )
+    report["variant"].update(  # type: ignore[index]
+        {
+            "planner": "global_cross_tile_hard_v1",
+            "plan_hash": "b" * 64,
+            "coverage": 1.0,
+            "cross_tile_coverage": 1.0,
+            "tier_counts": {"same_task_exact_n": 2},
+        }
+    )
+    directions = report["directions"]
+    assert isinstance(directions, dict)
+    candidate_directions: dict[str, object] = {}
+    for direction, structural in zip(("sar_to_optical", "optical_to_sar"), candidate_structural, strict=True):
+        candidate = _selection_report(
+            optical_structural=structural if direction == "sar_to_optical" else 0.1,
+            sar_structural=structural if direction == "optical_to_sar" else 0.2,
+        )["directions"][direction]
+        assert isinstance(candidate, dict)
+        candidate_directions[direction] = candidate
+    report["candidate_directions"] = candidate_directions
     return report
 
 
@@ -226,13 +352,96 @@ def test_source_shuffle_does_not_depend_on_global_torch_rng_or_generator_device(
         assert torch.equal(first, cuda_generator_mapping)
 
 
-def test_source_shuffle_metadata_records_reproducible_planner() -> None:
-    metadata = SOPATVariantConfig("source_shuffle", seed=71).metadata()
+def test_global_counterfactual_metadata_records_reproducible_planner() -> None:
+    metadata = SOPATVariantConfig("global_cross_tile", seed=71).metadata()
 
     assert metadata["seed"] == 71
-    assert metadata["shuffle_planner"] == "stable_cyclic_offset_v1"
-    assert metadata["shuffle_key"] == ("variant.seed", "direction", "batch_index")
-    assert metadata["shuffle_generator"] == "ignored_for_reproducibility"
+    assert metadata["planner"] == "global_cross_tile_hard_v1"
+    assert metadata["counterfactual_source"] == "dataset_global_plan"
+
+
+def test_global_counterfactual_overrides_only_donor_values_and_valid() -> None:
+    batch = _global_counterfactual_batch("sar_to_optical")
+    observations = batch["observations"]
+    days = batch["observation_days"]
+    present = batch["observation_present"]
+    assert isinstance(observations, torch.Tensor)
+    assert isinstance(days, torch.Tensor)
+    assert isinstance(present, torch.Tensor)
+
+    routed = _global_cross_tile_counterfactual_batch(batch)
+    replacement = batch["counterfactual_observation_values"]
+    replacement_valid = batch["counterfactual_observation_valid"]
+    assert isinstance(replacement, torch.Tensor)
+    assert isinstance(replacement_valid, torch.Tensor)
+    torch.testing.assert_close(routed["observations"], replacement)
+    torch.testing.assert_close(routed["observation_valid"], replacement_valid)
+    torch.testing.assert_close(routed["observation_days"], days)
+    torch.testing.assert_close(routed["observation_present"], present)
+    assert routed["target"] is batch["target"]
+    assert routed["target_anchor"] is batch["target_anchor"]
+
+
+def test_global_counterfactual_is_batch_order_invariant_and_target_free() -> None:
+    batch = _global_counterfactual_batch("sar_to_optical", batch_size=3)
+    model = _EchoCandidateModel()
+    first = predict_sopat_variant(model, batch, "sar_to_optical", "global_cross_tile")
+    order = [2, 0, 1]
+    reordered = _select_batch(batch, order)
+    second = predict_sopat_variant(model, reordered, "sar_to_optical", "global_cross_tile")
+    torch.testing.assert_close(second.values, first.values.index_select(0, torch.tensor(order)))
+    torch.testing.assert_close(
+        second.candidate_values,
+        first.candidate_values.index_select(0, torch.tensor(order)),  # type: ignore[union-attr]
+    )
+    forward_inputs = model.calls[0]
+    assert "target" not in forward_inputs
+    assert "target_valid" not in forward_inputs
+    target_anchor = batch["target_anchor"]
+    donor_values = batch["counterfactual_observation_values"]
+    assert isinstance(target_anchor, torch.Tensor)
+    assert isinstance(donor_values, torch.Tensor)
+    torch.testing.assert_close(forward_inputs["target_anchor"], target_anchor)  # type: ignore[arg-type]
+    torch.testing.assert_close(forward_inputs["observations"], donor_values)  # type: ignore[arg-type]
+
+
+def test_global_counterfactual_evaluation_is_invariant_to_batch_size_and_order() -> None:
+    full_batches = {
+        direction: _global_counterfactual_batch(direction, batch_size=3)
+        for direction in ("sar_to_optical", "optical_to_sar")
+    }
+    full_loaders = {
+        direction: _PlanLoader([batch], direction=direction)
+        for direction, batch in full_batches.items()
+    }
+    reordered_loaders = {
+        direction: _PlanLoader(
+            [_select_batch(batch, [2]), _select_batch(batch, [0, 1])], direction=direction
+        )
+        for direction, batch in full_batches.items()
+    }
+
+    first = evaluate_sopat_loaders(
+        _EchoCandidateModel(), full_loaders, variant=SOPATVariantConfig("global_cross_tile")
+    )
+    second = evaluate_sopat_loaders(
+        _EchoCandidateModel(), reordered_loaders, variant=SOPATVariantConfig("global_cross_tile")
+    )
+
+    assert "candidate" not in first["directions"]["sar_to_optical"]  # type: ignore[index]
+    assert set(first["candidate_directions"]) == {"sar_to_optical", "optical_to_sar"}  # type: ignore[arg-type]
+    variant = first["variant"]
+    assert isinstance(variant, dict)
+    assert variant["planner"] == "global_cross_tile_hard_v1"
+    assert variant["coverage"] == 1.0
+    assert variant["cross_tile_coverage"] == 1.0
+    assert set(variant["plan_hashes"]) == {"sar_to_optical", "optical_to_sar"}  # type: ignore[arg-type]
+    for direction in ("sar_to_optical", "optical_to_sar"):
+        for report_key in ("directions", "candidate_directions"):
+            first_metrics = first[report_key][direction]["all"]["all"]  # type: ignore[index]
+            second_metrics = second[report_key][direction]["all"]["all"]  # type: ignore[index]
+            for metric in ("rmse", "anchor_rmse", "structural_rmse"):
+                assert float(second_metrics[metric]) == pytest.approx(float(first_metrics[metric]))
 
 
 def test_source_shuffle_gate_uses_structural_degradation_in_both_directions() -> None:
@@ -300,6 +509,73 @@ def test_source_shuffle_gate_fails_closed_when_structural_metric_is_missing() ->
         "missing_source_shuffle_structural_metrics:sar_to_optical" in item
         for item in result.failures
     )
+
+
+def test_policy_v3_requires_global_plan_metadata_and_candidate_degradation() -> None:
+    config = SOPATSelectionConfig(
+        phase="feasibility",
+        policy_version="sopat_v4_quality_gate_v3",
+        required_tasks=("translation",),
+        required_observation_counts=("one",),
+        feasibility_overall_anchor_ratio=2.0,
+        feasibility_bucket_anchor_ratio=2.0,
+        feasibility_source_shuffle_min_degradation=0.01,
+        feasibility_candidate_source_shuffle_min_degradation=0.01,
+    )
+    passing = select_sopat_candidate(
+        _global_selection_report(), config, source_shuffle_report=_global_counterfactual_report()
+    )
+    assert passing.eligible
+
+    candidate_failure = select_sopat_candidate(
+        _global_selection_report(),
+        config,
+        source_shuffle_report=_global_counterfactual_report(candidate_structural=(0.1, 0.2)),
+    )
+    assert not candidate_failure.eligible
+    assert any("global_counterfactual_candidate_insufficient" in item for item in candidate_failure.failures)
+
+    legacy = _global_counterfactual_report()
+    legacy["variant"]["name"] = "source_shuffle"  # type: ignore[index]
+    legacy_failure = select_sopat_candidate(_global_selection_report(), config, source_shuffle_report=legacy)
+    assert not legacy_failure.eligible
+    assert "legacy_global_counterfactual_planner" in legacy_failure.failures
+
+    incomplete = _global_counterfactual_report()
+    incomplete["variant"]["coverage"] = 0.99  # type: ignore[index]
+    incomplete_failure = select_sopat_candidate(
+        _global_selection_report(), config, source_shuffle_report=incomplete
+    )
+    assert not incomplete_failure.eligible
+    assert any("incomplete_global_counterfactual_coverage" in item for item in incomplete_failure.failures)
+
+
+def test_policy_v3_keeps_feasibility_quality_gates_enabled() -> None:
+    config = SOPATSelectionConfig(
+        phase="feasibility",
+        policy_version="sopat_v4_quality_gate_v3",
+        required_tasks=("translation",),
+        required_observation_counts=("one",),
+        feasibility_overall_anchor_ratio=2.0,
+        feasibility_bucket_anchor_ratio=2.0,
+    )
+    report = _global_selection_report()
+    directions = report["directions"]
+    assert isinstance(directions, dict)
+    sar_to_optical = directions["sar_to_optical"]
+    assert isinstance(sar_to_optical, dict)
+    metrics = sar_to_optical["all"]["all"]
+    assert isinstance(metrics, dict)
+    metrics["scene_improved_fraction"] = 0.49
+
+    result = select_sopat_candidate(
+        report,
+        config,
+        source_shuffle_report=_global_counterfactual_report(),
+    )
+
+    assert not result.eligible
+    assert any("scene_improvement_gate:sar_to_optical" in item for item in result.failures)
 
 
 @pytest.mark.parametrize(
