@@ -46,7 +46,18 @@ V3.2 `best_physical.pt` 是可用于确定性物理输出的 release 权重。
 | 2024 | 36,781 | 392,296,801,048 |
 
 推荐在新服务器保持同一路径，避免重写 JSONL 中的资产路径。传输使用可恢复的
-`rsync`，先复制，再执行 checksum 校验：
+`rsync`。包内脚本默认只预演，确认目标地址后显式执行复制，再做 checksum 校验：
+
+```bash
+scripts/transfer_sentinel_2017_2024.sh \
+  USER@HOST:/data/data_disk/data_dir --dry-run
+scripts/transfer_sentinel_2017_2024.sh \
+  USER@HOST:/data/data_disk/data_dir --execute
+scripts/transfer_sentinel_2017_2024.sh \
+  USER@HOST:/data/data_disk/data_dir --verify
+```
+
+对应的原始命令为：
 
 ```bash
 rsync -aH --numeric-ids --partial --info=progress2 \
