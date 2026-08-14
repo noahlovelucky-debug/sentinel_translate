@@ -30,7 +30,9 @@ V3.2 `best_physical.pt` 是可用于确定性物理输出的 release 权重。
 /data/data_disk/data_dir/{2017,...,2024}
 ```
 
-精确源清单是 `317,815` 个普通文件、`3,430,323,306,985` bytes：
+2017–2024 年目录内的精确数据清单是 `317,814` 个普通文件、
+`3,430,323,306,974` bytes。数据根目录另有一个 11-byte 的
+`.retry_incomplete_downloads.lock` 运行锁，不属于 Sentinel 数据，也不应传输：
 
 | 年份 | 文件数 | bytes |
 |---|---:|---:|
@@ -48,9 +50,10 @@ V3.2 `best_physical.pt` 是可用于确定性物理输出的 release 权重。
 
 ```bash
 rsync -aH --numeric-ids --partial --info=progress2 \
+  --exclude='.retry_incomplete_downloads.lock' \
   /data/data_disk/data_dir/ USER@HOST:/data/data_disk/data_dir/
 
-rsync -aHnc --numeric-ids \
+rsync -aHnc --numeric-ids --exclude='.retry_incomplete_downloads.lock' \
   /data/data_disk/data_dir/ USER@HOST:/data/data_disk/data_dir/
 ```
 
