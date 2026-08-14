@@ -311,5 +311,15 @@ Optical->SAR `64/64` 个验证序列；被排除的 3 个序列在 query target 
 - 设计规格：已冻结。
 - 日期级 full index 审计：通过；25 个 2560x2560、10 m grids。
 - V4 核心、数据、训练、评价代码和定向单测：已实现。
-- 64 feasibility、同裁剪 V2/V4 对比、GitHub commit、full training：待执行。
+- 64 feasibility 已完成；同一 fixed-center 协议保留 SAR->Optical 61 个、
+  Optical->SAR 64 个验证样本。当前模型在 aggregate RMSE 上优于历史 target anchor，
+  但 source-shuffle 因果证据门槛未通过，故 full training 未释放。
+- 最近的 symmetric-confidence 校准只训练两方向 confidence heads。SAR->Optical RMSE 为
+  `0.08955`（anchor `0.09169`），Optical->SAR 为 `5.213 dB`（anchor `5.571 dB`）；
+  source-shuffle structural degradation 分别仅为 `0.390%` 和 `-0.813%`，低于 `1%`
+  feasibility 门槛，且 SAR Edge F1 回归超过允许值。完整结果见
+  `docs/results/sopat_v4_symmetric_confidence_64.json`。
+- 因果失败已定位到 batch-local donor 与 candidate transport 的通用 anchor 修正退化解。
+  下一轮必须使用 split-global、跨 tile、无历史资产重叠的 deterministic hard negative，
+  并在 candidate 与 gated physical 两级同时验证 source dependence；不得降低 release gate。
 - SOPAT-Operator、任意传感器/分辨率、residual flow：未实现，不属于当前发布主张。

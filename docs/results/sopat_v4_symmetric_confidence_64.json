@@ -1,0 +1,97 @@
+{
+  "schema_version": 1,
+  "date": "2026-08-14",
+  "family": "sopat_v4_symmetric_confidence_64",
+  "protocol": {
+    "checkpoint": "/dev/shm/sopat_v4_feasibility_symmetric_confidence/physical/latest.pt",
+    "checkpoint_global_step": 500,
+    "initial_checkpoint": "/dev/shm/sopat_v4_feasibility_contrastive/physical/latest.pt",
+    "initial_weight_source": "ema",
+    "trainable_scope": "confidence_only",
+    "canonical_grid": "10m",
+    "comparison_crop": "fixed_center",
+    "validation_samples": {
+      "sar_to_optical": 61,
+      "optical_to_sar": 64
+    }
+  },
+  "overall_metrics": {
+    "sar_to_optical": {
+      "anchor_copy": {
+        "rmse": 0.09169303523864618,
+        "structural_rmse": 0.08490947655628277,
+        "sam_deg": 4.283515414115791,
+        "ndvi_mae": 0.10272439425630991,
+        "edge_f1": 0.46593535020850485,
+        "psd_log_l1": 0.0024527825432310462
+      },
+      "sopat": {
+        "rmse": 0.08954961485142848,
+        "structural_rmse": 0.0831657433296289,
+        "scene_improved_fraction": 0.6229508196721312,
+        "sam_deg": 4.032969510774283,
+        "ndvi_mae": 0.10191034904746436,
+        "edge_f1": 0.47463705246110244,
+        "psd_log_l1": 0.0023207218867161723,
+        "pre_projection_violation": 0.0
+      },
+      "source_shuffle": {
+        "rmse": 0.08983059845533566,
+        "structural_rmse": 0.08349015951471073,
+        "sam_deg": 4.095366325740362,
+        "ndvi_mae": 0.10679130426954515,
+        "edge_f1": 0.47398407069356435,
+        "psd_log_l1": 0.0023151920563503183
+      },
+      "source_shuffle_structural_degradation": 0.003901
+    },
+    "optical_to_sar": {
+      "anchor_copy": {
+        "rmse": 0.2785550524616474,
+        "structural_rmse": 0.1236538554672444,
+        "sar_db_rmse": 5.571101052182246,
+        "sar_db_bias": -0.588211486243909,
+        "sar_db_corr": 0.8274377134199681,
+        "edge_f1": 0.9190563541032744,
+        "psd_log_l1": 0.026515030884183943
+      },
+      "sopat": {
+        "rmse": 0.2606689252747763,
+        "structural_rmse": 0.11400945137813333,
+        "scene_improved_fraction": 0.984375,
+        "sar_db_rmse": 5.213378521028745,
+        "sar_db_bias": -0.2731023699835663,
+        "sar_db_corr": 0.8412582492525474,
+        "edge_f1": 0.8964067838782919,
+        "psd_log_l1": 0.024281924415845424,
+        "pre_projection_violation": 0.0
+      },
+      "source_shuffle": {
+        "rmse": 0.259769989586311,
+        "structural_rmse": 0.11308236139500492,
+        "sar_db_rmse": 5.195399809210736,
+        "sar_db_bias": -0.21944129866182616,
+        "sar_db_corr": 0.8413856776646639,
+        "edge_f1": 0.894450790088327,
+        "psd_log_l1": 0.024250781629234552
+      },
+      "source_shuffle_structural_degradation": -0.008132
+    }
+  },
+  "selection": {
+    "policy_version": "sopat_v4_quality_gate_v2",
+    "phase": "feasibility",
+    "eligible": false,
+    "failures": [
+      "source_shuffle_insufficient_structural_degradation:sar_to_optical:0.003901<0.010000",
+      "sar_edge_anchor_gate:0.8964067838782919:0.9190563541032744",
+      "source_shuffle_insufficient_structural_degradation:optical_to_sar:-0.008132<0.010000"
+    ],
+    "full_training_released": false
+  },
+  "conclusion": {
+    "quality": "Both directions improve aggregate RMSE over the historical target anchor, but SAR edge fidelity exceeds the allowed regression.",
+    "causality": "Replacing the source history does not degrade structural error by the required one percent in either direction. Optical-to-SAR improves under the wrong history, so causal source dependence is not established.",
+    "next_action": "Replace batch-local counterfactuals with a deterministic split-global cross-tile hard-negative plan and train the candidate transport itself before repeating feasibility."
+  }
+}
